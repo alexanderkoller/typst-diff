@@ -23,3 +23,15 @@ anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"

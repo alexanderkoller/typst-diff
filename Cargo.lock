@@ -2619,6 +2619,7 @@ dependencies = [
  "anyhow",
  "clap",
  "similar",
+ "tempfile",
  "typst",
  "typst-eval",
  "typst-kit",
