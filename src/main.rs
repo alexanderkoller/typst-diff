@@ -1,12 +1,4 @@
-pub mod annotate;
-pub mod diff;
-pub mod eval;
-pub mod render;
-pub mod world;
-
-pub use annotate::build_annotated_content;
-pub use eval::eval_to_content;
-pub use render::render_to_pdf;
+use typst_diff::{build_annotated_content, diff, eval_to_content, render_to_pdf, world};
 
 use std::path::PathBuf;
 
