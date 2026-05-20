@@ -1,4 +1,5 @@
 pub mod annotate;
+pub mod diag;
 pub mod diff;
 pub mod eval;
 pub mod render;

@@ -248,9 +248,10 @@ fn pair_edit_zone(deletes: Vec<Content>, inserts: Vec<Content>, out: &mut Vec<Bl
         return;
     }
 
+    // Match each delete to its best insert (greedy, in delete order).
     let mut used_inserts = vec![false; inserts.len()];
-    let mut pairs: Vec<(Content, Content)> = Vec::new();
-    let mut unpaired_del: Vec<Content> = Vec::new();
+    // paired_insert_idx[i] = Some(j) if deletes[i] is paired with inserts[j]
+    let mut paired_insert_idx: Vec<Option<usize>> = Vec::with_capacity(deletes.len());
 
     for del in &deletes {
         let del_text = del.plain_text();
@@ -262,20 +263,26 @@ fn pair_edit_zone(deletes: Vec<Content>, inserts: Vec<Content>, out: &mut Vec<Bl
         match best {
             Some((j, sim)) if sim >= 0.3 => {
                 used_inserts[j] = true;
-                pairs.push((del.clone(), inserts[j].clone()));
+                paired_insert_idx.push(Some(j));
             }
-            _ => unpaired_del.push(del.clone()),
+            _ => paired_insert_idx.push(None),
         }
     }
 
-    let unpaired_ins: Vec<Content> = inserts.into_iter().enumerate()
-        .filter(|(j, _)| !used_inserts[*j])
-        .map(|(_, c)| c)
-        .collect();
+    // Emit deletes (as Delete or Replace) in their original order.
+    for (i, del) in deletes.into_iter().enumerate() {
+        match paired_insert_idx[i] {
+            Some(j) => out.push(BlockOp::Replace(del, inserts[j].clone())),
+            None => out.push(BlockOp::Delete(del)),
+        }
+    }
 
-    out.extend(unpaired_del.into_iter().map(BlockOp::Delete));
-    out.extend(unpaired_ins.into_iter().map(BlockOp::Insert));
-    out.extend(pairs.into_iter().map(|(o, n)| BlockOp::Replace(o, n)));
+    // Emit unpaired inserts after all deletes (in original insert order).
+    for (j, ins) in inserts.into_iter().enumerate() {
+        if !used_inserts[j] {
+            out.push(BlockOp::Insert(ins));
+        }
+    }
 }
 
 fn similarity(a: &str, b: &str) -> f64 {

@@ -7,6 +7,8 @@ use typst::World;
 use typst::ROUTINES;
 use typst_pdf::{PdfOptions, pdf};
 
+use crate::diag::format_diagnostics;
+
 pub fn render_to_pdf(content: &Content, world: &dyn World) -> Result<Vec<u8>> {
     let library = world.library();
     let styles = StyleChain::new(&library.styles);
@@ -28,17 +30,13 @@ pub fn render_to_pdf(content: &Content, world: &dyn World) -> Result<Vec<u8>> {
     // One layout iteration is intentional: the diff document has no counters or
     // cross-references requiring convergence. See design spec section "Rendering".
     let document = typst_layout::layout_document(&mut engine, content, styles)
-        .map_err(|errs| {
-            let msgs: Vec<String> = errs.iter().map(|d| d.message.to_string()).collect();
-            anyhow::anyhow!("layout failed:\n{}", msgs.join("\n"))
-        })?;
+        .map_err(|errs| anyhow::anyhow!("layout failed:\n{}", format_diagnostics(world, &errs)))?;
     drop(engine);
 
     // Surface any delayed errors collected during layout.
     let delayed = sink.delayed();
     if !delayed.is_empty() {
-        let msgs: Vec<String> = delayed.iter().map(|d| d.message.to_string()).collect();
-        return Err(anyhow::anyhow!("layout errors:\n{}", msgs.join("\n")));
+        return Err(anyhow::anyhow!("layout errors:\n{}", format_diagnostics(world, &delayed)));
     }
 
     pdf(&document, &PdfOptions::default()).map_err(|errs| {

@@ -5,6 +5,8 @@ use typst::foundations::Content;
 use typst::World;
 use typst::ROUTINES;
 
+use crate::diag::format_diagnostics;
+
 pub fn eval_to_content(world: &dyn World) -> Result<Content> {
     let source = world.source(world.main())
         .map_err(|e| anyhow::anyhow!("cannot read main source: {e}"))?;
@@ -19,10 +21,7 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
         &source,
     )
     .map(|module| module.content())
-    .map_err(|errs| {
-        let msgs: Vec<String> = errs.iter().map(|d| d.message.to_string()).collect();
-        anyhow::anyhow!("eval failed:\n{}", msgs.join("\n"))
-    })
+    .map_err(|errs| anyhow::anyhow!("eval failed:\n{}", format_diagnostics(world, &errs)))
 }
 
 #[cfg(test)]
