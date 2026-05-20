@@ -50,11 +50,23 @@ fn is_display_equation(c: &Content) -> bool {
 
 fn is_known_inline(c: &Content) -> bool {
     use typst::model::{EmphElem, LinkElem, StrongElem};
+    use typst::text::{
+        HighlightElem, LinebreakElem, OverlineElem, SmartQuoteElem, StrikeElem, SubElem,
+        SuperElem, UnderlineElem,
+    };
     c.is::<TextElem>()
         || c.is::<SpaceElem>()
+        || c.is::<LinebreakElem>()
         || c.is::<StrongElem>()
         || c.is::<EmphElem>()
         || c.is::<LinkElem>()
+        || c.is::<SmartQuoteElem>()
+        || c.is::<UnderlineElem>()
+        || c.is::<OverlineElem>()
+        || c.is::<StrikeElem>()
+        || c.is::<HighlightElem>()
+        || c.is::<SubElem>()
+        || c.is::<SuperElem>()
         || (c.is::<EquationElem>() && !is_display_equation(c))
 }
 
@@ -132,8 +144,19 @@ impl PartialOrd for HashableContent {
 }
 impl Ord for HashableContent {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Use plain_text as a proxy ordering; equal content will compare equal.
-        self.0.plain_text().cmp(&other.0.plain_text())
+        // Primary: plain_text for semantic grouping. Secondary: hash as tiebreaker
+        // so that structurally equal Content (same hash) always compares Equal,
+        // satisfying the Ord/Eq consistency contract.
+        let text_cmp = self.0.plain_text().cmp(&other.0.plain_text());
+        if text_cmp != std::cmp::Ordering::Equal {
+            return text_cmp;
+        }
+        let mut h1 = std::collections::hash_map::DefaultHasher::new();
+        let mut h2 = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::Hasher as _;
+        self.0.hash(&mut h1);
+        other.0.hash(&mut h2);
+        h1.finish().cmp(&h2.finish())
     }
 }
 impl Hash for HashableContent {
@@ -197,18 +220,17 @@ pub fn match_edit_zones(ops: Vec<BlockOp>) -> Vec<BlockOp> {
                 i += 1;
             }
             BlockOp::Delete(_) | BlockOp::Insert(_) => {
-                let del_start = i;
-                while i < n && matches!(&ops[i], BlockOp::Delete(_)) { i += 1; }
-                let ins_start = i;
-                while i < n && matches!(&ops[i], BlockOp::Insert(_)) { i += 1; }
-
-                let deletes: Vec<Content> = ops[del_start..ins_start].iter()
-                    .map(|op| match op { BlockOp::Delete(c) => c.clone(), _ => unreachable!() })
+                // Collect the entire contiguous Delete/Insert zone regardless of ordering.
+                let start = i;
+                while i < n && matches!(&ops[i], BlockOp::Delete(_) | BlockOp::Insert(_)) {
+                    i += 1;
+                }
+                let deletes: Vec<Content> = ops[start..i].iter()
+                    .filter_map(|op| match op { BlockOp::Delete(c) => Some(c.clone()), _ => None })
                     .collect();
-                let inserts: Vec<Content> = ops[ins_start..i].iter()
-                    .map(|op| match op { BlockOp::Insert(c) => c.clone(), _ => unreachable!() })
+                let inserts: Vec<Content> = ops[start..i].iter()
+                    .filter_map(|op| match op { BlockOp::Insert(c) => Some(c.clone()), _ => None })
                     .collect();
-
                 pair_edit_zone(deletes, inserts, &mut result);
             }
         }
@@ -258,7 +280,8 @@ fn pair_edit_zone(deletes: Vec<Content>, inserts: Vec<Content>, out: &mut Vec<Bl
 
 fn similarity(a: &str, b: &str) -> f64 {
     if a.is_empty() && b.is_empty() { return 1.0; }
-    let max_len = a.len().max(b.len());
+    let max_len = a.chars().count().max(b.chars().count());
+    if max_len == 0 { return 1.0; }
     1.0 - edit_distance(a, b) as f64 / max_len as f64
 }
 
