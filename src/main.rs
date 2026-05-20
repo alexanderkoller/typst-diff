@@ -1,3 +1,4 @@
+mod diff;
 mod eval;
 mod world;
 pub use eval::eval_to_content;
