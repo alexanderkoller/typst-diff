@@ -19,7 +19,10 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
         &source,
     )
     .map(|module| module.content())
-    .map_err(|errs| anyhow::anyhow!("eval errors: {} diagnostic(s)", errs.len()))
+    .map_err(|errs| {
+        let msgs: Vec<String> = errs.iter().map(|d| d.message.to_string()).collect();
+        anyhow::anyhow!("eval failed:\n{}", msgs.join("\n"))
+    })
 }
 
 #[cfg(test)]
