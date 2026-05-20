@@ -25,8 +25,13 @@ impl SystemWorld {
     pub fn new(entry: impl AsRef<Path>) -> Result<Self> {
         let entry = entry.as_ref().canonicalize()
             .with_context(|| format!("cannot find {:?}", entry.as_ref()))?;
-        let root = entry.parent().unwrap().to_owned();
-        let filename = entry.file_name().unwrap().to_str().unwrap();
+        let root = entry.parent()
+            .ok_or_else(|| anyhow::anyhow!("entry path has no parent: {:?}", entry))?
+            .to_owned();
+        let filename = entry.file_name()
+            .ok_or_else(|| anyhow::anyhow!("entry path has no filename: {:?}", entry))?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("filename is not valid UTF-8: {:?}", entry))?;
         let main = FileId::new(None, VirtualPath::new(format!("/{filename}")));
 
         let fonts = FontSearcher::new().search();
@@ -42,7 +47,7 @@ impl SystemWorld {
         };
 
         // Pre-load the main file so it's in the cache.
-        world.source(main).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        world.source(main).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok(world)
     }
@@ -72,7 +77,7 @@ impl World for SystemWorld {
         }
         let path = self.disk_path(id);
         let text = std::fs::read_to_string(&path)
-            .map_err(|_| FileError::NotFound(path.clone()))?;
+            .map_err(|err| FileError::from_io(err, &path))?;
         let src = Source::new(id, text);
         cache.insert(id, src.clone());
         Ok(src)
@@ -86,7 +91,7 @@ impl World for SystemWorld {
         let path = self.disk_path(id);
         let result = std::fs::read(&path)
             .map(Bytes::new)
-            .map_err(|_| FileError::NotFound(path.clone()));
+            .map_err(|err| FileError::from_io(err, &path));
         cache.insert(id, result.clone());
         result
     }
