@@ -507,7 +507,6 @@ mod tests {
 
     #[test]
     fn diff_content_detects_word_change() {
-        use typst::model::ParbreakElem;
         let old = seq([TextElem::packed("The fox jumps.")]);
         let new = seq([TextElem::packed("The fox leaps.")]);
         let result = diff_content(&old, &new);
