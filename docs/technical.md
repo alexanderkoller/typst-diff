@@ -131,6 +131,13 @@ Used by the CLI. Runs two additional passes over the Content tree:
    counter steps, and document structure into a flat sequence of `(Content,
    StyleChain)` pairs.
 
+Before realization, `collect_preserved_by_span` records original structured
+nodes whose realized form would otherwise become opaque layout output. At the
+moment this preservation set contains `TableElem` and `EquationElem`. After
+realization, `restore_preserved` replaces realized nodes with matching spans
+with the original table/equation nodes, recursing through `SequenceElem`,
+`StyledElem`, and `ParElem`.
+
 The realized output is then re-wrapped into a `Content::sequence` where each
 item carries its inline styles (non-page styles), and the whole sequence is
 wrapped with root page styles. Page styles on individual items are extracted
@@ -259,6 +266,7 @@ pub enum DiffResultOp {
     Deleted(DiffBlock),
     Inserted(DiffBlock),
     Modified(DiffBlock, Vec<WordOp>),  // new block + word-level diff
+    ModifiedTable(DiffBlock, Vec<TableCellDiff>),
 }
 
 pub struct DiffResult {
@@ -268,8 +276,23 @@ pub struct DiffResult {
 ```
 
 `root_styles` is extracted from the outermost `StyledElem` in the new
-document's realized content. It typically carries default page margins, fonts,
-and text size, and is applied to the entire annotated output.
+document's realized content. It carries document-level page styles, such as
+default margins and headers/footers, and is applied to the entire annotated
+output.
+
+### `TableCellDiff`
+
+```rust
+pub struct TableCellDiff {
+    pub index: usize,
+    pub word_ops: Vec<WordOp>,
+}
+```
+
+When both sides of a replacement are `TableElem` values with the same number of
+cells, `diff_content` diffs corresponding cell bodies rather than treating the
+whole table as a single atomic block. `index` is the cell's linear position in
+semantic table order, including repeated headers and footers.
 
 ### `Token`
 
@@ -334,6 +357,7 @@ Within `collect_blocks_from_children`, each child is classified:
 | `SequenceElem` with block children | Recurse (`collect_blocks_from_children`) |
 | `ParbreakElem` | Flush paragraph; emit as its own `DiffBlock` |
 | `HeadingElem`, `RawElem`, display `EquationElem` | Flush paragraph; emit as atomic block |
+| `TableElem` | Flush paragraph; emit as atomic block; cell bodies are handled later by table-specific replacement logic |
 | Known inline nodes | Append to current paragraph |
 | Unknown nodes | Flush paragraph; emit as atomic block |
 
@@ -427,6 +451,18 @@ so, the text is tokenised at whitespace boundaries and each piece becomes its
 own `Token`, even though the original Content structure is opaque. This prevents
 a single large strong/emph block from becoming one giant undiffable token.
 
+**Math tokens:** `EquationElem` nodes are tokens keyed by `equation.body.repr()`
+rather than by `plain_text()`. This preserves distinctions that text extraction
+would lose, such as scripts, fractions, and other math structure. The current
+granularity is expression-level: symbols inside a single equation are not yet
+diffed independently.
+
+**Table cells:** `diff_table_cells` handles table-vs-table replacements by
+collecting `TableCell` bodies from `TableElem.children`, including headers and
+footers. If both tables have the same number of cells, corresponding cell
+bodies are word-diffed. Cells without textual changes are left untouched; cells
+with changes are recorded as `TableCellDiff` and rewritten during annotation.
+
 ---
 
 ## Annotation strategy
@@ -440,15 +476,17 @@ produces annotated `Content`:
 | `Inserted(block)` | Wrap `block.content` with `.styled(TextElem::fill.set(green()))`. All text inside inherits green fill. |
 | `Deleted(block)` | Flatten the block to plain text via `plain_content()`, apply red fill, wrap in `StrikeElem`. Using plain text avoids re-rendering structural side effects (e.g. a deleted `HeadingElem` would otherwise still add a chapter number to the document). |
 | `Modified(new_block, word_ops)` | Build inline annotated content from `word_ops` (see below), then use `replace_text_container` to graft it into the original block structure. |
+| `ModifiedTable(new_block, cell_diffs)` | Clone the new table and replace only the changed cell bodies with annotated inline content. |
 
 **Word-op inline rendering:**
 
 - `Equal` tokens → emit `token.content` as-is.
 - `Insert` tokens → join all token contents in a `Content::sequence`, wrap with
-  green fill style. Tokens whose `plain_text()` is empty are replaced with
-  `TextElem::packed(token.text)` to ensure space tokens remain renderable.
-- `Delete` tokens → join all token contents, wrap with red fill, wrap in
-  `StrikeElem`.
+  green fill style.
+- `Delete` tokens → render token-by-token. Text-like tokens are wrapped with
+  red fill and `StrikeElem`. Equation tokens are rebuilt as `EquationElem`
+  containing `CancelElem`, because text strikethrough does not apply inside
+  math layout.
 
 **`replace_text_container(template, replacement)`** walks the block's Content
 tree looking for the node to replace the inline children:
@@ -464,11 +502,17 @@ If no suitable container is found (e.g. a `HeadingElem` without a bare inner
 sequence), `replace_text_container` returns `None` and the annotated content is
 used directly without structural wrapping.
 
+**`replace_table_cells(template, cell_diffs)`** walks a cloned `TableElem`
+through `TableChild::{Header, Footer, Item}` and `TableItem::Cell` in the same
+linear order used by `diff_table_cells`. For each changed cell, it calls
+`annotated_inline_content` and grafts the result into the cell body with
+`replace_text_container`.
+
 **Page-style grouping:** Blocks are batched by `page_styles` identity. Whenever
 `page_styles` changes between consecutive blocks, the accumulated batch is
 wrapped with `Content::sequence(...).styled_with_map(page_styles)` and added to
 the output. The final batch is always flushed. The entire output sequence is
-then wrapped with `result.root_styles` (document-wide defaults).
+then wrapped with `result.root_styles` (document-wide page styles).
 
 ---
 
@@ -556,7 +600,23 @@ Moved-block detection is not implemented.
 
 **Math equations:** Display equations are treated as atomic blocks (never
 word-diffed). Inline equations are atomic tokens. Changes inside equations are
-shown as whole-equation delete+insert.
+shown as whole-equation delete+insert. Deleted equations use Typst's
+`math.cancel` element instead of text strikethrough.
+
+**Opaque content containers:** The generic traversal currently descends through
+`SequenceElem`, `StyledElem`, and `ParElem`. It also has special handling for
+`TableElem` cells and `EquationElem` tokens. Other structured containers are
+mostly treated as atomic blocks or atomic tokens. Important examples are
+`ListElem`, `EnumElem`, `TermsElem`, `GridElem`, `FigureElem` and
+`FigureCaption`, `FootnoteElem`, `BlockElem`, `BoxElem`, `AlignElem`,
+`PadElem`, `PlaceElem`, `ColumnsElem`, `StackElem`, `QuoteElem`, and shape
+elements with optional bodies such as `RectElem` and `CircleElem`. Changes
+inside these containers may be missed if the outer element compares equal by
+plain text, or may be highlighted only as a whole-container replacement.
+
+**Lists and enumerations:** The corpus currently contains examples where list,
+nested-list, and enumeration item text changes are not detected as modifications
+because list containers are not traversed item-by-item.
 
 **Code blocks (`RawElem`):** Treated as atomic blocks. Source-level changes
 inside code blocks are shown as whole-block delete+insert.

@@ -69,12 +69,33 @@ name, a tag, or a commit hash.
 
 1. Both documents are evaluated by the Typst compiler, expanding all `#include`s
    and macros into a `Content` tree.
-2. The trees are split into blocks (paragraphs, headings, code blocks, display
-   equations) and aligned with an LCS diff.
-3. Adjacent changed blocks with ≥ 30% text similarity are paired for word-level
+2. Show rules and counter-dependent content are realized with a layout
+   introspector so the diff sees the content Typst actually typesets.
+3. The trees are split into blocks (paragraphs, headings, code blocks, display
+   equations, tables) and aligned with an LCS diff.
+4. Adjacent changed blocks with ≥ 30% text similarity are paired for word-level
    diffing; dissimilar blocks are marked as whole-block additions/deletions.
-4. The annotated content is rendered to PDF using the **new** document's world,
+5. The annotated content is rendered to PDF using the **new** document's world,
    so fonts and assets resolve correctly.
+
+## Limitations
+
+typst-diff currently traverses only a limited set of content containers when
+looking for fine-grained changes:
+
+- Paragraphs, styled content, sequences, text, spaces, headings, raw blocks,
+  tables, and equations are handled explicitly.
+- Table cell contents are diffed cell-by-cell.
+- Math equations are diffed as whole expressions. Deleted equations are rendered
+  with Typst's math cancellation mark; inserted equations are green.
+- Other structured containers are still mostly opaque. This includes lists,
+  enumerations, term lists, grids, figures and captions, footnotes, boxes,
+  blocks, alignment/padding/placement wrappers, columns, stacks, quotes, and
+  shape bodies. Changes inside these may be missed or rendered as whole-container
+  changes instead of word-level changes.
+- Moved paragraphs are shown as a deletion plus an insertion; moved-block
+  detection is not implemented.
+- Only PDF output is supported.
 
 ## Building
 
@@ -132,6 +153,32 @@ The `Cargo.toml` profiles are tuned:
 cargo test
 ```
 
-23 tests: 20 unit tests covering each module, 3 integration tests that run the
-full pipeline on fixture documents, including Git revision mode, and verify
-valid PDF output.
+This runs the Rust unit tests and integration tests, including fixture documents,
+Git revision mode, table cell diffs, math diffs, and PDF validation.
+
+Run the corpus suite:
+
+```sh
+tests/run_corpus.sh
+```
+
+Useful corpus flags:
+
+```sh
+tests/run_corpus.sh --list
+tests/run_corpus.sh --filter 23-display-math-changed
+tests/run_corpus.sh --release
+tests/run_corpus.sh --verbose
+```
+
+Corpus outputs are written to `tests/corpus_output/<test-name>/`, including
+`diff.pdf`, `modifications.txt`, `stderr.txt`, and `result.txt`.
+
+Run the larger example pair:
+
+```sh
+tests/examples/run_diff.sh
+```
+
+This writes `tests/examples/diff.pdf` and
+`tests/examples/modifications.txt`.
