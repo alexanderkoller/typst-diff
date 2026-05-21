@@ -1,3 +1,22 @@
+//! Convert a [`DiffResult`] into an annotated Typst [`Content`] tree ready for rendering.
+//!
+//! # Colour conventions
+//!
+//! | Change type       | Colour                  | Technique                    |
+//! |-------------------|-------------------------|------------------------------|
+//! | Inserted block    | Green text fill         | `TextElem::fill`             |
+//! | Deleted block     | Red strikethrough       | `StrikeElem` on plain text   |
+//! | Deleted equation  | Red cancel              | `CancelElem` inside equation |
+//! | Modified word ins | Green (or blue if compact) | `TextElem::fill`           |
+//! | Modified word del | Red strikethrough       | `StrikeElem`                 |
+//!
+//! # Page-style grouping
+//!
+//! Blocks that share the same `page_styles` are accumulated into a group and then
+//! wrapped together in a single `styled_with_map(page_styles)` call. A new group is
+//! started whenever the page styles change. This preserves `#set page(…)` boundaries
+//! (margins, headers, footers) across section breaks in the diff output.
+
 use typst::foundations::Content;
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::Abs;
@@ -19,6 +38,11 @@ fn blue() -> Color {
     Color::from_u8(0, 100, 220, 255)
 }
 
+/// Build the annotated document from a [`DiffResult`].
+///
+/// `compact_substitutions`: when `true`, substitution pairs (adjacent delete+insert)
+/// are shown as blue insertions only — the red strikethrough is suppressed. Useful
+/// for authors who want to see "what it says now" without visual noise from deleted text.
 pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool) -> Content {
     let mut groups: Vec<Content> = Vec::new();
     let mut current_blocks: Vec<Content> = Vec::new();
@@ -92,11 +116,22 @@ fn flush_group(
     });
 }
 
+/// Strip all structure from `content` and return a single `TextElem` with its plain text.
+///
+/// Deleted blocks are flattened to avoid re-triggering heading counters, TOC entries,
+/// and other document-level side effects that block elements carry.
 fn plain_content(content: &Content) -> Content {
     let text = content.plain_text();
     TextElem::packed(text.as_str())
 }
 
+/// Turn a [`WordOp`] sequence into a flat inline `Content` sequence with colour annotations.
+///
+/// Deleted tokens become red `StrikeElem` (equations use `CancelElem`). Inserted tokens
+/// become green. In compact mode, inserted tokens that are adjacent to a delete are
+/// coloured blue and their delete sibling is dropped entirely. A thin space separator is
+/// inserted between a delete run and its following insert run when the boundary would
+/// otherwise join two non-whitespace tokens.
 fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) -> Content {
     let mut inline: Vec<Content> = Vec::new();
     for (i, wop) in word_ops.iter().enumerate() {
@@ -198,6 +233,12 @@ fn deleted_token_content(token: &crate::diff::Token) -> Content {
     Content::new(StrikeElem::new(colored))
 }
 
+/// Graft `replacement` into the innermost text-bearing position of `template`.
+///
+/// This preserves the block's outer styling (e.g. heading level, custom paragraph
+/// styles) while swapping out only the inline text content. The search recurses through
+/// `ParElem`, `StyledElem`, and all-inline `SequenceElem` wrappers.
+/// Returns `None` if no suitable injection site is found.
 fn replace_text_container(template: &Content, replacement: &Content) -> Option<Content> {
     let mut content = template.clone();
 

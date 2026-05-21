@@ -1,3 +1,9 @@
+//! Typst [`World`] implementation backed by the real filesystem.
+//!
+//! [`SystemWorld`] is the bridge between typst-diff and the Typst compiler.
+//! It resolves virtual file paths to real disk paths, caches loaded sources and
+//! binary blobs, and downloads Typst packages on demand via `typst-kit`.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,18 +19,30 @@ use typst_kit::download::{Downloader, ProgressSink};
 use typst_kit::fonts::{FontSearcher, FontSlot};
 use typst_kit::package::PackageStorage;
 
+/// A Typst [`World`] that reads source and binary files from the local filesystem.
+///
+/// All virtual paths are rooted at the directory containing the entry file.
+/// Files are cached after the first read so repeated accesses are free.
 pub struct SystemWorld {
+    /// Absolute path to the directory containing the entry file — the "root" for virtual paths.
     root: PathBuf,
+    /// The virtual [`FileId`] assigned to the entry file (always `/<filename>`).
     main: FileId,
     library: LazyHash<Library>,
     book: LazyHash<FontBook>,
     font_slots: Vec<FontSlot>,
     package_storage: PackageStorage,
+    /// Cache of already-parsed [`Source`] objects, keyed by their virtual [`FileId`].
     source_cache: Arc<Mutex<HashMap<FileId, Source>>>,
+    /// Cache of raw binary file bytes (images, fonts, etc.).
     file_cache: Arc<Mutex<HashMap<FileId, FileResult<Bytes>>>>,
 }
 
 impl SystemWorld {
+    /// Create a world rooted at `entry`'s parent directory.
+    ///
+    /// The entry file is pre-loaded into the source cache; if it cannot be read
+    /// (e.g. the path doesn't exist) an error is returned immediately.
     pub fn new(entry: impl AsRef<Path>) -> Result<Self> {
         let entry = entry
             .as_ref()
@@ -60,6 +78,11 @@ impl SystemWorld {
         Ok(world)
     }
 
+    /// Resolve a virtual [`FileId`] to an absolute path on disk.
+    ///
+    /// For package files, the package is downloaded (once) via `package_storage`
+    /// and the returned root is the unpacked package directory. For project files,
+    /// the root is `self.root`.
     fn disk_path(&self, id: FileId) -> FileResult<PathBuf> {
         let root = if let Some(package) = id.package() {
             let mut progress = ProgressSink;

@@ -1,3 +1,24 @@
+//! Typst document evaluation: from source text to a fully-realized [`Content`] tree.
+//!
+//! Two public entry points are exposed:
+//! - [`eval_to_content`] — shallow eval only (Typst AST → unevaluated `Content`).
+//! - [`eval_to_realized_content`] — full pipeline used by the diff: eval → layout →
+//!   realization, producing a stable content tree where show rules and counters have
+//!   been expanded and footnote markers and equations are in their original form.
+//!
+//! # Why realization is needed
+//!
+//! The diff operates on the *semantic* content tree, not the raw layout output.
+//! Typst's realization step expands show rules (e.g. `show heading: …`) so that the
+//! resulting tree reflects the document's logical structure. Without it, two headings
+//! with identical text but different show rules would look identical in the diff.
+//!
+//! # Preserved elements
+//!
+//! `EquationElem` and "slot container" nodes (lists, figures, tables, …) would become
+//! opaque layout output after realization. They are captured by span before realization
+//! and spliced back in afterwards, keeping them diffable as structured content.
+
 use anyhow::Result;
 use std::collections::HashMap;
 use typst::ROUTINES;
@@ -21,6 +42,11 @@ use crate::content_slots::{
 };
 use crate::diag::format_diagnostics;
 
+/// Evaluate the entry file and return the raw, unrealized [`Content`] tree.
+///
+/// This is a thin wrapper around `typst_eval::eval`. The result still contains
+/// unevaluated show rules and unexpanded counters. Useful for tests but not for
+/// diffing; prefer [`eval_to_realized_content`] for production use.
 pub fn eval_to_content(world: &dyn World) -> Result<Content> {
     let source = world
         .source(world.main())
@@ -39,12 +65,30 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
     .map_err(|errs| anyhow::anyhow!("eval failed:\n{}", format_diagnostics(world, &errs)))
 }
 
+/// Evaluate, layout, and realize the document into a stable [`Content`] tree.
+///
+/// Steps:
+/// 1. Evaluate source → raw content (via [`eval_to_content`]).
+/// 2. Normalize bare list/enum/term items into their container elements.
+/// 3. Run up to 5 layout iterations to build a stable [`Introspector`]
+///    (needed so that counters, references, and footnotes converge).
+/// 4. Call `ROUTINES.realize` to expand show rules and finalize the tree.
+/// 5. Restore pre-realization `EquationElem` and slot-container nodes by span.
+/// 6. Restore original `FootnoteElem` nodes (realization replaces them with markers).
+///
+/// The returned `Content` is what `diff::diff_content` operates on.
 pub fn eval_to_realized_content(world: &dyn World) -> Result<Content> {
     let content = normalize_list_item_runs(eval_to_content(world)?);
     let introspector = layout_introspector(world, &content)?;
     realize_to_content(world, &content, introspector)
 }
 
+/// Run layout up to 5 times until the [`Introspector`] converges.
+///
+/// An `Introspector` feeds back into the layout engine for features that depend
+/// on their own position (page references, footnote numbering, counters). Running
+/// layout once produces an initial introspector; repeating with that introspector
+/// lets position-dependent values stabilize. 5 iterations is Typst's standard limit.
 fn layout_introspector(world: &dyn World, content: &Content) -> Result<Introspector> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
@@ -93,6 +137,13 @@ fn layout_introspector(world: &dyn World, content: &Content) -> Result<Introspec
     Ok(introspector)
 }
 
+/// Expand show rules and finalize the content tree using a stable `introspector`.
+///
+/// After realization each top-level item is wrapped with only its non-page styles
+/// (page styles are handled separately in [`build_annotated_content`]), except for
+/// `PagebreakElem` nodes which get marginal styles. The whole sequence is then
+/// wrapped with the root-level page styles so that margin/header/footer settings
+/// from `#set page(…)` survive into annotation and rendering.
 fn realize_to_content(
     world: &dyn World,
     content: &Content,
@@ -154,6 +205,8 @@ fn realize_to_content(
     Ok(restore_footnote_markers(realized, &footnotes))
 }
 
+/// Walk the pre-realization tree and index every `EquationElem` and slot-container
+/// node by span so they can be swapped back in after realization.
 fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
     let mut preserved = HashMap::new();
     let _ = content.traverse::<_, ()>(&mut |content| {
@@ -165,6 +218,12 @@ fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
     preserved
 }
 
+/// Collect all `FootnoteElem` nodes in document order from the pre-realization tree.
+///
+/// Realization replaces `FootnoteElem` nodes with superscript number markers and
+/// moves the note body to the page footer. `restore_footnote_markers` uses this
+/// list to swap the markers back to the original structured elements so the diff
+/// can see footnote text as diffable content rather than bare numbers.
 fn collect_footnotes(content: &Content) -> Vec<Content> {
     let mut footnotes = Vec::new();
     let _ = content.traverse::<_, ()>(&mut |content| {
@@ -308,6 +367,10 @@ fn restore_preserved(content: Content, preserved: &HashMap<Span, Content>) -> Co
     content
 }
 
+/// Strip `PageElem` styles from a style map, keeping only inline/block styles.
+///
+/// Page styles must not be re-applied at the block level; they are handled
+/// separately per style group in `build_annotated_content`.
 fn non_page_styles(styles: Styles) -> Styles {
     styles
         .iter()

@@ -74,12 +74,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Absolute paths to the two documents to diff, plus an optional temp directory that
+/// must stay alive until rendering is done (the `--revision` Git snapshot lives there).
 struct ResolvedInputs {
     old: PathBuf,
     new: PathBuf,
     _snapshot: Option<TempDir>,
 }
 
+/// Validate the argument combination and produce concrete file paths.
+///
+/// `--revision` and an explicit `new` path are mutually exclusive; one of them must
+/// be present.
 fn resolve_inputs(args: &Args) -> Result<ResolvedInputs> {
     match (&args.revision, &args.new) {
         (Some(revision), None) => resolve_git_inputs(&args.old_or_file, revision),
@@ -99,6 +105,12 @@ fn resolve_inputs(args: &Args) -> Result<ResolvedInputs> {
     }
 }
 
+/// Snapshot the entire Git repository at `revision` into a temp directory and return
+/// paths to the old (snapshotted) and new (working-tree) copies of `file`.
+///
+/// The full repo snapshot (via `git archive | tar`) is needed rather than a single-file
+/// checkout so that `#include` directives in the Typst source resolve correctly relative
+/// to the snapshot root.
 fn resolve_git_inputs(file: &PathBuf, revision: &str) -> Result<ResolvedInputs> {
     let working_file = file
         .canonicalize()
@@ -135,6 +147,7 @@ fn resolve_git_inputs(file: &PathBuf, revision: &str) -> Result<ResolvedInputs> 
     })
 }
 
+/// Return the absolute path to the Git repository root containing `cwd`.
 fn git_root(cwd: &std::path::Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["-C"])
@@ -152,6 +165,7 @@ fn git_root(cwd: &std::path::Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root.trim()).canonicalize()?)
 }
 
+/// Run `git archive | tar -x` to unpack `revision` into a fresh temp directory.
 fn archive_revision(git_root: &PathBuf, revision: &str) -> Result<TempDir> {
     let archive = Command::new("git")
         .args(["-C"])

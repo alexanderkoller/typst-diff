@@ -1,3 +1,22 @@
+//! Named content "slots" — addressable text-bearing sub-positions inside structured elements.
+//!
+//! Many Typst elements (lists, tables, figures, …) contain multiple independent
+//! text regions. The diff needs to identify *which* sub-region changed, not just that
+//! the whole block changed.
+//!
+//! A **slot** is a leaf text-bearing position identified by a [`Vec<SlotStep>`] path from
+//! the element root. [`extract_slots`] walks a `Content` tree and collects every slot.
+//! [`replace_slot`] takes a path and a replacement `Content` and writes it back into a
+//! clone of the original tree.
+//!
+//! # Element coverage
+//!
+//! Slots are extracted from: `ListElem` / `ListItem`, `EnumElem` / `EnumItem`,
+//! `TermsElem` / `TermItem`, `FigureElem` (body + caption), `FootnoteElem`,
+//! `QuoteElem`, `TableElem`, `GridElem`, `StackElem`, and single-body wrappers
+//! (`AlignElem`, `PadElem`, `PlaceElem`, `ColumnsElem`, `BoxElem`, `BlockElem`,
+//! `RectElem`, `CircleElem`, `EllipseElem`).
+
 use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridChild, GridElem, GridItem, PadElem,
@@ -9,6 +28,7 @@ use typst::model::{
 };
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
+/// One step in a path from a container element to a leaf slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlotStep {
     SequenceChild(usize),
@@ -29,18 +49,32 @@ pub enum SlotStep {
     StackChild(usize),
 }
 
+/// A named text-bearing position inside a structured element.
+///
+/// `path` uniquely addresses the slot from the element root; `content` is the
+/// current text payload at that address.
 #[derive(Clone, Debug)]
 pub struct ContentSlot {
     pub path: Vec<SlotStep>,
     pub content: Content,
 }
 
+/// Collect every named slot from `content` in document order.
+///
+/// Returns an empty vec for elements that have no addressable slots (e.g. plain
+/// `TextElem`, `HeadingElem`, `RawElem`). Non-empty results are used by the diff
+/// to attempt slot-level diffing before falling back to whole-block word-diffing.
 pub fn extract_slots(content: &Content) -> Vec<ContentSlot> {
     let mut slots = Vec::new();
     collect_slots(content, &mut Vec::new(), &mut slots);
     slots
 }
 
+/// Returns `true` if `content` is a structured element that [`extract_slots`] knows
+/// how to descend into.
+///
+/// Used in `eval.rs` to identify nodes that must be preserved before realization
+/// (realization turns them into opaque layout output).
 pub fn is_slot_container(content: &Content) -> bool {
     content.is::<ListElem>()
         || content.is::<ListItem>()
@@ -65,6 +99,12 @@ pub fn is_slot_container(content: &Content) -> bool {
         || content.is::<EllipseElem>()
 }
 
+/// Wrap consecutive bare `ListItem` / `EnumItem` / `TermItem` nodes into their
+/// container elements (`ListElem`, `EnumElem`, `TermsElem`).
+///
+/// Typst's evaluator sometimes emits list items as siblings in a `SequenceElem`
+/// rather than inside a `ListElem`. This normalization step ensures the content
+/// tree always uses the container form, which [`extract_slots`] understands.
 pub fn normalize_list_item_runs(content: Content) -> Content {
     let mut content = content;
 
@@ -392,6 +432,11 @@ fn collect_grid_item_slot(
     }
 }
 
+/// Write `replacement` into the slot identified by `path` inside a clone of `template`.
+///
+/// Returns `None` if the path is empty, the expected element type isn't found at any
+/// step, or the index is out of range. On success returns a new `Content` tree with
+/// only the target slot mutated.
 pub fn replace_slot(
     template: &Content,
     path: &[SlotStep],
@@ -669,6 +714,10 @@ fn replace_one_grid_item_cell(
     None
 }
 
+/// Graft `replacement` into the innermost inline-content position of `template`.
+///
+/// Like [`crate::annotate`]'s `replace_text_container` but operates on slot content
+/// (which may already be a `ParElem`). Returns `None` if no injection site is found.
 pub fn replace_inline_content(template: &Content, replacement: &Content) -> Option<Content> {
     let mut content = template.clone();
 

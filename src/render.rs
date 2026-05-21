@@ -1,3 +1,5 @@
+//! Render annotated [`Content`] to PDF bytes.
+
 use anyhow::Result;
 use typst::ROUTINES;
 use typst::World;
@@ -9,6 +11,12 @@ use typst_pdf::{PdfOptions, pdf};
 
 use crate::diag::format_diagnostics;
 
+/// Layout `content` and export it as PDF bytes.
+///
+/// Uses the same convergence loop as [`crate::eval::layout_introspector`]: up to 5
+/// layout passes until the `Introspector` stabilises (needed for cross-references,
+/// footnote numbers, etc. in the annotated document). Tagged PDF is disabled because
+/// the annotation markup doesn't carry accessible metadata.
 pub fn render_to_pdf(content: &Content, world: &dyn World) -> Result<Vec<u8>> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);

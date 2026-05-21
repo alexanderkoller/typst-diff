@@ -1,3 +1,27 @@
+//! Two-level document diff: block-level LCS followed by word-level diff.
+//!
+//! # Algorithm overview
+//!
+//! 1. **Block extraction** — [`extract_block_units`] / [`extract_blocks`] walk the
+//!    realized `Content` tree and segment it into [`DiffBlock`] values (paragraphs,
+//!    headings, raw blocks, display equations, tables, …), carrying the `PageElem`
+//!    styles that were active at each block's position.
+//!
+//! 2. **Block-level LCS** — [`diff_block_units_raw`] wraps each block in
+//!    [`HashableContent`] and feeds the slice to `similar::capture_diff_slices`
+//!    (Myers algorithm). This produces `Equal / Delete / Insert` operations.
+//!
+//! 3. **Edit-zone matching** — [`match_edit_zones`] scans the raw ops for contiguous
+//!    `Delete + Insert` zones and pairs each delete with its most-similar insert
+//!    (similarity ≥ 0.3). Paired blocks become [`BlockOp::Replace`].
+//!
+//! 4. **Word-level diff** — `diff_content` drives all of the above, then for each
+//!    `Replace` pair either:
+//!    - diffs the slot contents (lists, tables, …) with [`diff_words`], or
+//!    - extracts tokens with [`extract_words`] and diffs them with [`diff_words`].
+//!    Only pairs that contain a real textual change become [`DiffResultOp::Modified`];
+//!    style-only changes collapse back to `Equal`.
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -12,13 +36,21 @@ use typst::text::{RawElem, SpaceElem, TextElem};
 
 use crate::content_slots::{ContentSlot, SlotStep, extract_slots};
 
+/// A block-level unit of content together with the page styles active at its position.
+///
+/// `page_styles` is "sticky": if a block carries no page-style update of its own it
+/// inherits the styles of the nearest preceding block that did. This means every block
+/// always knows which `#set page(…)` context it belongs to, even across section breaks.
 #[derive(Clone)]
 pub struct DiffBlock {
     pub content: Content,
     pub page_styles: Styles,
 }
 
-/// Segment a Content tree into block-level units.
+/// Segment a `Content` tree into block-level units (page styles discarded).
+///
+/// Convenience wrapper around [`extract_block_units`] for callers (tests, etc.)
+/// that don't need the accompanying `page_styles`.
 pub fn extract_blocks(content: &Content) -> Vec<Content> {
     extract_block_units(content)
         .into_iter()
@@ -32,6 +64,10 @@ fn extract_block_units(content: &Content) -> Vec<DiffBlock> {
     blocks
 }
 
+/// Propagate page styles forward so every block has the most-recently-set page context.
+///
+/// Blocks that originate from a `#set page(…)` call carry their own page styles;
+/// sibling blocks that follow without any page-style update inherit the last seen one.
 fn make_page_styles_sticky(blocks: &mut [DiffBlock]) {
     let mut current = Styles::new();
     for block in blocks {
@@ -95,6 +131,13 @@ fn extract_block_units_with_styles(
     blocks
 }
 
+/// Iterate `children`, flushing accumulated inline content into paragraph blocks
+/// whenever a block-level element is encountered.
+///
+/// Inline content accumulates in `para`; block-level triggers (`ParbreakElem`,
+/// `HeadingElem`, `RawElem`, display equations, or any unknown element) flush `para`
+/// first, then push themselves. `StyledElem` wrappers are unwrapped and their styles
+/// are pushed down onto their children.
 fn collect_blocks_from_children(
     children: Vec<Content>,
     page_styles: Styles,
@@ -173,6 +216,7 @@ fn collect_blocks_from_children(
     }
 }
 
+/// Drain `para` into a single `ParElem` block if it contains any non-space content.
 fn flush_para(para: &mut Vec<Content>, blocks: &mut Vec<DiffBlock>, page_styles: &Styles) {
     let nonempty = para.iter().any(|c| !c.is::<SpaceElem>());
     if nonempty {
@@ -194,6 +238,13 @@ fn paragraph_block(content: Content) -> Content {
     }
 }
 
+/// Coalesce adjacent `TextElem` and `SpaceElem` nodes into single `TextElem` strings.
+///
+/// The Myers LCS algorithm hashes block content for equality checks. Without
+/// normalization, two identical paragraphs that happen to be split into different
+/// numbers of `TextElem` nodes (due to show rules or markup boundaries) would hash
+/// differently and be treated as changed. Merging contiguous text runs makes equality
+/// hash-stable.
 fn normalize_text_runs(content: Content) -> Content {
     if let Some(seq) = content.to_packed::<SequenceElem>() {
         let mut children = Vec::new();
@@ -277,7 +328,12 @@ fn apply_block_styles(block: Content, styles: &Styles) -> Content {
     }
 }
 
-/// A single diffable unit: either a word/space split from TextElem, or an atomic inline.
+/// A single diffable token: either a word/space split from `TextElem`, or an atomic inline.
+///
+/// Equality and hashing are based solely on `text` so that the Myers LCS algorithm
+/// can match tokens by visible text content regardless of their structural `content`
+/// representation. `content` carries the original `Content` node so that unchanged
+/// tokens can be reconstructed faithfully in the annotated output.
 #[derive(Clone, Debug)]
 pub struct Token {
     pub text: String,
@@ -306,7 +362,14 @@ impl Hash for Token {
     }
 }
 
-/// Extract a flat list of tokens from a block's inline content.
+/// Walk a block's inline content and produce a flat list of [`Token`]s.
+///
+/// - `TextElem` / `SpaceElem` nodes are split on whitespace boundaries.
+/// - `EquationElem` nodes become a single token whose text is the equation's `repr`.
+/// - Slot-container nodes (lists, figures, …) are recursed via [`collect_slot_tokens`].
+/// - Any other node becomes a single atomic token. If the node's plain text exceeds
+///   500 characters it is split into word/space tokens instead of kept atomic, so
+///   that large opaque elements (e.g. huge `StrongElem` runs) are still word-diffable.
 pub fn extract_words(content: &Content) -> Vec<Token> {
     let mut tokens = Vec::new();
     collect_tokens(content, &mut tokens);
@@ -385,7 +448,12 @@ fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
     }
 }
 
-/// Wrapper providing Eq + Hash + Ord for Content (which is PartialEq + Hash but not Eq/Ord).
+/// Newtype that adds `Eq + Ord` to `Content` so it can be used with `similar`.
+///
+/// `Content` only implements `PartialEq` and `Hash`; `similar::capture_diff_slices`
+/// requires full `Eq + Ord`. Ordering is by plain-text first, then by hash as a
+/// tiebreaker — this satisfies the `Ord`/`Eq` consistency contract because two nodes
+/// with the same hash (structurally equal) will always compare `Equal`.
 #[derive(Clone)]
 struct HashableContent(Content);
 impl PartialEq for HashableContent {
@@ -422,15 +490,23 @@ impl Hash for HashableContent {
     }
 }
 
+/// Block-level diff operation produced by [`diff_block_units_raw`] and [`match_edit_zones`].
+///
+/// `Equal` and `Replace` carry both the old and new block so the caller can
+/// choose which version to render. `diff_content` always renders the *new* version.
 #[derive(Clone)]
 pub enum BlockOp {
     Equal(DiffBlock, DiffBlock),
     Delete(DiffBlock),
     Insert(DiffBlock),
+    /// A matched delete/insert pair whose plain-text similarity is ≥ 0.3.
     Replace(DiffBlock, DiffBlock),
 }
 
-/// Raw block diff — produces Equal, Delete, Insert (no Replace).
+/// Diff two flat block slices with Myers LCS, returning `Equal / Delete / Insert` ops.
+///
+/// This is the public entry point for tests. Production code calls the internal
+/// `diff_block_units_raw` which accepts [`DiffBlock`] slices (with page styles).
 pub fn diff_blocks_raw(old: &[Content], new: &[Content]) -> Vec<BlockOp> {
     let old: Vec<DiffBlock> = old
         .iter()
@@ -508,7 +584,12 @@ fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
     result
 }
 
-/// Pair adjacent Delete+Insert groups by similarity, converting matched pairs to Replace.
+/// Scan the raw ops for contiguous `Delete + Insert` zones and pair them by similarity.
+///
+/// Within each zone every delete is greedily matched to the most-similar unused insert
+/// (similarity threshold 0.3). Pairs become [`BlockOp::Replace`]; unmatched deletes and
+/// inserts are emitted as-is. Paired inserts are emitted after all deletes (in their
+/// original order) to keep the output sequence stable.
 pub fn match_edit_zones(ops: Vec<BlockOp>) -> Vec<BlockOp> {
     let mut result: Vec<BlockOp> = Vec::new();
     let mut i = 0;
@@ -601,6 +682,11 @@ fn pair_edit_zone(deletes: Vec<DiffBlock>, inserts: Vec<DiffBlock>, out: &mut Ve
     }
 }
 
+/// Compute a [0, 1] similarity score between two plain-text strings.
+///
+/// For short strings (≤ 2 000 chars) uses normalized Levenshtein distance.
+/// For longer strings falls back to Sørensen–Dice word overlap, which is O(n)
+/// rather than O(n²) and avoids timeout on large blocks.
 fn similarity(a: &str, b: &str) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
@@ -650,6 +736,11 @@ fn word_overlap_similarity(a: &str, b: &str) -> f64 {
     }
 }
 
+/// Levenshtein distance between `a` and `b`, returning `None` if the distance
+/// exceeds `max_distance`.
+///
+/// The early-exit lets the caller quickly discard pairs that are too dissimilar
+/// without paying the full O(n²) DP cost.
 fn edit_distance_with_limit(a: &str, b: &str, max_distance: usize) -> Option<usize> {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -685,6 +776,7 @@ fn edit_distance_with_limit(a: &str, b: &str, max_distance: usize) -> Option<usi
     (prev[n] <= max_distance).then_some(prev[n])
 }
 
+/// A word-level diff operation over [`Token`] sequences.
 #[derive(Clone, Debug)]
 pub enum WordOp {
     Equal(Vec<Token>),
@@ -701,7 +793,11 @@ fn has_textual_word_change(word_ops: &[WordOp]) -> bool {
     })
 }
 
-/// Diff two token sequences, coalescing adjacent same-tag ops.
+/// Diff two [`Token`] sequences with Myers LCS, coalescing adjacent same-kind ops.
+///
+/// Adjacent `Delete Delete` or `Insert Insert` chunks from `similar` are merged into
+/// a single op so that annotate can treat them as one run (important for separator
+/// insertion between delete and insert runs).
 pub fn diff_words(old: &[Token], new: &[Token]) -> Vec<WordOp> {
     let raw_ops = capture_diff_slices(Algorithm::Myers, old, new);
     let mut result: Vec<WordOp> = Vec::new();
@@ -759,19 +855,31 @@ fn coalesce(ops: &mut Vec<WordOp>, next: WordOp) {
     }
 }
 
+/// Final per-block diff classification, passed to `annotate::build_annotated_content`.
+///
+/// All variants carry the *new* block (or the only block for `Equal`/`Deleted`).
+/// `Modified` and `ModifiedSlots` also carry the word-level or slot-level diffs.
 pub enum DiffResultOp {
     Equal(DiffBlock),
     Deleted(DiffBlock),
     Inserted(DiffBlock),
+    /// A block whose text changed; contains word-level ops for inline annotation.
     Modified(DiffBlock, Vec<WordOp>),
+    /// A structured container (list, table, …) where only named slots changed.
     ModifiedSlots(DiffBlock, Vec<SlotDiff>),
 }
 
+/// The complete diff of two documents: a sequence of per-block operations and the
+/// root page styles from the new document (used to wrap the final annotated content).
 pub struct DiffResult {
     pub block_ops: Vec<DiffResultOp>,
     pub root_styles: Styles,
 }
 
+/// A word-level diff for one named slot inside a structured container.
+///
+/// `path` identifies the slot within its parent element (e.g. `[ListItem(1)]`);
+/// `word_ops` is the word diff for that slot's content.
 #[derive(Clone)]
 pub struct SlotDiff {
     pub path: Vec<SlotStep>,
