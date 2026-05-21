@@ -89,8 +89,8 @@ fn table_cell_changes_are_reported_and_rendered() {
     assert!(log.contains("modify slot"), "{log}");
     assert!(log.contains("TableCell(3)"), "{log}");
     assert!(log.contains("TableCell(5)"), "{log}");
-    assert!(log.contains("4 | 650"), "{log}");
-    assert!(log.contains("5 | 100"), "{log}");
+    assert!(log.contains("4 650"), "{log}");
+    assert!(log.contains("5 100"), "{log}");
     assert!(log.contains("108"), "{log}");
     assert!(log.contains("97"), "{log}");
 

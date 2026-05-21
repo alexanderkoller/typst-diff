@@ -843,6 +843,90 @@ pub fn diff_words(old: &[Token], new: &[Token]) -> Vec<WordOp> {
             }
         }
     }
+    merge_substitution_zones(result)
+}
+
+/// True if `op` is an `Equal` whose tokens are all whitespace characters.
+fn is_whitespace_only_equal(op: &WordOp) -> bool {
+    match op {
+        WordOp::Equal(tokens) => tokens
+            .iter()
+            .all(|t| t.text.chars().all(|c| c.is_whitespace())),
+        _ => false,
+    }
+}
+
+/// Absorb whitespace-only `Equal` ops into adjacent `Delete`/`Insert` runs.
+///
+/// A *zone* is a maximal contiguous run of ops that are `Delete`, `Insert`, or
+/// whitespace-only `Equal`. Within each zone, whitespace-only `Equal` tokens are
+/// distributed into both the preceding Delete side and the Insert side, so that
+/// the final output is at most one `Delete` followed by at most one `Insert`
+/// (with spaces embedded). Trailing whitespace in a zone is dropped.
+///
+/// Non-whitespace `Equal` ops are never touched.
+fn merge_substitution_zones(ops: Vec<WordOp>) -> Vec<WordOp> {
+    let mut result: Vec<WordOp> = Vec::new();
+    let mut i = 0;
+    let n = ops.len();
+
+    while i < n {
+        if matches!(&ops[i], WordOp::Delete(_) | WordOp::Insert(_)) {
+            // Extend the zone as far as Delete / Insert / whitespace-Equal ops reach.
+            let zone_start = i;
+            while i < n
+                && (matches!(&ops[i], WordOp::Delete(_) | WordOp::Insert(_))
+                    || is_whitespace_only_equal(&ops[i]))
+            {
+                i += 1;
+            }
+            // Trim trailing whitespace-only Equals (they'd only add dangling space).
+            while i > zone_start && is_whitespace_only_equal(&ops[i - 1]) {
+                i -= 1;
+            }
+            result.extend(merge_zone(&ops[zone_start..i]));
+        } else {
+            result.push(ops[i].clone());
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Merge the ops of a single substitution zone into at most one Delete + one Insert.
+fn merge_zone(zone: &[WordOp]) -> Vec<WordOp> {
+    let mut delete_tokens: Vec<Token> = Vec::new();
+    let mut insert_tokens: Vec<Token> = Vec::new();
+    // Whitespace pending to be prepended before the next Delete or Insert on each side.
+    let mut pending_del: Vec<Token> = Vec::new();
+    let mut pending_ins: Vec<Token> = Vec::new();
+
+    for op in zone {
+        match op {
+            WordOp::Delete(tokens) => {
+                delete_tokens.append(&mut pending_del);
+                delete_tokens.extend_from_slice(tokens);
+            }
+            WordOp::Insert(tokens) => {
+                insert_tokens.append(&mut pending_ins);
+                insert_tokens.extend_from_slice(tokens);
+            }
+            WordOp::Equal(tokens) => {
+                // Whitespace-only equal: stage a copy for each side.
+                pending_del.extend_from_slice(tokens);
+                pending_ins.extend_from_slice(tokens);
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    if !delete_tokens.is_empty() {
+        result.push(WordOp::Delete(delete_tokens));
+    }
+    if !insert_tokens.is_empty() {
+        result.push(WordOp::Insert(insert_tokens));
+    }
     result
 }
 
@@ -1464,6 +1548,31 @@ mod tests {
         let tokens = extract_words(&TextElem::packed("Hello world."));
         let ops = diff_words(&tokens, &tokens.clone());
         assert!(ops.iter().all(|op| matches!(op, WordOp::Equal(_))));
+    }
+
+    #[test]
+    fn sentence_substitution_merges_into_one_delete_one_insert() {
+        let old = extract_words(&TextElem::packed("The quick brown fox jumps."));
+        let new = extract_words(&TextElem::packed("A slow red dog leaps."));
+        let ops = diff_words(&old, &new);
+        let n_del = ops.iter().filter(|op| matches!(op, WordOp::Delete(_))).count();
+        let n_ins = ops.iter().filter(|op| matches!(op, WordOp::Insert(_))).count();
+        assert_eq!(n_del, 1, "expected exactly one merged Delete run");
+        assert_eq!(n_ins, 1, "expected exactly one merged Insert run");
+    }
+
+    #[test]
+    fn partial_substitution_preserves_equal_words() {
+        // "The fox leaps." — only "leaps" changes; "The" and "fox" stay equal.
+        let old = extract_words(&TextElem::packed("The fox jumps."));
+        let new = extract_words(&TextElem::packed("The fox leaps."));
+        let ops = diff_words(&old, &new);
+        let n_equal = ops.iter().filter(|op| matches!(op, WordOp::Equal(_))).count();
+        let n_del = ops.iter().filter(|op| matches!(op, WordOp::Delete(_))).count();
+        let n_ins = ops.iter().filter(|op| matches!(op, WordOp::Insert(_))).count();
+        assert!(n_equal >= 1, "expected Equal ops for unchanged prefix");
+        assert_eq!(n_del, 1);
+        assert_eq!(n_ins, 1);
     }
 
     // --- diff_content tests ---
