@@ -7,8 +7,10 @@ use typst::foundations::{
 };
 use typst::layout::{BlockBody, BlockElem, PageElem, Rel};
 use typst::math::EquationElem;
-use typst::model::{HeadingElem, ParElem, ParbreakElem, TableChild, TableElem, TableItem};
+use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
+
+use crate::content_slots::{ContentSlot, SlotStep, extract_slots};
 
 #[derive(Clone)]
 pub struct DiffBlock {
@@ -325,6 +327,7 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             text: equation.body.repr().to_string(),
             content: content.clone(),
         });
+    } else if collect_slot_tokens(content, out) {
     } else if let Some(text_elem) = content.to_packed::<TextElem>() {
         collect_text_tokens(text_elem.text.as_str(), out);
     } else if content.is::<SpaceElem>() {
@@ -343,6 +346,18 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             });
         }
     }
+}
+
+fn collect_slot_tokens(content: &Content, out: &mut Vec<Token>) -> bool {
+    let slots = extract_slots(content);
+    if slots.is_empty() {
+        return false;
+    }
+
+    for slot in slots {
+        collect_tokens(&slot.content, out);
+    }
+    true
 }
 
 fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
@@ -749,7 +764,7 @@ pub enum DiffResultOp {
     Deleted(DiffBlock),
     Inserted(DiffBlock),
     Modified(DiffBlock, Vec<WordOp>),
-    ModifiedTable(DiffBlock, Vec<TableCellDiff>),
+    ModifiedSlots(DiffBlock, Vec<SlotDiff>),
 }
 
 pub struct DiffResult {
@@ -758,8 +773,8 @@ pub struct DiffResult {
 }
 
 #[derive(Clone)]
-pub struct TableCellDiff {
-    pub index: usize,
+pub struct SlotDiff {
+    pub path: Vec<SlotStep>,
     pub word_ops: Vec<WordOp>,
 }
 
@@ -805,22 +820,22 @@ impl DiffResult {
                         ],
                     );
                 }
-                DiffResultOp::ModifiedTable(_, cell_diffs) => {
-                    for cell_diff in cell_diffs {
-                        let deletes = collect_word_op_text(&cell_diff.word_ops, |op| match op {
+                DiffResultOp::ModifiedSlots(_, slot_diffs) => {
+                    for slot_diff in slot_diffs {
+                        let deletes = collect_word_op_text(&slot_diff.word_ops, |op| match op {
                             WordOp::Delete(tokens) => Some(tokens),
                             _ => None,
                         });
-                        let inserts = collect_word_op_text(&cell_diff.word_ops, |op| match op {
+                        let inserts = collect_word_op_text(&slot_diff.word_ops, |op| match op {
                             WordOp::Insert(tokens) => Some(tokens),
                             _ => None,
                         });
                         push_log_entry(
                             &mut log,
                             index,
-                            "modify table cell",
+                            "modify slot",
                             &[
-                                ("cell", cell_diff.index.to_string()),
+                                ("slot", format!("{:?}", slot_diff.path)),
                                 ("deleted", deletes),
                                 ("inserted", inserts),
                             ],
@@ -892,10 +907,10 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResult {
             BlockOp::Delete(old_block) => DiffResultOp::Deleted(old_block),
             BlockOp::Insert(new_block) => DiffResultOp::Inserted(new_block),
             BlockOp::Replace(old_block, new_block) => {
-                if let Some(cell_diffs) = diff_table_cells(&old_block.content, &new_block.content)
-                    && !cell_diffs.is_empty()
+                if let Some(slot_diffs) = diff_slots(&old_block.content, &new_block.content)
+                    && !slot_diffs.is_empty()
                 {
-                    DiffResultOp::ModifiedTable(new_block, cell_diffs)
+                    DiffResultOp::ModifiedSlots(new_block, slot_diffs)
                 } else {
                     let old_tokens = extract_words(&old_block.content);
                     let new_tokens = extract_words(&new_block.content);
@@ -916,57 +931,38 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResult {
     }
 }
 
-fn diff_table_cells(old: &Content, new: &Content) -> Option<Vec<TableCellDiff>> {
-    let old_cells = table_cell_bodies(old)?;
-    let new_cells = table_cell_bodies(new)?;
-    if old_cells.len() != new_cells.len() {
+fn diff_slots(old: &Content, new: &Content) -> Option<Vec<SlotDiff>> {
+    let old_slots = extract_slots(old);
+    let new_slots = extract_slots(new);
+    if old_slots.is_empty() || old_slots.len() != new_slots.len() {
+        return None;
+    }
+    if !same_slot_shape(&old_slots, &new_slots) {
         return None;
     }
 
     Some(
-        old_cells
+        old_slots
             .into_iter()
-            .zip(new_cells)
-            .enumerate()
-            .filter_map(|(index, (old_cell, new_cell))| {
-                let word_ops = diff_words(&extract_words(&old_cell), &extract_words(&new_cell));
-                has_textual_word_change(&word_ops).then_some(TableCellDiff { index, word_ops })
+            .zip(new_slots)
+            .filter_map(|(old_slot, new_slot)| {
+                let word_ops = diff_words(
+                    &extract_words(&old_slot.content),
+                    &extract_words(&new_slot.content),
+                );
+                has_textual_word_change(&word_ops).then_some(SlotDiff {
+                    path: new_slot.path,
+                    word_ops,
+                })
             })
             .collect(),
     )
 }
 
-fn table_cell_bodies(content: &Content) -> Option<Vec<Content>> {
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return table_cell_bodies(&styled.child);
-    }
-
-    let table = content.to_packed::<TableElem>()?;
-    let mut cells = Vec::new();
-    collect_table_child_cells(&table.children, &mut cells);
-    Some(cells)
-}
-
-fn collect_table_child_cells(children: &[TableChild], cells: &mut Vec<Content>) {
-    for child in children {
-        match child {
-            TableChild::Header(header) => collect_table_item_cells(&header.children, cells),
-            TableChild::Footer(footer) => collect_table_item_cells(&footer.children, cells),
-            TableChild::Item(item) => collect_table_item_cell(item, cells),
-        }
-    }
-}
-
-fn collect_table_item_cells(items: &[TableItem], cells: &mut Vec<Content>) {
-    for item in items {
-        collect_table_item_cell(item, cells);
-    }
-}
-
-fn collect_table_item_cell(item: &TableItem, cells: &mut Vec<Content>) {
-    if let TableItem::Cell(cell) = item {
-        cells.push(cell.body.clone());
-    }
+fn same_slot_shape(old: &[ContentSlot], new: &[ContentSlot]) -> bool {
+    old.iter()
+        .zip(new)
+        .all(|(old_slot, new_slot)| old_slot.path == new_slot.path)
 }
 
 fn root_page_styles(content: &Content) -> Styles {
@@ -1376,5 +1372,31 @@ mod tests {
             _ => false,
         });
         assert!(has_word_change);
+    }
+
+    #[test]
+    fn diff_content_detects_list_item_slot_change() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let old = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Beta"))),
+        ]));
+        let new = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Better"))),
+        ]));
+
+        let result = diff_content(&old, &new);
+        let has_slot_change = result.block_ops.iter().any(|op| match op {
+            DiffResultOp::ModifiedSlots(_, slots) => slots.iter().any(|slot| {
+                slot.path
+                    .iter()
+                    .any(|step| format!("{step:?}") == "ListItem(1)")
+            }),
+            _ => false,
+        });
+        assert!(has_slot_change);
     }
 }

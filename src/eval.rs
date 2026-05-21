@@ -10,10 +10,13 @@ use typst::foundations::{
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PageElem, PagebreakElem};
 use typst::math::EquationElem;
-use typst::model::{DocumentInfo, ParElem, TableElem};
+use typst::model::{DocumentInfo, ParElem};
 use typst::routines::{Arenas, RealizationKind};
 use typst::syntax::Span;
 
+use crate::content_slots::{
+    extract_slots, is_slot_container, normalize_list_item_runs, replace_slot,
+};
 use crate::diag::format_diagnostics;
 
 pub fn eval_to_content(world: &dyn World) -> Result<Content> {
@@ -35,7 +38,7 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
 }
 
 pub fn eval_to_realized_content(world: &dyn World) -> Result<Content> {
-    let content = eval_to_content(world)?;
+    let content = normalize_list_item_runs(eval_to_content(world)?);
     let introspector = layout_introspector(world, &content)?;
     realize_to_content(world, &content, introspector)
 }
@@ -151,7 +154,7 @@ fn realize_to_content(
 fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
     let mut preserved = HashMap::new();
     let _ = content.traverse::<_, ()>(&mut |content| {
-        if content.is::<TableElem>() || content.is::<EquationElem>() {
+        if content.is::<EquationElem>() || is_slot_container(&content) {
             preserved.insert(content.span(), content.clone());
         }
         std::ops::ControlFlow::Continue(())
@@ -176,6 +179,13 @@ fn restore_preserved(content: Content, preserved: &HashMap<Span, Content>) -> Co
         styled.child = restore_preserved(styled.child.clone(), preserved);
     } else if let Some(par) = content.to_packed_mut::<ParElem>() {
         par.body = restore_preserved(par.body.clone(), preserved);
+    } else {
+        for slot in extract_slots(&content) {
+            let restored = restore_preserved(slot.content, preserved);
+            if let Some(next) = replace_slot(&content, &slot.path, restored) {
+                content = next;
+            }
+        }
     }
 
     content

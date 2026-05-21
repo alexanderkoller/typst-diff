@@ -1,4 +1,5 @@
 pub mod annotate;
+pub mod content_slots;
 pub mod diag;
 pub mod diff;
 pub mod eval;

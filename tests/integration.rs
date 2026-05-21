@@ -86,11 +86,80 @@ fn table_cell_changes_are_reported_and_rendered() {
     let result = typst_diff::diff::diff_content(&old, &new);
     let log = result.modification_log();
 
-    assert!(log.contains("modify table cell"), "{log}");
+    assert!(log.contains("modify slot"), "{log}");
+    assert!(log.contains("TableCell(3)"), "{log}");
+    assert!(log.contains("TableCell(5)"), "{log}");
     assert!(log.contains("4 | 650"), "{log}");
     assert!(log.contains("5 | 100"), "{log}");
     assert!(log.contains("108"), "{log}");
     assert!(log.contains("97"), "{log}");
+
+    let annotated = typst_diff::build_annotated_content(&result, false);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
+    assert!(pdf.len() > 1000, "PDF suspiciously small");
+}
+
+#[test]
+fn list_item_changes_are_reported_and_rendered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("old.typ"),
+        "- Alpha item\n- Beta item\n- Gamma item\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("new.typ"),
+        "- Alpha item\n- Better item\n- Gamma item\n",
+    )
+    .unwrap();
+
+    let old_world = typst_diff::world::SystemWorld::new(dir.path().join("old.typ")).unwrap();
+    let new_world = typst_diff::world::SystemWorld::new(dir.path().join("new.typ")).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_content(&old, &new);
+    let log = result.modification_log();
+
+    assert!(log.contains("modify slot"), "{log}");
+    assert!(log.contains("ItemBody"), "{log}");
+    assert!(log.contains("Beta"), "{log}");
+    assert!(log.contains("Better"), "{log}");
+
+    let annotated = typst_diff::build_annotated_content(&result, false);
+    let plain = annotated.plain_text();
+    assert!(plain.contains("Alpha item"), "{plain}");
+    assert!(plain.contains("Gamma item"), "{plain}");
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
+    assert!(pdf.len() > 1000, "PDF suspiciously small");
+}
+
+#[test]
+fn figure_caption_changes_are_reported_and_rendered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("old.typ"),
+        "#figure(rect(width: 20pt, height: 10pt), caption: [Old caption])\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("new.typ"),
+        "#figure(rect(width: 20pt, height: 10pt), caption: [New caption])\n",
+    )
+    .unwrap();
+
+    let old_world = typst_diff::world::SystemWorld::new(dir.path().join("old.typ")).unwrap();
+    let new_world = typst_diff::world::SystemWorld::new(dir.path().join("new.typ")).unwrap();
+    let old = typst_diff::eval_to_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_content(&old, &new);
+    let log = result.modification_log();
+
+    assert!(log.contains("modify slot"), "{log}");
+    assert!(log.contains("FigureCaption"), "{log}");
+    assert!(log.contains("Old"), "{log}");
+    assert!(log.contains("New"), "{log}");
 
     let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();

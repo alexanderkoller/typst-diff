@@ -2,10 +2,11 @@ use typst::foundations::Content;
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::Abs;
 use typst::math::{CancelElem, EquationElem};
-use typst::model::{ParElem, TableChild, TableElem, TableItem};
-use typst::text::{StrikeElem, TextElem};
+use typst::model::ParElem;
+use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
+use crate::content_slots::{extract_slots, replace_inline_content, replace_slot};
 use crate::diff::{DiffBlock, DiffResult, DiffResultOp, WordOp};
 
 fn green() -> Color {
@@ -49,9 +50,13 @@ pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool)
                 }
             }
 
-            DiffResultOp::ModifiedTable(new_block, cell_diffs) => DiffBlock {
-                content: replace_table_cells(&new_block.content, cell_diffs, compact_substitutions)
-                    .unwrap_or_else(|| new_block.content.clone()),
+            DiffResultOp::ModifiedSlots(new_block, slot_diffs) => DiffBlock {
+                content: replace_modified_slots(
+                    &new_block.content,
+                    slot_diffs,
+                    compact_substitutions,
+                )
+                .unwrap_or_else(|| new_block.content.clone()),
                 page_styles: new_block.page_styles.clone(),
             },
         };
@@ -106,8 +111,16 @@ fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) ->
                 let next = word_ops.get(i + 1);
                 let adjacent_delete = prev.is_some_and(|op| matches!(op, WordOp::Delete(_)))
                     || next.is_some_and(|op| matches!(op, WordOp::Delete(_)));
-                let color = if compact_substitutions && adjacent_delete { blue() } else { green() };
-                let joined = Content::sequence(tokens.iter().map(|t| t.content.clone()));
+                let color = if compact_substitutions && adjacent_delete {
+                    blue()
+                } else {
+                    green()
+                };
+                let joined = changed_token_sequence(
+                    tokens,
+                    prev.and_then(deleted_tokens),
+                    compact_substitutions,
+                );
                 inline.push(joined.styled(TextElem::fill.set(color.into())));
             }
             WordOp::Delete(tokens) => {
@@ -123,6 +136,43 @@ fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) ->
         }
     }
     Content::sequence(inline)
+}
+
+fn deleted_tokens(op: &WordOp) -> Option<&[crate::diff::Token]> {
+    match op {
+        WordOp::Delete(tokens) => Some(tokens),
+        _ => None,
+    }
+}
+
+fn changed_token_sequence(
+    tokens: &[crate::diff::Token],
+    previous_delete: Option<&[crate::diff::Token]>,
+    compact_substitutions: bool,
+) -> Content {
+    let mut content: Vec<Content> = Vec::new();
+    if !compact_substitutions && previous_delete.is_some_and(|prev| needs_separator(prev, tokens)) {
+        content.push(SpaceElem::shared().clone());
+    }
+    content.extend(tokens.iter().map(|t| t.content.clone()));
+    Content::sequence(content)
+}
+
+fn needs_separator(left: &[crate::diff::Token], right: &[crate::diff::Token]) -> bool {
+    let Some(left_text) = left.last().map(|token| token.text.as_str()) else {
+        return false;
+    };
+    let Some(right_text) = right.first().map(|token| token.text.as_str()) else {
+        return false;
+    };
+    left_text
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !ch.is_whitespace())
+        && right_text
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_whitespace())
 }
 
 fn deleted_token_content(token: &crate::diff::Token) -> Content {
@@ -187,87 +237,21 @@ fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
 }
 
-fn replace_table_cells(
+fn replace_modified_slots(
     template: &Content,
-    cell_diffs: &[crate::diff::TableCellDiff],
+    slot_diffs: &[crate::diff::SlotDiff],
     compact_substitutions: bool,
 ) -> Option<Content> {
     let mut content = template.clone();
-
-    if let Some(styled) = content.to_packed_mut::<StyledElem>()
-        && let Some(child) = replace_table_cells(&styled.child, cell_diffs, compact_substitutions)
-    {
-        styled.child = child;
-        return Some(content);
+    for slot_diff in slot_diffs {
+        let inline = annotated_inline_content(&slot_diff.word_ops, compact_substitutions);
+        let current_slot = extract_slots(&content)
+            .into_iter()
+            .find(|slot| slot.path == slot_diff.path)?;
+        let replacement = replace_inline_content(&current_slot.content, &inline).unwrap_or(inline);
+        content = replace_slot(&content, &slot_diff.path, replacement)?;
     }
-
-    let table = content.to_packed_mut::<TableElem>()?;
-    let mut next_diff = 0;
-    let mut cell_index = 0;
-    replace_table_child_cells(
-        &mut table.children,
-        cell_diffs,
-        &mut next_diff,
-        &mut cell_index,
-        compact_substitutions,
-    );
     Some(content)
-}
-
-fn replace_table_child_cells(
-    children: &mut [TableChild],
-    cell_diffs: &[crate::diff::TableCellDiff],
-    next_diff: &mut usize,
-    cell_index: &mut usize,
-    compact_substitutions: bool,
-) {
-    for child in children {
-        match child {
-            TableChild::Header(header) => {
-                replace_table_item_cells(&mut header.children, cell_diffs, next_diff, cell_index, compact_substitutions)
-            }
-            TableChild::Footer(footer) => {
-                replace_table_item_cells(&mut footer.children, cell_diffs, next_diff, cell_index, compact_substitutions)
-            }
-            TableChild::Item(item) => {
-                replace_table_item_cell(item, cell_diffs, next_diff, cell_index, compact_substitutions)
-            }
-        }
-    }
-}
-
-fn replace_table_item_cells(
-    items: &mut [TableItem],
-    cell_diffs: &[crate::diff::TableCellDiff],
-    next_diff: &mut usize,
-    cell_index: &mut usize,
-    compact_substitutions: bool,
-) {
-    for item in items {
-        replace_table_item_cell(item, cell_diffs, next_diff, cell_index, compact_substitutions);
-    }
-}
-
-fn replace_table_item_cell(
-    item: &mut TableItem,
-    cell_diffs: &[crate::diff::TableCellDiff],
-    next_diff: &mut usize,
-    cell_index: &mut usize,
-    compact_substitutions: bool,
-) {
-    let TableItem::Cell(cell) = item else {
-        return;
-    };
-
-    if let Some(cell_diff) = cell_diffs.get(*next_diff)
-        && cell_diff.index == *cell_index
-    {
-        let inline = annotated_inline_content(&cell_diff.word_ops, compact_substitutions);
-        cell.body = replace_text_container(&cell.body, &inline).unwrap_or(inline);
-        *next_diff += 1;
-    }
-
-    *cell_index += 1;
 }
 
 #[cfg(test)]
