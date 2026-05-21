@@ -77,8 +77,13 @@ name, a tag, or a commit hash.
 3. The trees are split into blocks (paragraphs, headings, code blocks, display
    equations, tables) and aligned with an LCS diff.
 4. Adjacent changed blocks with ≥ 30% text similarity are paired for word-level
-   diffing; dissimilar blocks are marked as whole-block additions/deletions.
-5. The annotated content is rendered to PDF using the **new** document's world,
+   diffing. Structured containers (lists, tables, figures, etc.) are diffed
+   slot-by-slot rather than as a whole. Dissimilar blocks are marked as
+   whole-block additions/deletions.
+5. Consecutive deleted and inserted words that are separated only by whitespace
+   are merged into a single red run and a single green run, avoiding alternating
+   red–green noise when a whole sentence is replaced.
+6. The annotated content is rendered to PDF using the **new** document's world,
    so fonts and assets resolve correctly.
 
 ### Colour scheme
@@ -97,22 +102,15 @@ easier to read at a glance.
 
 ## Limitations
 
-typst-diff currently traverses only a limited set of content containers when
-looking for fine-grained changes:
-
-- Paragraphs, styled content, sequences, text, spaces, headings, raw blocks,
-  tables, and equations are handled explicitly.
-- Table cell contents are diffed cell-by-cell.
-- Math equations are diffed as whole expressions. Deleted equations are rendered
-  with Typst's math cancellation mark; inserted equations are green.
-- Other structured containers are still mostly opaque. This includes lists,
-  enumerations, term lists, grids, figures and captions, footnotes, boxes,
-  blocks, alignment/padding/placement wrappers, columns, stacks, quotes, and
-  shape bodies. Changes inside these may be missed or rendered as whole-container
-  changes instead of word-level changes.
-- Moved paragraphs are shown as a deletion plus an insertion; moved-block
-  detection is not implemented.
-- Only PDF output is supported.
+- **Math equations** are treated as atomic tokens. Changes inside a single
+  equation are shown as a whole-equation delete + insert. Deleted equations use
+  Typst's `math.cancel` element instead of strikethrough.
+- **Code blocks** (`raw`) are atomic blocks. Changes are shown as whole-block
+  delete + insert.
+- **Moved paragraphs** appear as a deletion at the original site plus an
+  insertion at the new site. Move detection is not implemented.
+- **Only PDF output** is supported.
+- **Colours are hardcoded**: green `#00b400` and red `#dc0000`.
 
 ## Building
 

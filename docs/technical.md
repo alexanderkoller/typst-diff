@@ -51,14 +51,15 @@ changes.
 
 ```
 src/
-├── lib.rs        — library root; public re-exports
-├── main.rs       — CLI binary: argument parsing + orchestration
-├── world.rs      — World trait implementation (filesystem + fonts)
-├── eval.rs       — Content tree extraction from a World
-├── diff.rs       — Two-level block+word diff
-├── annotate.rs   — Build annotated Content from a DiffResult
-├── render.rs     — layout_document + typst_pdf → Vec<u8>
-└── diag.rs       — Diagnostic formatting (file:line:col messages)
+├── lib.rs             — library root; public re-exports
+├── main.rs            — CLI binary: argument parsing + orchestration
+├── world.rs           — World trait implementation (filesystem + fonts)
+├── eval.rs            — Content tree extraction from a World
+├── diff.rs            — Two-level block+word diff
+├── content_slots.rs   — Named sub-positions inside structured elements
+├── annotate.rs        — Build annotated Content from a DiffResult
+├── render.rs          — layout_document + typst_pdf → Vec<u8>
+└── diag.rs            — Diagnostic formatting (file:line:col messages)
 ```
 
 The crate is both a library and a binary. `src/lib.rs` exports the public API
@@ -131,12 +132,11 @@ Used by the CLI. Runs two additional passes over the Content tree:
    counter steps, and document structure into a flat sequence of `(Content,
    StyleChain)` pairs.
 
-Before realization, `collect_preserved_by_span` records original structured
-nodes whose realized form would otherwise become opaque layout output. At the
-moment this preservation set contains `TableElem` and `EquationElem`. After
-realization, `restore_preserved` replaces realized nodes with matching spans
-with the original table/equation nodes, recursing through `SequenceElem`,
-`StyledElem`, and `ParElem`.
+Before realization, `collect_preserved_by_span` records every `EquationElem`
+and every node that `content_slots::is_slot_container` recognises (lists,
+tables, figures, etc.). These nodes would become opaque layout output after
+realization. After realization, `restore_preserved` substitutes them back by
+span, recursing through `SequenceElem`, `StyledElem`, and `ParElem`.
 
 The realized output is then re-wrapped into a `Content::sequence` where each
 item carries its inline styles (non-page styles), and the whole sequence is
@@ -146,6 +146,34 @@ and attached as `DiffBlock::page_styles` downstream.
 The realized pipeline is heavier but produces more accurate diffs for documents
 that use Typst's document structure features (chapter counters, auto-generated
 headings, etc.).
+
+### content_slots
+
+Defines the *slot* abstraction: a named, text-bearing sub-position inside a
+structured `Content` element, identified by a `Vec<SlotStep>` path from the
+element root.
+
+**`extract_slots(content)`** walks a `Content` tree and returns every leaf slot
+in document order. Returns an empty `Vec` for elements with no addressable slots
+(plain text, headings, raw blocks, etc.). The full set of handled containers is:
+`ListElem` / `ListItem`, `EnumElem` / `EnumItem`, `TermsElem` / `TermItem`,
+`FigureElem` (body + caption), `FootnoteElem`, `QuoteElem`, `TableElem`,
+`GridElem`, `StackElem`, and single-body wrappers (`AlignElem`, `PadElem`,
+`PlaceElem`, `ColumnsElem`, `BoxElem`, `BlockElem`, `RectElem`, `CircleElem`,
+`EllipseElem`).
+
+**`is_slot_container(content)`** returns `true` for all of the above types. Used
+in `eval.rs` to identify nodes that must be captured before realization (see
+[eval](#eval)).
+
+**`replace_slot(template, path, replacement)`** writes a new `Content` value
+into the addressed slot of a cloned tree, returning `None` if the path doesn't
+match.
+
+**`normalize_list_item_runs(content)`** wraps consecutive bare `ListItem` /
+`EnumItem` / `TermItem` nodes into their container elements. The Typst evaluator
+sometimes emits items as siblings in a `SequenceElem`; this normalisation ensures
+the tree always uses the container form before `extract_slots` runs.
 
 ### diff
 
@@ -265,13 +293,13 @@ pub enum DiffResultOp {
     Equal(DiffBlock),
     Deleted(DiffBlock),
     Inserted(DiffBlock),
-    Modified(DiffBlock, Vec<WordOp>),  // new block + word-level diff
-    ModifiedTable(DiffBlock, Vec<TableCellDiff>),
+    Modified(DiffBlock, Vec<WordOp>),          // new block + word-level diff
+    ModifiedSlots(DiffBlock, Vec<SlotDiff>),   // structured container, slots changed
 }
 
 pub struct DiffResult {
     pub block_ops: Vec<DiffResultOp>,
-    pub root_styles: Styles,           // document-level page styles
+    pub root_styles: Styles,                   // document-level page styles
 }
 ```
 
@@ -280,19 +308,24 @@ document's realized content. It carries document-level page styles, such as
 default margins and headers/footers, and is applied to the entire annotated
 output.
 
-### `TableCellDiff`
+`ModifiedSlots` takes priority over `Modified`: when a `Replace` block pair
+has the same slot shape (same number of slots at the same paths), `diff_content`
+diffs corresponding slots word-by-word. If no slots are found or the shape
+differs, it falls back to whole-block word diffing (`Modified`).
+
+### `SlotDiff`
 
 ```rust
-pub struct TableCellDiff {
-    pub index: usize,
+pub struct SlotDiff {
+    pub path: Vec<SlotStep>,
     pub word_ops: Vec<WordOp>,
 }
 ```
 
-When both sides of a replacement are `TableElem` values with the same number of
-cells, `diff_content` diffs corresponding cell bodies rather than treating the
-whole table as a single atomic block. `index` is the cell's linear position in
-semantic table order, including repeated headers and footers.
+Identifies one changed slot within a structured container. `path` is the
+`Vec<SlotStep>` address returned by `extract_slots`; `word_ops` is the
+word-level diff for that slot's content. Only slots with at least one textual
+change are included — unchanged slots are omitted from the `Vec<SlotDiff>`.
 
 ### `Token`
 
@@ -320,7 +353,9 @@ pub enum WordOp {
 ```
 
 Adjacent same-tag ops from the raw `similar` output are coalesced into a single
-`WordOp` before the vector is returned.
+`WordOp` before the vector is returned. A second pass (`merge_substitution_zones`)
+then absorbs whitespace-only `Equal` ops that sit between `Delete`/`Insert` runs
+into those runs (see [Word-level diff](#word-level-diff)).
 
 ### `HashableContent`
 
@@ -418,9 +453,31 @@ two `Vec<Token>` slices. `Token` implements `PartialEq`, `Eq`, `Hash`, and
 `Ord` based on the `text` field only, satisfying the trait bounds required by
 `similar`.
 
-`DiffOp::Replace` from `similar` is again decomposed into Delete + Insert pairs
-before coalescing. Adjacent ops of the same tag are merged by `coalesce` so the
-resulting `Vec<WordOp>` never has two consecutive ops of the same type.
+`DiffOp::Replace` from `similar` is decomposed into Delete + Insert pairs
+before coalescing. Adjacent ops of the same tag are merged by `coalesce` so
+the result never has two consecutive ops of the same type.
+
+**Substitution zone merging (`merge_substitution_zones`):** Myers LCS operates
+on individual tokens, so replacing an entire sentence word-by-word produces an
+alternating Delete / Insert / Equal(space) / Delete / Insert / … pattern. The
+whitespace-only `Equal` ops prevent `coalesce` from joining the Deletes (or
+Inserts) into a single run.
+
+`merge_substitution_zones` runs as a final pass inside `diff_words`. It
+identifies *zones*: maximal contiguous runs of `Delete`, `Insert`, and
+whitespace-only `Equal` ops. Within each zone:
+
+- Two per-side pending-whitespace buffers accumulate whitespace tokens from
+  `Equal` ops.
+- On `Delete`: flush the delete-side buffer into the delete token list, then
+  append the op's own tokens.
+- On `Insert`: same for the insert side.
+- Trailing whitespace (no following op to consume it) is dropped.
+
+The result is at most one `Delete` followed by at most one `Insert` per zone,
+with whitespace embedded. A sentence-level substitution therefore renders as
+one contiguous red strikethrough followed by one contiguous green run instead
+of alternating red–green at every word boundary.
 
 ### Similarity metric
 
@@ -457,11 +514,13 @@ would lose, such as scripts, fractions, and other math structure. The current
 granularity is expression-level: symbols inside a single equation are not yet
 diffed independently.
 
-**Table cells:** `diff_table_cells` handles table-vs-table replacements by
-collecting `TableCell` bodies from `TableElem.children`, including headers and
-footers. If both tables have the same number of cells, corresponding cell
-bodies are word-diffed. Cells without textual changes are left untouched; cells
-with changes are recorded as `TableCellDiff` and rewritten during annotation.
+**Slot containers:** `diff_slots` handles structured-container-vs-container
+replacements. It calls `extract_slots` on both sides and, if the slot count
+and paths match, word-diffs each slot pair. Only slots with textual changes
+become `SlotDiff` entries. The slot mechanism covers tables (cell-by-cell),
+lists (item-by-item), figures (body + caption), footnotes, quotes, grids, and
+most layout wrappers. If the slot shape differs (structure changed), `diff_slots`
+returns `None` and the block falls back to whole-block word diffing.
 
 ---
 
@@ -476,7 +535,7 @@ produces annotated `Content`:
 | `Inserted(block)` | Wrap `block.content` with `.styled(TextElem::fill.set(green()))`. All text inside inherits green fill. |
 | `Deleted(block)` | Flatten the block to plain text via `plain_content()`, apply red fill, wrap in `StrikeElem`. Using plain text avoids re-rendering structural side effects (e.g. a deleted `HeadingElem` would otherwise still add a chapter number to the document). |
 | `Modified(new_block, word_ops)` | Build inline annotated content from `word_ops` (see below), then use `replace_text_container` to graft it into the original block structure. |
-| `ModifiedTable(new_block, cell_diffs)` | Clone the new table and replace only the changed cell bodies with annotated inline content. |
+| `ModifiedSlots(new_block, slot_diffs)` | For each changed slot: build annotated inline content from the slot's `word_ops`, use `replace_inline_content` to graft it into the slot body, then use `replace_slot` to write the slot back into a clone of `new_block.content`. |
 
 **Word-op inline rendering:**
 
@@ -501,12 +560,6 @@ tree looking for the node to replace the inline children:
 If no suitable container is found (e.g. a `HeadingElem` without a bare inner
 sequence), `replace_text_container` returns `None` and the annotated content is
 used directly without structural wrapping.
-
-**`replace_table_cells(template, cell_diffs)`** walks a cloned `TableElem`
-through `TableChild::{Header, Footer, Item}` and `TableItem::Cell` in the same
-linear order used by `diff_table_cells`. For each changed cell, it calls
-`annotated_inline_content` and grafts the result into the cell body with
-`replace_text_container`.
 
 **Page-style grouping:** Blocks are batched by `page_styles` identity. Whenever
 `page_styles` changes between consecutive blocks, the accumulated batch is
@@ -600,46 +653,34 @@ Moved-block detection is not implemented.
 
 **Math equations:** Display equations are treated as atomic blocks (never
 word-diffed). Inline equations are atomic tokens. Changes inside equations are
-shown as whole-equation delete+insert. Deleted equations use Typst's
+shown as whole-equation delete + insert. Deleted equations use Typst's
 `math.cancel` element instead of text strikethrough.
 
-**Opaque content containers:** The generic traversal currently descends through
-`SequenceElem`, `StyledElem`, and `ParElem`. It also has special handling for
-`TableElem` cells and `EquationElem` tokens. Other structured containers are
-mostly treated as atomic blocks or atomic tokens. Important examples are
-`ListElem`, `EnumElem`, `TermsElem`, `GridElem`, `FigureElem` and
-`FigureCaption`, `FootnoteElem`, `BlockElem`, `BoxElem`, `AlignElem`,
-`PadElem`, `PlaceElem`, `ColumnsElem`, `StackElem`, `QuoteElem`, and shape
-elements with optional bodies such as `RectElem` and `CircleElem`. Changes
-inside these containers may be missed if the outer element compares equal by
-plain text, or may be highlighted only as a whole-container replacement.
-
-**Lists and enumerations:** The corpus currently contains examples where list,
-nested-list, and enumeration item text changes are not detected as modifications
-because list containers are not traversed item-by-item.
-
 **Code blocks (`RawElem`):** Treated as atomic blocks. Source-level changes
-inside code blocks are shown as whole-block delete+insert.
+inside code blocks are shown as whole-block delete + insert.
+
+**Slot shape matching:** `diff_slots` only proceeds when the old and new
+container have the same number of slots at the same paths. If the list or
+table structure itself changes (items added/removed, columns inserted), the
+whole container falls back to plain word diffing or whole-block
+delete + insert.
 
 **Block similarity threshold:** The 0.3 threshold is a fixed constant.
-Completely rewritten paragraphs will sometimes exceed 0.3 similarity (e.g. if
-only two words in a long paragraph changed) and be paired for word-level
-diffing, which is usually the desired behaviour. A threshold of 0.0 would pair
-everything; 1.0 would never pair.
+Completely rewritten paragraphs will sometimes exceed 0.3 similarity and be
+paired for word-level diffing, which is usually the desired behaviour. A
+threshold of 0.0 would pair everything; 1.0 would never pair.
 
 **Structural headings:** Deleted `HeadingElem` blocks are rendered as plain
-strikethrough text, not as a struck-through heading. This avoids incrementing
-chapter counters or generating table-of-contents entries for deleted content.
-Inserted headings retain their full heading styling.
+strikethrough text to avoid incrementing chapter counters or generating
+table-of-contents entries for deleted content. Inserted headings retain full
+heading styling.
 
-**Page-style tracking:** Page style stickiness is implemented as a forward pass
-over extracted blocks. If a document sets page styles mid-sequence in a way that
-is not captured by the `StyledElem` unwrapping logic, blocks may inherit the
-wrong page styles.
+**Page-style tracking:** Page style stickiness is a forward pass over extracted
+blocks. If a document sets page styles in a way not captured by the `StyledElem`
+unwrapping logic, blocks may inherit incorrect page styles.
 
 **Two-document restriction:** The CLI takes exactly two document versions. Git
-range diffing (three-way merge, comparing more than two revisions) is out of
-scope.
+range diffing (three-way merge, more than two revisions) is out of scope.
 
 **HTML output:** Only PDF output is supported.
 
