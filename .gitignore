@@ -1,1 +1,8 @@
-/target
+/target/
+/diff.pdf
+/notes.txt
+tests/corpus_output/
+tests/examples/diff.pdf
+tests/examples/modifications.txt
+tests/examples/new.pdf
+tests/examples/new-direct.pdf

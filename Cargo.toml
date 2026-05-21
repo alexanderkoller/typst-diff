@@ -2,6 +2,12 @@
 name = "typst-diff"
 version = "0.1.0"
 edition = "2024"
+description = "Diff two Typst documents and produce a PDF showing word-level changes"
+license = "MIT"
+repository = "https://github.com/alexanderkoller/typst-diff"
+keywords = ["typst", "diff", "pdf"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = ["tests/", "docs/", "*.md", "**/*.md", "*.orig", "**/*.orig", ".*"]
 
 [lib]
 name = "typst_diff"
