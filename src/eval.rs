@@ -7,12 +7,14 @@ use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{
     Content, NativeElement, SequenceElem, Style, StyleChain, StyledElem, Styles, Target, TargetElem,
 };
+use typst::introspection::TagElem;
 use typst::introspection::{Introspector, Locator};
-use typst::layout::{PageElem, PagebreakElem};
+use typst::layout::{HElem, PageElem, PagebreakElem};
 use typst::math::EquationElem;
-use typst::model::{DocumentInfo, ParElem};
+use typst::model::{DocumentInfo, FootnoteElem, ParElem};
 use typst::routines::{Arenas, RealizationKind};
 use typst::syntax::Span;
+use typst::text::TextElem;
 
 use crate::content_slots::{
     extract_slots, is_slot_container, normalize_list_item_runs, replace_slot,
@@ -104,6 +106,7 @@ fn realize_to_content(
     let root_page_styles = page_styles(&style_map);
     let styles = StyleChain::new(&style_map);
     let preserved = collect_preserved_by_span(content);
+    let footnotes = collect_footnotes(content);
 
     let traced = Traced::default();
     let mut sink = Sink::new();
@@ -137,18 +140,18 @@ fn realize_to_content(
         ));
     }
 
-    Ok(
-        Content::sequence(realized.iter().map(|(realized_content, styles)| {
-            let content = restore_preserved((*realized_content).clone(), &preserved);
-            let styles = if realized_content.is::<PagebreakElem>() {
-                marginal_styles(&styles.to_map())
-            } else {
-                non_page_styles(styles.to_map())
-            };
-            content.styled_with_map(styles)
-        }))
-        .styled_with_map(root_page_styles),
-    )
+    let realized = Content::sequence(realized.iter().map(|(realized_content, styles)| {
+        let content = restore_preserved((*realized_content).clone(), &preserved);
+        let styles = if realized_content.is::<PagebreakElem>() {
+            marginal_styles(&styles.to_map())
+        } else {
+            non_page_styles(styles.to_map())
+        };
+        content.styled_with_map(styles)
+    }))
+    .styled_with_map(root_page_styles);
+
+    Ok(restore_footnote_markers(realized, &footnotes))
 }
 
 fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
@@ -160,6 +163,120 @@ fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
         std::ops::ControlFlow::Continue(())
     });
     preserved
+}
+
+fn collect_footnotes(content: &Content) -> Vec<Content> {
+    let mut footnotes = Vec::new();
+    let _ = content.traverse::<_, ()>(&mut |content| {
+        if content.is::<FootnoteElem>() {
+            footnotes.push(content);
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    footnotes
+}
+
+fn restore_footnote_markers(content: Content, footnotes: &[Content]) -> Content {
+    let mut next = 0;
+    restore_footnote_markers_inner(content, footnotes, &mut next)
+}
+
+fn restore_footnote_markers_inner(
+    content: Content,
+    footnotes: &[Content],
+    next: &mut usize,
+) -> Content {
+    if footnotes.is_empty() {
+        return content;
+    }
+
+    if is_footnote_marker(&content, *next + 1)
+        && let Some(footnote) = footnotes.get(*next)
+    {
+        *next += 1;
+        return footnote.clone();
+    }
+
+    let mut content = content;
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        seq.children = restore_footnote_markers_in_sequence(&seq.children, footnotes, next);
+    } else if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        styled.child = restore_footnote_markers_inner(styled.child.clone(), footnotes, next);
+    } else if let Some(par) = content.to_packed_mut::<ParElem>() {
+        par.body = restore_footnote_markers_inner(par.body.clone(), footnotes, next);
+    }
+
+    content
+}
+
+fn restore_footnote_markers_in_sequence(
+    children: &[Content],
+    footnotes: &[Content],
+    next: &mut usize,
+) -> Vec<Content> {
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < children.len() {
+        if is_footnote_marker_deep(&children[i], *next + 1)
+            && let Some(footnote) = footnotes.get(*next)
+        {
+            while out.last().is_some_and(is_footnote_scaffold) {
+                out.pop();
+            }
+            out.push(footnote.clone());
+            *next += 1;
+            i += 1;
+            while i < children.len() && is_footnote_scaffold(&children[i]) {
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(restore_footnote_markers_inner(
+            children[i].clone(),
+            footnotes,
+            next,
+        ));
+        i += 1;
+    }
+
+    out
+}
+
+fn is_footnote_marker_deep(content: &Content, number: usize) -> bool {
+    if is_footnote_marker(content, number) {
+        return true;
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return is_footnote_marker_deep(&styled.child, number);
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .any(|child| is_footnote_marker_deep(child, number));
+    }
+    false
+}
+
+fn is_footnote_scaffold(content: &Content) -> bool {
+    if content.is::<TagElem>() || content.is::<HElem>() {
+        return true;
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return is_footnote_scaffold(&styled.child);
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq.children.iter().all(is_footnote_scaffold);
+    }
+    false
+}
+
+fn is_footnote_marker(content: &Content, number: usize) -> bool {
+    content
+        .to_packed::<TextElem>()
+        .is_some_and(|text| text.text.as_str() == number.to_string())
 }
 
 fn restore_preserved(content: Content, preserved: &HashMap<Span, Content>) -> Content {

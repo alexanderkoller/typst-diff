@@ -11,6 +11,7 @@ use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlotStep {
+    SequenceChild(usize),
     StyledChild,
     ParBody,
     ItemBody,
@@ -140,6 +141,15 @@ fn group_list_item_runs(children: Vec<Content>) -> Vec<Content> {
 }
 
 fn collect_slots(content: &Content, prefix: &mut Vec<SlotStep>, slots: &mut Vec<ContentSlot>) {
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        for (index, child) in seq.children.iter().enumerate() {
+            prefix.push(SlotStep::SequenceChild(index));
+            collect_slots(child, prefix, slots);
+            prefix.pop();
+        }
+        return;
+    }
+
     if let Some(styled) = content.to_packed::<StyledElem>() {
         prefix.push(SlotStep::StyledChild);
         collect_slots(&styled.child, prefix, slots);
@@ -148,6 +158,13 @@ fn collect_slots(content: &Content, prefix: &mut Vec<SlotStep>, slots: &mut Vec<
     }
 
     if let Some(par) = content.to_packed::<ParElem>() {
+        let before = slots.len();
+        prefix.push(SlotStep::ParBody);
+        collect_slots(&par.body, prefix, slots);
+        prefix.pop();
+        if slots.len() > before {
+            return;
+        }
         push_slot(prefix, SlotStep::ParBody, par.body.clone(), slots);
         return;
     }
@@ -384,14 +401,24 @@ pub fn replace_slot(
     let mut content = template.clone();
 
     match step {
+        SlotStep::SequenceChild(index) => {
+            let seq = content.to_packed_mut::<SequenceElem>()?;
+            let child = seq.children.get(*index)?;
+            seq.children[*index] = replace_slot(child, rest, replacement)?;
+            Some(content)
+        }
         SlotStep::StyledChild => {
             let styled = content.to_packed_mut::<StyledElem>()?;
             styled.child = replace_slot(&styled.child, rest, replacement)?;
             Some(content)
         }
-        SlotStep::ParBody if rest.is_empty() => {
+        SlotStep::ParBody => {
             let par = content.to_packed_mut::<ParElem>()?;
-            par.body = replacement;
+            if rest.is_empty() {
+                par.body = replacement;
+            } else {
+                par.body = replace_slot(&par.body, rest, replacement)?;
+            }
             Some(content)
         }
         SlotStep::ItemBody if rest.is_empty() => {
