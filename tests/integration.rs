@@ -97,3 +97,22 @@ fn table_cell_changes_are_reported_and_rendered() {
     assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
     assert!(pdf.len() > 1000, "PDF suspiciously small");
 }
+
+#[test]
+fn math_expression_changes_are_reported_and_rendered() {
+    let old_world = world_for("math_old.typ");
+    let new_world = world_for("math_new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_content(&old, &new);
+    let log = result.modification_log();
+
+    assert!(log.contains("[γ]"), "{log}");
+    assert!(log.contains("2n"), "{log}");
+    assert!(log.contains("/ 6") || log.contains("6"), "{log}");
+
+    let annotated = typst_diff::build_annotated_content(&result);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
+    assert!(pdf.len() > 1000, "PDF suspiciously small");
+}

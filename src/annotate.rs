@@ -1,8 +1,10 @@
 use typst::foundations::Content;
-use typst::foundations::{SequenceElem, StyledElem};
+use typst::foundations::{SequenceElem, StyleChain, StyledElem};
+use typst::layout::Abs;
+use typst::math::{CancelElem, EquationElem};
 use typst::model::{ParElem, TableChild, TableElem, TableItem};
 use typst::text::{StrikeElem, TextElem};
-use typst::visualize::Color;
+use typst::visualize::{Color, Stroke};
 
 use crate::diff::{DiffBlock, DiffResult, DiffResultOp, WordOp};
 
@@ -101,19 +103,34 @@ fn annotated_inline_content(word_ops: &[WordOp]) -> Content {
                 inline.push(joined.styled(TextElem::fill.set(green().into())));
             }
             WordOp::Delete(tokens) => {
-                let joined = Content::sequence(tokens.iter().map(|t| {
-                    if t.content.plain_text().is_empty() {
-                        TextElem::packed(t.text.as_str())
-                    } else {
-                        t.content.clone()
-                    }
-                }));
-                let colored = joined.styled(TextElem::fill.set(red().into()));
-                inline.push(Content::new(StrikeElem::new(colored)));
+                inline.push(Content::sequence(tokens.iter().map(deleted_token_content)));
             }
         }
     }
     Content::sequence(inline)
+}
+
+fn deleted_token_content(token: &crate::diff::Token) -> Content {
+    if let Some(equation) = token.content.to_packed::<EquationElem>() {
+        let body = equation
+            .body
+            .clone()
+            .styled(TextElem::fill.set(red().into()));
+        let cancelled = Content::new(
+            CancelElem::new(body).with_stroke(Stroke::from_pair(red(), Abs::pt(0.6).into())),
+        );
+        return Content::new(
+            EquationElem::new(cancelled).with_block(equation.block.get(StyleChain::default())),
+        );
+    }
+
+    let content = if token.content.plain_text().is_empty() {
+        TextElem::packed(token.text.as_str())
+    } else {
+        token.content.clone()
+    };
+    let colored = content.styled(TextElem::fill.set(red().into()));
+    Content::new(StrikeElem::new(colored))
 }
 
 fn replace_text_container(template: &Content, replacement: &Content) -> Option<Content> {

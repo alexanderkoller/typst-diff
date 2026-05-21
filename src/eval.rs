@@ -4,10 +4,13 @@ use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{Content, NativeElement, Style, StyleChain, Styles, Target, TargetElem};
+use typst::foundations::{
+    Content, NativeElement, SequenceElem, Style, StyleChain, StyledElem, Styles, Target, TargetElem,
+};
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PageElem, PagebreakElem};
-use typst::model::{DocumentInfo, TableElem};
+use typst::math::EquationElem;
+use typst::model::{DocumentInfo, ParElem, TableElem};
 use typst::routines::{Arenas, RealizationKind};
 use typst::syntax::Span;
 
@@ -97,7 +100,7 @@ fn realize_to_content(
     let style_map = styles.to_map().outside();
     let root_page_styles = page_styles(&style_map);
     let styles = StyleChain::new(&style_map);
-    let tables = collect_tables_by_span(content);
+    let preserved = collect_preserved_by_span(content);
 
     let traced = Traced::default();
     let mut sink = Sink::new();
@@ -133,10 +136,7 @@ fn realize_to_content(
 
     Ok(
         Content::sequence(realized.iter().map(|(realized_content, styles)| {
-            let content = tables
-                .get(&realized_content.span())
-                .cloned()
-                .unwrap_or_else(|| (*realized_content).clone());
+            let content = restore_preserved((*realized_content).clone(), &preserved);
             let styles = if realized_content.is::<PagebreakElem>() {
                 marginal_styles(&styles.to_map())
             } else {
@@ -148,15 +148,37 @@ fn realize_to_content(
     )
 }
 
-fn collect_tables_by_span(content: &Content) -> HashMap<Span, Content> {
-    let mut tables = HashMap::new();
+fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
+    let mut preserved = HashMap::new();
     let _ = content.traverse::<_, ()>(&mut |content| {
-        if content.is::<TableElem>() {
-            tables.insert(content.span(), content.clone());
+        if content.is::<TableElem>() || content.is::<EquationElem>() {
+            preserved.insert(content.span(), content.clone());
         }
         std::ops::ControlFlow::Continue(())
     });
-    tables
+    preserved
+}
+
+fn restore_preserved(content: Content, preserved: &HashMap<Span, Content>) -> Content {
+    if let Some(replacement) = preserved.get(&content.span()) {
+        return replacement.clone();
+    }
+
+    let mut content = content;
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        seq.children = seq
+            .children
+            .iter()
+            .cloned()
+            .map(|child| restore_preserved(child, preserved))
+            .collect();
+    } else if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        styled.child = restore_preserved(styled.child.clone(), preserved);
+    } else if let Some(par) = content.to_packed_mut::<ParElem>() {
+        par.body = restore_preserved(par.body.clone(), preserved);
+    }
+
+    content
 }
 
 fn non_page_styles(styles: Styles) -> Styles {

@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use typst::foundations::{
-    Content, NativeElement, SequenceElem, Smart, Style, StyleChain, StyledElem, Styles,
+    Content, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem, Styles,
 };
 use typst::layout::{BlockBody, BlockElem, PageElem, Rel};
 use typst::math::EquationElem;
@@ -320,6 +320,11 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
         collect_tokens(&styled.child, out);
     } else if let Some(par) = content.to_packed::<ParElem>() {
         collect_tokens(&par.body, out);
+    } else if let Some(equation) = content.to_packed::<EquationElem>() {
+        out.push(Token {
+            text: equation.body.repr().to_string(),
+            content: content.clone(),
+        });
     } else if let Some(text_elem) = content.to_packed::<TextElem>() {
         collect_text_tokens(text_elem.text.as_str(), out);
     } else if content.is::<SpaceElem>() {
