@@ -1,199 +1,97 @@
 # typst-diff
 
-Compares two Typst documents and produces a PDF showing word-level changes:
-additions in green, deletions in red strikethrough.
+typst-diff compares two versions of a Typst document and produces a PDF that
+marks every addition in green and every deletion in red strikethrough — word
+by word.
 
-Works on fully-evaluated content trees, so `#include` directives and macros are
-expanded before diffing.
+- **Works on evaluated content.** `#include` directives, user-defined functions,
+  and show rules are fully expanded before diffing, so the output reflects what
+  Typst actually typesets, not what the source looks like.
+- **Multi-file projects.** Pass the top-level entry file; all included files
+  are resolved automatically.
+- **Git integration.** Compare the current working tree against any commit,
+  branch, or tag without manually saving a copy of the old version.
+- **Fine-grained diffs.** Lists, enumerations, tables, figures, footnotes, and
+  other structured containers are diffed item-by-item, not as opaque blocks.
 
-## Usage
+## Install
 
-```
-typst-diff <OLD> <NEW> [-o diff.pdf] [-l changes.log]
-typst-diff <FILE> --revision <REV> [-o diff.pdf] [-l changes.log]
-```
+Requires [Rust 1.85 or later](https://rustup.rs).
 
-```
-Arguments:
-  <OLD>   Path to the old document entry point
-  <NEW>   Path to the new document entry point
-  <FILE>  Working-tree entry point when comparing against Git
-
-Options:
-  -r, --revision <REV>  Compare the working-tree file against this Git revision
-  -o, --output <OUTPUT>  Output PDF path [default: diff.pdf]
-  -l, --log-modifications <PATH>
-                          Write a text log of detected insertions, deletions,
-                          and modified blocks
-  -s, --compact-substitutions
-                          Show substitutions as blue without red strikethrough;
-                          insertions remain green, pure deletions remain red
-  -h, --help             Print help
-```
-
-Both arguments are entry-point `.typ` files. If your document uses `#include`,
-pass the top-level file; included files are resolved relative to it.
-
-The Git form compares the working-tree version of `<FILE>` against `<REV>`.
-Run it from anywhere inside the Git working tree. The file path must point to
-the current working-tree entry point.
-
-### Examples
-
-Single-file diff:
 ```sh
-typst-diff v1/main.typ v2/main.typ -o changes.pdf
+cargo install typst-diff
 ```
 
-Multi-file project:
+## Quick start
+
+**Compare two files:**
 ```sh
-typst-diff old/main.typ new/main.typ
+typst-diff old.typ new.typ
 # writes diff.pdf in the current directory
 ```
 
-Working tree against Git:
+**Multi-file project:**
 ```sh
-typst-diff main.typ --revision HEAD~1 -o changes.pdf
+typst-diff old/main.typ new/main.typ -o changes.pdf
 ```
 
-Write a debugging log of the detected edits:
+**Compare working tree against a Git revision:**
 ```sh
-typst-diff main.typ --revision HEAD -o changes.pdf -l changes.log
+typst-diff main.typ --revision HEAD~1
+typst-diff main.typ --revision v1.0 -o since-v1.pdf
 ```
 
-Git mode assumes the command runs inside a Git working tree. It snapshots the
-full tree at `<REV>` with `git archive`, so included files and assets are read
-from that revision while the new document is read from the current working tree.
+Run `typst-diff --help` for the full option list.
 
-You can use any revision accepted by Git, such as `HEAD`, `HEAD~1`, a branch
-name, a tag, or a commit hash.
+## Options
 
-## How it works
+```
+typst-diff <OLD> <NEW> [OPTIONS]
+typst-diff <FILE> --revision <REV> [OPTIONS]
 
-1. Both documents are evaluated by the Typst compiler, expanding all `#include`s
-   and macros into a `Content` tree.
-2. Show rules and counter-dependent content are realized with a layout
-   introspector so the diff sees the content Typst actually typesets.
-3. The trees are split into blocks (paragraphs, headings, code blocks, display
-   equations, tables) and aligned with an LCS diff.
-4. Adjacent changed blocks with ≥ 30% text similarity are paired for word-level
-   diffing. Structured containers (lists, tables, figures, etc.) are diffed
-   slot-by-slot rather than as a whole. Dissimilar blocks are marked as
-   whole-block additions/deletions.
-5. Consecutive deleted and inserted words that are separated only by whitespace
-   are merged into a single red run and a single green run, avoiding alternating
-   red–green noise when a whole sentence is replaced.
-6. The annotated content is rendered to PDF using the **new** document's world,
-   so fonts and assets resolve correctly.
+Arguments:
+  <OLD>   Path to the old document entry point
+  <NEW>   Path to the new document entry point
+  <FILE>  Working-tree entry point when comparing against a Git revision
 
-### Colour scheme
+Options:
+  -r, --revision <REV>          Compare the working-tree file against this Git revision
+  -o, --output <PATH>           Output PDF path [default: diff.pdf]
+  -l, --log-modifications <PATH>
+                                Write a plain-text log of every detected insertion,
+                                deletion, and modification
+  -s, --compact-substitutions   Show substitutions as blue without red strikethrough
+  -h, --help                    Print help
+```
+
+Git mode requires `git` and `tar` on your `PATH`. You can use any revision
+accepted by Git: `HEAD`, `HEAD~1`, a branch name, a tag, or a commit hash.
+
+## Colour scheme
 
 | Change | Default | `--compact-substitutions` |
-|---|---|---|
+|--------|---------|--------------------------|
 | Inserted word or block | green | green |
 | Deleted word or block | red strikethrough | red strikethrough |
 | Substitution — new text | green | **blue** |
 | Substitution — old text | red strikethrough | *(hidden)* |
 
-A substitution is a word deletion immediately adjacent to a word insertion within
-the same block. With `--compact-substitutions` the replaced text is hidden and
-the replacement is coloured blue, making diffs with many small word changes
-easier to read at a glance.
+With `--compact-substitutions`, replaced text is hidden and the replacement is
+blue. This reduces visual noise when many individual words change at once.
 
 ## Limitations
 
-- **Math equations** are treated as atomic tokens. Changes inside a single
-  equation are shown as a whole-equation delete + insert. Deleted equations use
-  Typst's `math.cancel` element instead of strikethrough.
-- **Code blocks** (`raw`) are atomic blocks. Changes are shown as whole-block
-  delete + insert.
-- **Moved paragraphs** appear as a deletion at the original site plus an
-  insertion at the new site. Move detection is not implemented.
-- **Only PDF output** is supported.
-- **Colours are hardcoded**: green `#00b400` and red `#dc0000`.
+- **Math equations** are atomic. Changes inside an equation appear as a
+  whole-expression delete + insert. Deleted equations are rendered with Typst's
+  `math.cancel` mark.
+- **Code blocks** are atomic. Changes appear as a whole-block delete + insert.
+- **Moved paragraphs** show as a deletion at the old location plus an insertion
+  at the new location.
+- **PDF only.** No other output formats are supported.
 
-## Building
+## Further reading
 
-Requires Rust 1.85 or later (for the 2024 edition).
-
-```sh
-git clone <repo>
-cd typst-diff
-cargo build --release
-```
-
-The binary is at `target/release/typst-diff`. Copy it anywhere on your `PATH`.
-
-## Installing
-
-To install the binary into your PATH, run
-
-```sh
-cargo install --path .
-```
-
-This installs the `typst-diff` binary into Cargo's bin directory, usually
-`~/.cargo/bin`. Make sure that directory is on your `PATH`.
-
-To install from a local checkout with release optimizations and overwrite an
-older local install:
-
-```sh
-cargo install --path . --force
-```
-
-### Build profiles
-
-**Release** (optimised, ~25 MB):
-```sh
-cargo build --release
-```
-
-**Debug** (fast incremental rebuilds, ~500 MB with debug symbols):
-```sh
-cargo build
-```
-
-The `Cargo.toml` profiles are tuned:
-
-| Profile | `lto` | `strip` | `debug` |
-|---|---|---|---|
-| release | thin | yes | — |
-| dev | — | — | line tables only |
-| dev deps | — | — | none |
-
-## Running tests
-
-```sh
-cargo test
-```
-
-This runs the Rust unit tests and integration tests, including fixture documents,
-Git revision mode, table cell diffs, math diffs, and PDF validation.
-
-Run the corpus suite:
-
-```sh
-tests/run_corpus.sh
-```
-
-Useful corpus flags:
-
-```sh
-tests/run_corpus.sh --list
-tests/run_corpus.sh --filter 23-display-math-changed
-tests/run_corpus.sh --release
-tests/run_corpus.sh --verbose
-```
-
-Corpus outputs are written to `tests/corpus_output/<test-name>/`, including
-`diff.pdf`, `modifications.txt`, `stderr.txt`, and `result.txt`.
-
-Run the larger example pair:
-
-```sh
-tests/examples/run_diff.sh
-```
-
-This writes `tests/examples/diff.pdf` and
-`tests/examples/modifications.txt`.
+- [docs/technical.md](docs/technical.md) — architecture, algorithms, and data
+  structures
+- [docs/contributing.md](docs/contributing.md) — building from source and
+  running the test suite
