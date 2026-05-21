@@ -15,8 +15,8 @@ fn world_for(path: &str) -> typst_diff::world::SystemWorld {
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
     let new_world = world_for("simple_new.typ");
-    let old = typst_diff::eval_to_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
     let result = typst_diff::diff::diff_content(&old, &new);
     let annotated = typst_diff::build_annotated_content(&result);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
@@ -71,6 +71,27 @@ fn multifile_diff_produces_valid_pdf() {
     let old = typst_diff::eval_to_content(&old_world).unwrap();
     let new = typst_diff::eval_to_content(&new_world).unwrap();
     let result = typst_diff::diff::diff_content(&old, &new);
+    let annotated = typst_diff::build_annotated_content(&result);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
+    assert!(pdf.len() > 1000, "PDF suspiciously small");
+}
+
+#[test]
+fn table_cell_changes_are_reported_and_rendered() {
+    let old_world = world_for("table_old.typ");
+    let new_world = world_for("table_new.typ");
+    let old = typst_diff::eval_to_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_content(&old, &new);
+    let log = result.modification_log();
+
+    assert!(log.contains("modify table cell"), "{log}");
+    assert!(log.contains("4 | 650"), "{log}");
+    assert!(log.contains("5 | 100"), "{log}");
+    assert!(log.contains("108"), "{log}");
+    assert!(log.contains("97"), "{log}");
+
     let annotated = typst_diff::build_annotated_content(&result);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");

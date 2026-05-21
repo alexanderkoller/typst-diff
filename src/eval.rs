@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
@@ -6,8 +7,9 @@ use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{Content, NativeElement, Style, StyleChain, Styles, Target, TargetElem};
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PageElem, PagebreakElem};
-use typst::model::DocumentInfo;
+use typst::model::{DocumentInfo, TableElem};
 use typst::routines::{Arenas, RealizationKind};
+use typst::syntax::Span;
 
 use crate::diag::format_diagnostics;
 
@@ -95,6 +97,7 @@ fn realize_to_content(
     let style_map = styles.to_map().outside();
     let root_page_styles = page_styles(&style_map);
     let styles = StyleChain::new(&style_map);
+    let tables = collect_tables_by_span(content);
 
     let traced = Traced::default();
     let mut sink = Sink::new();
@@ -128,15 +131,32 @@ fn realize_to_content(
         ));
     }
 
-    Ok(Content::sequence(realized.iter().map(|(content, styles)| {
-        let styles = if content.is::<PagebreakElem>() {
-            marginal_styles(&styles.to_map())
-        } else {
-            non_page_styles(styles.to_map())
-        };
-        (*content).clone().styled_with_map(styles)
-    }))
-    .styled_with_map(root_page_styles))
+    Ok(
+        Content::sequence(realized.iter().map(|(realized_content, styles)| {
+            let content = tables
+                .get(&realized_content.span())
+                .cloned()
+                .unwrap_or_else(|| (*realized_content).clone());
+            let styles = if realized_content.is::<PagebreakElem>() {
+                marginal_styles(&styles.to_map())
+            } else {
+                non_page_styles(styles.to_map())
+            };
+            content.styled_with_map(styles)
+        }))
+        .styled_with_map(root_page_styles),
+    )
+}
+
+fn collect_tables_by_span(content: &Content) -> HashMap<Span, Content> {
+    let mut tables = HashMap::new();
+    let _ = content.traverse::<_, ()>(&mut |content| {
+        if content.is::<TableElem>() {
+            tables.insert(content.span(), content.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    tables
 }
 
 fn non_page_styles(styles: Styles) -> Styles {

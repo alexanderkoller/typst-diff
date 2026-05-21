@@ -7,7 +7,7 @@ use typst::foundations::{
 };
 use typst::layout::{BlockBody, BlockElem, PageElem, Rel};
 use typst::math::EquationElem;
-use typst::model::{HeadingElem, ParElem, ParbreakElem};
+use typst::model::{HeadingElem, ParElem, ParbreakElem, TableChild, TableElem, TableItem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
 #[derive(Clone)]
@@ -744,11 +744,18 @@ pub enum DiffResultOp {
     Deleted(DiffBlock),
     Inserted(DiffBlock),
     Modified(DiffBlock, Vec<WordOp>),
+    ModifiedTable(DiffBlock, Vec<TableCellDiff>),
 }
 
 pub struct DiffResult {
     pub block_ops: Vec<DiffResultOp>,
     pub root_styles: Styles,
+}
+
+#[derive(Clone)]
+pub struct TableCellDiff {
+    pub index: usize,
+    pub word_ops: Vec<WordOp>,
 }
 
 impl DiffResult {
@@ -792,6 +799,28 @@ impl DiffResult {
                             ("inserted", inserts),
                         ],
                     );
+                }
+                DiffResultOp::ModifiedTable(_, cell_diffs) => {
+                    for cell_diff in cell_diffs {
+                        let deletes = collect_word_op_text(&cell_diff.word_ops, |op| match op {
+                            WordOp::Delete(tokens) => Some(tokens),
+                            _ => None,
+                        });
+                        let inserts = collect_word_op_text(&cell_diff.word_ops, |op| match op {
+                            WordOp::Insert(tokens) => Some(tokens),
+                            _ => None,
+                        });
+                        push_log_entry(
+                            &mut log,
+                            index,
+                            "modify table cell",
+                            &[
+                                ("cell", cell_diff.index.to_string()),
+                                ("deleted", deletes),
+                                ("inserted", inserts),
+                            ],
+                        );
+                    }
                 }
             }
         }
@@ -858,13 +887,19 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResult {
             BlockOp::Delete(old_block) => DiffResultOp::Deleted(old_block),
             BlockOp::Insert(new_block) => DiffResultOp::Inserted(new_block),
             BlockOp::Replace(old_block, new_block) => {
-                let old_tokens = extract_words(&old_block.content);
-                let new_tokens = extract_words(&new_block.content);
-                let word_ops = diff_words(&old_tokens, &new_tokens);
-                if has_textual_word_change(&word_ops) {
-                    DiffResultOp::Modified(new_block, word_ops)
+                if let Some(cell_diffs) = diff_table_cells(&old_block.content, &new_block.content)
+                    && !cell_diffs.is_empty()
+                {
+                    DiffResultOp::ModifiedTable(new_block, cell_diffs)
                 } else {
-                    DiffResultOp::Equal(new_block)
+                    let old_tokens = extract_words(&old_block.content);
+                    let new_tokens = extract_words(&new_block.content);
+                    let word_ops = diff_words(&old_tokens, &new_tokens);
+                    if has_textual_word_change(&word_ops) {
+                        DiffResultOp::Modified(new_block, word_ops)
+                    } else {
+                        DiffResultOp::Equal(new_block)
+                    }
                 }
             }
         })
@@ -873,6 +908,59 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResult {
     DiffResult {
         block_ops,
         root_styles: root_page_styles(new),
+    }
+}
+
+fn diff_table_cells(old: &Content, new: &Content) -> Option<Vec<TableCellDiff>> {
+    let old_cells = table_cell_bodies(old)?;
+    let new_cells = table_cell_bodies(new)?;
+    if old_cells.len() != new_cells.len() {
+        return None;
+    }
+
+    Some(
+        old_cells
+            .into_iter()
+            .zip(new_cells)
+            .enumerate()
+            .filter_map(|(index, (old_cell, new_cell))| {
+                let word_ops = diff_words(&extract_words(&old_cell), &extract_words(&new_cell));
+                has_textual_word_change(&word_ops).then_some(TableCellDiff { index, word_ops })
+            })
+            .collect(),
+    )
+}
+
+fn table_cell_bodies(content: &Content) -> Option<Vec<Content>> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return table_cell_bodies(&styled.child);
+    }
+
+    let table = content.to_packed::<TableElem>()?;
+    let mut cells = Vec::new();
+    collect_table_child_cells(&table.children, &mut cells);
+    Some(cells)
+}
+
+fn collect_table_child_cells(children: &[TableChild], cells: &mut Vec<Content>) {
+    for child in children {
+        match child {
+            TableChild::Header(header) => collect_table_item_cells(&header.children, cells),
+            TableChild::Footer(footer) => collect_table_item_cells(&footer.children, cells),
+            TableChild::Item(item) => collect_table_item_cell(item, cells),
+        }
+    }
+}
+
+fn collect_table_item_cells(items: &[TableItem], cells: &mut Vec<Content>) {
+    for item in items {
+        collect_table_item_cell(item, cells);
+    }
+}
+
+fn collect_table_item_cell(item: &TableItem, cells: &mut Vec<Content>) {
+    if let TableItem::Cell(cell) = item {
+        cells.push(cell.body.clone());
     }
 }
 

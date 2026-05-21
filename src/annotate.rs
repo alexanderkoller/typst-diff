@@ -1,6 +1,6 @@
 use typst::foundations::Content;
 use typst::foundations::{SequenceElem, StyledElem};
-use typst::model::ParElem;
+use typst::model::{ParElem, TableChild, TableElem, TableItem};
 use typst::text::{StrikeElem, TextElem};
 use typst::visualize::Color;
 
@@ -43,6 +43,12 @@ pub fn build_annotated_content(result: &DiffResult) -> Content {
                     page_styles: new_block.page_styles.clone(),
                 }
             }
+
+            DiffResultOp::ModifiedTable(new_block, cell_diffs) => DiffBlock {
+                content: replace_table_cells(&new_block.content, cell_diffs)
+                    .unwrap_or_else(|| new_block.content.clone()),
+                page_styles: new_block.page_styles.clone(),
+            },
         };
 
         if current_page_styles
@@ -147,6 +153,84 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
 
 fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
+}
+
+fn replace_table_cells(
+    template: &Content,
+    cell_diffs: &[crate::diff::TableCellDiff],
+) -> Option<Content> {
+    let mut content = template.clone();
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>()
+        && let Some(child) = replace_table_cells(&styled.child, cell_diffs)
+    {
+        styled.child = child;
+        return Some(content);
+    }
+
+    let table = content.to_packed_mut::<TableElem>()?;
+    let mut next_diff = 0;
+    let mut cell_index = 0;
+    replace_table_child_cells(
+        &mut table.children,
+        cell_diffs,
+        &mut next_diff,
+        &mut cell_index,
+    );
+    Some(content)
+}
+
+fn replace_table_child_cells(
+    children: &mut [TableChild],
+    cell_diffs: &[crate::diff::TableCellDiff],
+    next_diff: &mut usize,
+    cell_index: &mut usize,
+) {
+    for child in children {
+        match child {
+            TableChild::Header(header) => {
+                replace_table_item_cells(&mut header.children, cell_diffs, next_diff, cell_index)
+            }
+            TableChild::Footer(footer) => {
+                replace_table_item_cells(&mut footer.children, cell_diffs, next_diff, cell_index)
+            }
+            TableChild::Item(item) => {
+                replace_table_item_cell(item, cell_diffs, next_diff, cell_index)
+            }
+        }
+    }
+}
+
+fn replace_table_item_cells(
+    items: &mut [TableItem],
+    cell_diffs: &[crate::diff::TableCellDiff],
+    next_diff: &mut usize,
+    cell_index: &mut usize,
+) {
+    for item in items {
+        replace_table_item_cell(item, cell_diffs, next_diff, cell_index);
+    }
+}
+
+fn replace_table_item_cell(
+    item: &mut TableItem,
+    cell_diffs: &[crate::diff::TableCellDiff],
+    next_diff: &mut usize,
+    cell_index: &mut usize,
+) {
+    let TableItem::Cell(cell) = item else {
+        return;
+    };
+
+    if let Some(cell_diff) = cell_diffs.get(*next_diff)
+        && cell_diff.index == *cell_index
+    {
+        let inline = annotated_inline_content(&cell_diff.word_ops);
+        cell.body = replace_text_container(&cell.body, &inline).unwrap_or(inline);
+        *next_diff += 1;
+    }
+
+    *cell_index += 1;
 }
 
 #[cfg(test)]
