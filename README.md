@@ -25,6 +25,9 @@ Options:
   -l, --log-modifications <PATH>
                           Write a text log of detected insertions, deletions,
                           and modified blocks
+  -s, --compact-substitutions
+                          Show substitutions as blue without red strikethrough;
+                          insertions remain green, pure deletions remain red
   -h, --help             Print help
 ```
 
@@ -77,6 +80,20 @@ name, a tag, or a commit hash.
    diffing; dissimilar blocks are marked as whole-block additions/deletions.
 5. The annotated content is rendered to PDF using the **new** document's world,
    so fonts and assets resolve correctly.
+
+### Colour scheme
+
+| Change | Default | `--compact-substitutions` |
+|---|---|---|
+| Inserted word or block | green | green |
+| Deleted word or block | red strikethrough | red strikethrough |
+| Substitution — new text | green | **blue** |
+| Substitution — old text | red strikethrough | *(hidden)* |
+
+A substitution is a word deletion immediately adjacent to a word insertion within
+the same block. With `--compact-substitutions` the replaced text is hidden and
+the replacement is coloured blue, making diffs with many small word changes
+easier to read at a glance.
 
 ## Limitations
 

@@ -18,7 +18,7 @@ fn simple_diff_produces_valid_pdf() {
     let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
     let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
     let result = typst_diff::diff::diff_content(&old, &new);
-    let annotated = typst_diff::build_annotated_content(&result);
+    let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
     assert!(pdf.len() > 1000, "PDF suspiciously small");
@@ -71,7 +71,7 @@ fn multifile_diff_produces_valid_pdf() {
     let old = typst_diff::eval_to_content(&old_world).unwrap();
     let new = typst_diff::eval_to_content(&new_world).unwrap();
     let result = typst_diff::diff::diff_content(&old, &new);
-    let annotated = typst_diff::build_annotated_content(&result);
+    let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
     assert!(pdf.len() > 1000, "PDF suspiciously small");
@@ -92,7 +92,7 @@ fn table_cell_changes_are_reported_and_rendered() {
     assert!(log.contains("108"), "{log}");
     assert!(log.contains("97"), "{log}");
 
-    let annotated = typst_diff::build_annotated_content(&result);
+    let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
     assert!(pdf.len() > 1000, "PDF suspiciously small");
@@ -111,7 +111,7 @@ fn math_expression_changes_are_reported_and_rendered() {
     assert!(log.contains("2n"), "{log}");
     assert!(log.contains("/ 6") || log.contains("6"), "{log}");
 
-    let annotated = typst_diff::build_annotated_content(&result);
+    let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert!(pdf.starts_with(b"%PDF"), "output is not a PDF");
     assert!(pdf.len() > 1000, "PDF suspiciously small");

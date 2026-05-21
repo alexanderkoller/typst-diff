@@ -27,6 +27,9 @@ struct Args {
     /// Write a plain-text log of detected insertions, deletions, and modifications
     #[arg(short = 'l', long)]
     log_modifications: Option<PathBuf>,
+    /// Show substitutions as blue without red strikethrough; insertions green, deletions red
+    #[arg(short = 's', long)]
+    compact_substitutions: bool,
 }
 
 fn main() -> Result<()> {
@@ -59,7 +62,7 @@ fn main() -> Result<()> {
     }
 
     eprintln!("Annotating...");
-    let annotated = build_annotated_content(&diff_result);
+    let annotated = build_annotated_content(&diff_result, args.compact_substitutions);
 
     eprintln!("Rendering to PDF...");
     let pdf_bytes = render_to_pdf(&annotated, &new_world).context("failed to render PDF")?;

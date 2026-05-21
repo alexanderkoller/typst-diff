@@ -14,8 +14,11 @@ fn green() -> Color {
 fn red() -> Color {
     Color::from_u8(220, 0, 0, 255)
 }
+fn blue() -> Color {
+    Color::from_u8(0, 100, 220, 255)
+}
 
-pub fn build_annotated_content(result: &DiffResult) -> Content {
+pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool) -> Content {
     let mut groups: Vec<Content> = Vec::new();
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles = None;
@@ -39,7 +42,7 @@ pub fn build_annotated_content(result: &DiffResult) -> Content {
             }
 
             DiffResultOp::Modified(new_block, word_ops) => {
-                let inline = annotated_inline_content(word_ops);
+                let inline = annotated_inline_content(word_ops, compact_substitutions);
                 DiffBlock {
                     content: replace_text_container(&new_block.content, &inline).unwrap_or(inline),
                     page_styles: new_block.page_styles.clone(),
@@ -47,7 +50,7 @@ pub fn build_annotated_content(result: &DiffResult) -> Content {
             }
 
             DiffResultOp::ModifiedTable(new_block, cell_diffs) => DiffBlock {
-                content: replace_table_cells(&new_block.content, cell_diffs)
+                content: replace_table_cells(&new_block.content, cell_diffs, compact_substitutions)
                     .unwrap_or_else(|| new_block.content.clone()),
                 page_styles: new_block.page_styles.clone(),
             },
@@ -89,9 +92,9 @@ fn plain_content(content: &Content) -> Content {
     TextElem::packed(text.as_str())
 }
 
-fn annotated_inline_content(word_ops: &[WordOp]) -> Content {
+fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) -> Content {
     let mut inline: Vec<Content> = Vec::new();
-    for wop in word_ops {
+    for (i, wop) in word_ops.iter().enumerate() {
         match wop {
             WordOp::Equal(tokens) => {
                 for t in tokens {
@@ -99,11 +102,23 @@ fn annotated_inline_content(word_ops: &[WordOp]) -> Content {
                 }
             }
             WordOp::Insert(tokens) => {
+                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
+                let next = word_ops.get(i + 1);
+                let adjacent_delete = prev.is_some_and(|op| matches!(op, WordOp::Delete(_)))
+                    || next.is_some_and(|op| matches!(op, WordOp::Delete(_)));
+                let color = if compact_substitutions && adjacent_delete { blue() } else { green() };
                 let joined = Content::sequence(tokens.iter().map(|t| t.content.clone()));
-                inline.push(joined.styled(TextElem::fill.set(green().into())));
+                inline.push(joined.styled(TextElem::fill.set(color.into())));
             }
             WordOp::Delete(tokens) => {
-                inline.push(Content::sequence(tokens.iter().map(deleted_token_content)));
+                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
+                let next = word_ops.get(i + 1);
+                let is_substitution = compact_substitutions
+                    && (prev.is_some_and(|op| matches!(op, WordOp::Insert(_)))
+                        || next.is_some_and(|op| matches!(op, WordOp::Insert(_))));
+                if !is_substitution {
+                    inline.push(Content::sequence(tokens.iter().map(deleted_token_content)));
+                }
             }
         }
     }
@@ -175,11 +190,12 @@ fn is_inlineish(content: &Content) -> bool {
 fn replace_table_cells(
     template: &Content,
     cell_diffs: &[crate::diff::TableCellDiff],
+    compact_substitutions: bool,
 ) -> Option<Content> {
     let mut content = template.clone();
 
     if let Some(styled) = content.to_packed_mut::<StyledElem>()
-        && let Some(child) = replace_table_cells(&styled.child, cell_diffs)
+        && let Some(child) = replace_table_cells(&styled.child, cell_diffs, compact_substitutions)
     {
         styled.child = child;
         return Some(content);
@@ -193,6 +209,7 @@ fn replace_table_cells(
         cell_diffs,
         &mut next_diff,
         &mut cell_index,
+        compact_substitutions,
     );
     Some(content)
 }
@@ -202,17 +219,18 @@ fn replace_table_child_cells(
     cell_diffs: &[crate::diff::TableCellDiff],
     next_diff: &mut usize,
     cell_index: &mut usize,
+    compact_substitutions: bool,
 ) {
     for child in children {
         match child {
             TableChild::Header(header) => {
-                replace_table_item_cells(&mut header.children, cell_diffs, next_diff, cell_index)
+                replace_table_item_cells(&mut header.children, cell_diffs, next_diff, cell_index, compact_substitutions)
             }
             TableChild::Footer(footer) => {
-                replace_table_item_cells(&mut footer.children, cell_diffs, next_diff, cell_index)
+                replace_table_item_cells(&mut footer.children, cell_diffs, next_diff, cell_index, compact_substitutions)
             }
             TableChild::Item(item) => {
-                replace_table_item_cell(item, cell_diffs, next_diff, cell_index)
+                replace_table_item_cell(item, cell_diffs, next_diff, cell_index, compact_substitutions)
             }
         }
     }
@@ -223,9 +241,10 @@ fn replace_table_item_cells(
     cell_diffs: &[crate::diff::TableCellDiff],
     next_diff: &mut usize,
     cell_index: &mut usize,
+    compact_substitutions: bool,
 ) {
     for item in items {
-        replace_table_item_cell(item, cell_diffs, next_diff, cell_index);
+        replace_table_item_cell(item, cell_diffs, next_diff, cell_index, compact_substitutions);
     }
 }
 
@@ -234,6 +253,7 @@ fn replace_table_item_cell(
     cell_diffs: &[crate::diff::TableCellDiff],
     next_diff: &mut usize,
     cell_index: &mut usize,
+    compact_substitutions: bool,
 ) {
     let TableItem::Cell(cell) = item else {
         return;
@@ -242,7 +262,7 @@ fn replace_table_item_cell(
     if let Some(cell_diff) = cell_diffs.get(*next_diff)
         && cell_diff.index == *cell_index
     {
-        let inline = annotated_inline_content(&cell_diff.word_ops);
+        let inline = annotated_inline_content(&cell_diff.word_ops, compact_substitutions);
         cell.body = replace_text_container(&cell.body, &inline).unwrap_or(inline);
         *next_diff += 1;
     }
@@ -278,7 +298,7 @@ mod tests {
             )))],
             root_styles: Default::default(),
         };
-        let content = build_annotated_content(&result);
+        let content = build_annotated_content(&result, false);
         assert!(!content.is_empty());
     }
 
@@ -296,7 +316,7 @@ mod tests {
             )],
             root_styles: Default::default(),
         };
-        let content = build_annotated_content(&result);
+        let content = build_annotated_content(&result, false);
         assert!(!content.is_empty());
         let mut found_strike = false;
         let _ = content.traverse::<_, ()>(&mut |c| {
@@ -318,7 +338,7 @@ mod tests {
             )))],
             root_styles: Default::default(),
         };
-        let content = build_annotated_content(&result);
+        let content = build_annotated_content(&result, false);
 
         let mut found_heading = false;
         let mut found_old_text = false;

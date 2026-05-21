@@ -33,7 +33,7 @@ The engineering division delivered *strong results* in the third quarter,
 exceeding the projected output by *18 percent*.
 Key drivers included the early completion of the _API overhaul_ and
 improved collaboration between the backend and infrastructure teams.
-Resource utilisation averaged 91% across all active projects,
+Resource utilisation averaged 91% across  active projects,
 with *two minor incidents* reported during the review period.
 
 = Key Metrics
