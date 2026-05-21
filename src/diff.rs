@@ -54,7 +54,7 @@ fn extract_block_units_with_styles(
         if let Some(seq) = styled.child.to_packed::<SequenceElem>() {
             if is_inline_sequence(seq) {
                 return vec![DiffBlock {
-                    content: apply_block_styles(styled.child.clone(), &styles),
+                    content: apply_block_styles(paragraph_block(styled.child.clone()), &styles),
                     page_styles,
                 }];
             }
@@ -112,7 +112,10 @@ fn collect_blocks_from_children(
                     if has_page_style_updates {
                         flush_para(para, blocks, &page_styles);
                         blocks.push(DiffBlock {
-                            content: apply_block_styles(styled.child.clone(), &styles),
+                            content: apply_block_styles(
+                                paragraph_block(styled.child.clone()),
+                                &styles,
+                            ),
                             page_styles: child_page_styles.clone(),
                         });
                     } else {
@@ -171,12 +174,55 @@ fn collect_blocks_from_children(
 fn flush_para(para: &mut Vec<Content>, blocks: &mut Vec<DiffBlock>, page_styles: &Styles) {
     let nonempty = para.iter().any(|c| !c.is::<SpaceElem>());
     if nonempty {
+        let content = paragraph_block(Content::sequence(para.drain(..)));
         blocks.push(DiffBlock {
-            content: Content::sequence(para.drain(..)),
+            content,
             page_styles: page_styles.clone(),
         });
     } else {
         para.clear();
+    }
+}
+
+fn paragraph_block(content: Content) -> Content {
+    if content.is::<ParElem>() {
+        content
+    } else {
+        Content::new(ParElem::new(normalize_text_runs(content)))
+    }
+}
+
+fn normalize_text_runs(content: Content) -> Content {
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        let mut children = Vec::new();
+        let mut text = String::new();
+
+        for child in &seq.children {
+            if let Some(elem) = child.to_packed::<TextElem>() {
+                text.push_str(elem.text.as_str());
+            } else if child.is::<SpaceElem>() {
+                text.push(' ');
+            } else {
+                flush_text_run(&mut children, &mut text);
+                children.push(normalize_text_runs(child.clone()));
+            }
+        }
+
+        flush_text_run(&mut children, &mut text);
+        return Content::sequence(children);
+    }
+
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return normalize_text_runs(styled.child.clone()).styled_with_map(styled.styles.clone());
+    }
+
+    content
+}
+
+fn flush_text_run(children: &mut Vec<Content>, text: &mut String) {
+    if !text.is_empty() {
+        children.push(TextElem::packed(text.as_str()));
+        text.clear();
     }
 }
 
@@ -270,6 +316,10 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
         for child in &seq.children {
             collect_tokens(child, out);
         }
+    } else if let Some(styled) = content.to_packed::<StyledElem>() {
+        collect_tokens(&styled.child, out);
+    } else if let Some(par) = content.to_packed::<ParElem>() {
+        collect_tokens(&par.body, out);
     } else if let Some(text_elem) = content.to_packed::<TextElem>() {
         collect_text_tokens(text_elem.text.as_str(), out);
     } else if content.is::<SpaceElem>() {
