@@ -1,45 +1,71 @@
 use anyhow::Result;
+use typst::ROUTINES;
+use typst::World;
 use typst::comemo::Track;
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{Content, StyleChain};
+use typst::foundations::{Content, StyleChain, Target, TargetElem};
 use typst::introspection::Introspector;
-use typst::World;
-use typst::ROUTINES;
 use typst_pdf::{PdfOptions, pdf};
 
 use crate::diag::format_diagnostics;
 
 pub fn render_to_pdf(content: &Content, world: &dyn World) -> Result<Vec<u8>> {
     let library = world.library();
-    let styles = StyleChain::new(&library.styles);
+    let base = StyleChain::new(&library.styles);
+    let target = TargetElem::target.set(Target::Paged).wrap();
+    let styles = base.chain(&target);
 
-    let introspector = Introspector::default();
-    let constraint = typst::comemo::Constraint::new();
-    let mut sink = Sink::new();
     let traced = Traced::default();
 
-    let mut engine = Engine {
-        routines: &ROUTINES,
-        world: world.track(),
-        introspector: introspector.track_with(&constraint),
-        traced: traced.track(),
-        sink: sink.track_mut(),
-        route: Route::default(),
-    };
+    let mut introspector = Introspector::default();
+    let mut final_sink = Sink::new();
+    let mut document = None;
 
-    // One layout iteration is intentional: the diff document has no counters or
-    // cross-references requiring convergence. See design spec section "Rendering".
-    let document = typst_layout::layout_document(&mut engine, content, styles)
-        .map_err(|errs| anyhow::anyhow!("layout failed:\n{}", format_diagnostics(world, &errs)))?;
-    drop(engine);
+    for _ in 0..5 {
+        let constraint = typst::comemo::Constraint::new();
+        let mut sink = Sink::new();
+        let mut engine = Engine {
+            routines: &ROUTINES,
+            world: world.track(),
+            introspector: introspector.track_with(&constraint),
+            traced: traced.track(),
+            sink: sink.track_mut(),
+            route: Route::default(),
+        };
 
-    // Surface any delayed errors collected during layout.
-    let delayed = sink.delayed();
-    if !delayed.is_empty() {
-        return Err(anyhow::anyhow!("layout errors:\n{}", format_diagnostics(world, &delayed)));
+        let laid_out =
+            typst_layout::layout_document(&mut engine, content, styles).map_err(|errs| {
+                anyhow::anyhow!("layout failed:\n{}", format_diagnostics(world, &errs))
+            })?;
+        let next_introspector = laid_out.introspector.clone();
+        let converged = constraint.validate(&next_introspector);
+
+        document = Some(laid_out);
+        final_sink = sink;
+        introspector = next_introspector;
+
+        if converged {
+            break;
+        }
     }
 
-    pdf(&document, &PdfOptions::default()).map_err(|errs| {
+    let document = document.expect("layout loop always runs at least once");
+
+    // Surface any delayed errors collected during layout.
+    let delayed = final_sink.delayed();
+    if !delayed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "layout errors:\n{}",
+            format_diagnostics(world, &delayed)
+        ));
+    }
+
+    let pdf_options = PdfOptions {
+        tagged: false,
+        ..PdfOptions::default()
+    };
+
+    pdf(&document, &pdf_options).map_err(|errs| {
         let msgs: Vec<String> = errs.iter().map(|d| d.message.to_string()).collect();
         anyhow::anyhow!("pdf export failed:\n{}", msgs.join("\n"))
     })
@@ -48,10 +74,10 @@ pub fn render_to_pdf(content: &Content, world: &dyn World) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::SystemWorld;
     use std::fs;
     use tempfile::TempDir;
     use typst::text::TextElem;
-    use crate::world::SystemWorld;
 
     #[test]
     fn renders_simple_content_to_pdf() {

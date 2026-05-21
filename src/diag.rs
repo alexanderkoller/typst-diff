@@ -1,10 +1,14 @@
-use typst::diag::SourceDiagnostic;
 use typst::World;
+use typst::diag::SourceDiagnostic;
 
 /// Format a slice of diagnostics as "path:line:col: message" strings.
 /// Falls back to plain message text if span information is unavailable.
 pub fn format_diagnostics(world: &dyn World, diags: &[SourceDiagnostic]) -> String {
-    diags.iter().map(|d| format_one(world, d)).collect::<Vec<_>>().join("\n")
+    diags
+        .iter()
+        .map(|d| format_one(world, d))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_one(world: &dyn World, d: &SourceDiagnostic) -> String {

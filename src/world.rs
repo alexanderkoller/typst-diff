@@ -9,7 +9,9 @@ use typst::syntax::{FileId, Source, VirtualPath};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
+use typst_kit::download::{Downloader, ProgressSink};
 use typst_kit::fonts::{FontSearcher, FontSlot};
+use typst_kit::package::PackageStorage;
 
 pub struct SystemWorld {
     root: PathBuf,
@@ -17,18 +19,23 @@ pub struct SystemWorld {
     library: LazyHash<Library>,
     book: LazyHash<FontBook>,
     font_slots: Vec<FontSlot>,
+    package_storage: PackageStorage,
     source_cache: Arc<Mutex<HashMap<FileId, Source>>>,
     file_cache: Arc<Mutex<HashMap<FileId, FileResult<Bytes>>>>,
 }
 
 impl SystemWorld {
     pub fn new(entry: impl AsRef<Path>) -> Result<Self> {
-        let entry = entry.as_ref().canonicalize()
+        let entry = entry
+            .as_ref()
+            .canonicalize()
             .with_context(|| format!("cannot find {:?}", entry.as_ref()))?;
-        let root = entry.parent()
+        let root = entry
+            .parent()
             .ok_or_else(|| anyhow::anyhow!("entry path has no parent: {:?}", entry))?
             .to_owned();
-        let filename = entry.file_name()
+        let filename = entry
+            .file_name()
             .ok_or_else(|| anyhow::anyhow!("entry path has no filename: {:?}", entry))?
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("filename is not valid UTF-8: {:?}", entry))?;
@@ -42,6 +49,7 @@ impl SystemWorld {
             library: LazyHash::new(Library::default()),
             book: LazyHash::new(fonts.book),
             font_slots: fonts.fonts,
+            package_storage: PackageStorage::new(None, None, Downloader::new("typst-diff")),
             source_cache: Default::default(),
             file_cache: Default::default(),
         };
@@ -52,8 +60,19 @@ impl SystemWorld {
         Ok(world)
     }
 
-    fn disk_path(&self, id: FileId) -> PathBuf {
-        self.root.join(id.vpath().as_rootless_path())
+    fn disk_path(&self, id: FileId) -> FileResult<PathBuf> {
+        let root = if let Some(package) = id.package() {
+            let mut progress = ProgressSink;
+            self.package_storage
+                .prepare_package(package, &mut progress)
+                .map_err(FileError::from)?
+        } else {
+            self.root.clone()
+        };
+
+        id.vpath()
+            .resolve(&root)
+            .ok_or_else(|| FileError::NotFound(root.join(id.vpath().as_rootless_path())))
     }
 }
 
@@ -75,9 +94,8 @@ impl World for SystemWorld {
         if let Some(src) = cache.get(&id) {
             return Ok(src.clone());
         }
-        let path = self.disk_path(id);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|err| FileError::from_io(err, &path))?;
+        let path = self.disk_path(id)?;
+        let text = std::fs::read_to_string(&path).map_err(|err| FileError::from_io(err, &path))?;
         let src = Source::new(id, text);
         cache.insert(id, src.clone());
         Ok(src)
@@ -88,7 +106,7 @@ impl World for SystemWorld {
         if let Some(result) = cache.get(&id) {
             return result.clone();
         }
-        let path = self.disk_path(id);
+        let path = self.disk_path(id)?;
         let result = std::fs::read(&path)
             .map(Bytes::new)
             .map_err(|err| FileError::from_io(err, &path));

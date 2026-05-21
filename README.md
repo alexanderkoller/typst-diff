@@ -9,21 +9,31 @@ expanded before diffing.
 ## Usage
 
 ```
-typst-diff <OLD> <NEW> [-o diff.pdf]
+typst-diff <OLD> <NEW> [-o diff.pdf] [-l changes.log]
+typst-diff <FILE> --revision <REV> [-o diff.pdf] [-l changes.log]
 ```
 
 ```
 Arguments:
-  <OLD>  Path to the old document entry point
-  <NEW>  Path to the new document entry point
+  <OLD>   Path to the old document entry point
+  <NEW>   Path to the new document entry point
+  <FILE>  Working-tree entry point when comparing against Git
 
 Options:
+  -r, --revision <REV>  Compare the working-tree file against this Git revision
   -o, --output <OUTPUT>  Output PDF path [default: diff.pdf]
+  -l, --log-modifications <PATH>
+                          Write a text log of detected insertions, deletions,
+                          and modified blocks
   -h, --help             Print help
 ```
 
 Both arguments are entry-point `.typ` files. If your document uses `#include`,
 pass the top-level file; included files are resolved relative to it.
+
+The Git form compares the working-tree version of `<FILE>` against `<REV>`.
+Run it from anywhere inside the Git working tree. The file path must point to
+the current working-tree entry point.
 
 ### Examples
 
@@ -37,6 +47,23 @@ Multi-file project:
 typst-diff old/main.typ new/main.typ
 # writes diff.pdf in the current directory
 ```
+
+Working tree against Git:
+```sh
+typst-diff main.typ --revision HEAD~1 -o changes.pdf
+```
+
+Write a debugging log of the detected edits:
+```sh
+typst-diff main.typ --revision HEAD -o changes.pdf -l changes.log
+```
+
+Git mode assumes the command runs inside a Git working tree. It snapshots the
+full tree at `<REV>` with `git archive`, so included files and assets are read
+from that revision while the new document is read from the current working tree.
+
+You can use any revision accepted by Git, such as `HEAD`, `HEAD~1`, a branch
+name, a tag, or a commit hash.
 
 ## How it works
 
@@ -60,6 +87,24 @@ cargo build --release
 ```
 
 The binary is at `target/release/typst-diff`. Copy it anywhere on your `PATH`.
+
+## Installing
+
+To install the binary into your PATH, run
+
+```sh
+cargo install --path .
+```
+
+This installs the `typst-diff` binary into Cargo's bin directory, usually
+`~/.cargo/bin`. Make sure that directory is on your `PATH`.
+
+To install from a local checkout with release optimizations and overwrite an
+older local install:
+
+```sh
+cargo install --path . --force
+```
 
 ### Build profiles
 
@@ -87,5 +132,6 @@ The `Cargo.toml` profiles are tuned:
 cargo test
 ```
 
-22 tests: 20 unit tests covering each module, 2 integration tests that run the
-full pipeline on fixture documents and verify valid PDF output.
+23 tests: 20 unit tests covering each module, 3 integration tests that run the
+full pipeline on fixture documents, including Git revision mode, and verify
+valid PDF output.
