@@ -15,6 +15,7 @@
 5. [Key data structures](#key-data-structures)
 6. [Algorithms in depth](#algorithms-in-depth)
    - [Block extraction](#block-extraction)
+   - [Slots and regions](#slots-and-regions)
    - [Block-level LCS diff](#block-level-lcs-diff)
    - [Edit zone pairing](#edit-zone-pairing)
    - [Word-level diff](#word-level-diff)
@@ -64,6 +65,9 @@ src/
 
 The crate is both a library and a binary. `src/lib.rs` exports the public API
 so integration tests in `tests/` can call into individual pipeline stages.
+
+See [Container Diff Regions](container-diff-regions.md) for a design note on
+the next step after the current slot abstraction.
 
 ---
 
@@ -418,6 +422,86 @@ does a single forward pass and copies the most recently seen non-empty
 `page_styles` to every subsequent block that doesn't have its own. This ensures
 that the page layout (margins, orientation) established by a `set page(...)` at
 the top of a section applies to all blocks within that section.
+
+### Slots and regions
+
+The current container algorithm is slot-based. It works when a block is a
+structured element whose text-bearing children are available as normal `Content`
+fields.
+
+Example: a same-shape table change.
+
+```text
+old TableElem                         new TableElem
+├── TableCell(0): Method              ├── TableCell(0): Method
+├── TableCell(1): Precision           ├── TableCell(1): Precision
+├── TableCell(2): Recall              ├── TableCell(2): Recall
+├── TableCell(3): Proposed            ├── TableCell(3): Proposed v1
+└── ...                               └── ...
+
+extract_slots(old) == [TableCell(0), TableCell(1), ...]
+extract_slots(new) == [TableCell(0), TableCell(1), ...]
+
+result: diff_slots pairs matching cells and annotates only changed cells.
+```
+
+This is a clean abstraction for direct child fields: `extract_slots` finds the
+regions, `diff_slots` compares matching paths, and `replace_slot` writes the
+annotated content back into the same container.
+
+The abstraction breaks down when the meaningful region is not a direct child
+field, or when a container's shape changes:
+
+```mermaid
+flowchart TD
+    A["Replace(old block, new block)"] --> B{"same slot paths?"}
+    B -->|"yes"| C["ModifiedSlots: preserve container"]
+    B -->|"no"| D["Modified: flat word diff"]
+    D --> E["replace_text_container"]
+    E --> F{"inline text target exists?"}
+    F -->|"yes"| G["graft inline annotations"]
+    F -->|"no"| H["emit flat annotated content"]
+```
+
+Corpus 35 follows the `no` branch: the new table has an extra row, so the cell
+paths no longer match. The diff falls back to a flat word diff and the table
+structure is lost.
+
+Headers/footers and package-generated boxes expose a second limitation. Their
+text may live in styles or generated layout fields rather than normal document
+children:
+
+```text
+document Content blocks
+├── Heading
+├── Paragraph
+└── Paragraph
+
+root/page styles
+└── PageElem::header: Content("New Report Title --- Final")
+```
+
+The current block diff only compares document blocks. It carries page styles
+forward for rendering, but it does not diff old header content against new
+header content.
+
+The proposed generalization is a "diff region" abstraction:
+
+```mermaid
+flowchart LR
+    A["Content fields"] --> D["DiffRegion"]
+    B["StyledElem styles"] --> D
+    C["Page styles"] --> D
+    D --> E["word diff"]
+    D --> F["structured fallback"]
+    D --> G["opaque replace"]
+```
+
+A slot is then just one kind of region: a text-bearing child field inside a
+structured container. Page headers, style-backed block bodies, and opaque
+package output can use the same lifecycle: extract region, compare region,
+replace region. This keeps the model generic while widening the places where
+regions can be found.
 
 ### Block-level LCS diff
 

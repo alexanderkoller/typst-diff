@@ -35,12 +35,24 @@ Git revision mode, table and slot diffs, math diffs, and PDF output validation.
 
 ## Corpus test suite
 
-The corpus contains 48 numbered test pairs that each exercise a specific
+The corpus contains numbered test pairs that each exercise a specific
 scenario. Run it with:
 
 ```sh
 tests/run_corpus.sh
 ```
+
+Each test compiles the document pair to a PDF, renders every page to PNG at
+150 dpi, and compares the result against a committed reference image.
+
+**Status values:**
+
+| Status | Meaning |
+|--------|---------|
+| `PASS` | PDF compiled; all pages match the reference within 1% fuzz |
+| `FAIL` | Compile error, invalid PDF, page-count mismatch, or pixel diff |
+| `NEW`  | PDF compiled but no reference image exists yet |
+| `SKIP` | No entry points found (directory has no `old.typ` / `new.typ`) |
 
 Useful flags:
 
@@ -50,16 +62,46 @@ tests/run_corpus.sh --filter 23-display-math-changed  # run one test by name
 tests/run_corpus.sh --filter 23                     # match by number prefix
 tests/run_corpus.sh --release                       # use the release binary
 tests/run_corpus.sh --verbose                       # print modification logs
+tests/run_corpus.sh --only-failures                 # suppress PASS output
+tests/run_corpus.sh --dpi 200                       # higher-res rendering
+tests/run_corpus.sh --threshold 2%                  # looser fuzz tolerance
 ```
 
-Outputs land in `tests/corpus_output/<test-name>/`:
+Requires `pdftoppm` (from `poppler`) and ImageMagick `magick`. Install:
 
-| File | Contents |
+```sh
+brew install poppler imagemagick
+```
+
+### Managing reference images
+
+Reference images live in `tests/corpus/<name>/ref/` and are committed to git.
+When you add a new test or intentionally change rendering output, bootstrap or
+re-baseline with `--update-refs`:
+
+```sh
+# Bootstrap all references from scratch (first time, or after a mass change):
+tests/run_corpus.sh --release --update-refs
+
+# Re-baseline a single test after an intentional change:
+tests/run_corpus.sh --release --filter 02-single-word-substitution --update-refs
+```
+
+After `--update-refs`, every affected test should report `NEW` (refs created)
+and a plain re-run should report all `PASS`.
+
+### Outputs
+
+Per-test outputs land in `tests/corpus_output/<test-name>/` (git-ignored):
+
+| Path | Contents |
 |------|----------|
-| `diff.pdf` | The rendered diff |
-| `modifications.txt` | Plain-text modification log |
-| `stderr.txt` | Compiler/layout diagnostics |
-| `result.txt` | Pass / fail verdict |
+| `diff.pdf` | The rendered diff PDF |
+| `actual/page-N.png` | Per-page PNG renders of `diff.pdf` |
+| `diff/page-N.png` | Visual diff PNGs (only for mismatched pages) |
+| `modifications.txt` | Plain-text modification log (`-l` output) |
+| `stderr.txt` | Compiler / layout diagnostics |
+| `result.txt` | Full verdict with pixel-diff counts |
 
 ## Releasing a new version
 
