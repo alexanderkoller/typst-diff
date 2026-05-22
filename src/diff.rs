@@ -1555,8 +1555,14 @@ mod tests {
         let old = extract_words(&TextElem::packed("The quick brown fox jumps."));
         let new = extract_words(&TextElem::packed("A slow red dog leaps."));
         let ops = diff_words(&old, &new);
-        let n_del = ops.iter().filter(|op| matches!(op, WordOp::Delete(_))).count();
-        let n_ins = ops.iter().filter(|op| matches!(op, WordOp::Insert(_))).count();
+        let n_del = ops
+            .iter()
+            .filter(|op| matches!(op, WordOp::Delete(_)))
+            .count();
+        let n_ins = ops
+            .iter()
+            .filter(|op| matches!(op, WordOp::Insert(_)))
+            .count();
         assert_eq!(n_del, 1, "expected exactly one merged Delete run");
         assert_eq!(n_ins, 1, "expected exactly one merged Insert run");
     }
@@ -1567,9 +1573,18 @@ mod tests {
         let old = extract_words(&TextElem::packed("The fox jumps."));
         let new = extract_words(&TextElem::packed("The fox leaps."));
         let ops = diff_words(&old, &new);
-        let n_equal = ops.iter().filter(|op| matches!(op, WordOp::Equal(_))).count();
-        let n_del = ops.iter().filter(|op| matches!(op, WordOp::Delete(_))).count();
-        let n_ins = ops.iter().filter(|op| matches!(op, WordOp::Insert(_))).count();
+        let n_equal = ops
+            .iter()
+            .filter(|op| matches!(op, WordOp::Equal(_)))
+            .count();
+        let n_del = ops
+            .iter()
+            .filter(|op| matches!(op, WordOp::Delete(_)))
+            .count();
+        let n_ins = ops
+            .iter()
+            .filter(|op| matches!(op, WordOp::Insert(_)))
+            .count();
         assert!(n_equal >= 1, "expected Equal ops for unchanged prefix");
         assert_eq!(n_del, 1);
         assert_eq!(n_ins, 1);

@@ -135,8 +135,15 @@ Used by the CLI. Runs two additional passes over the Content tree:
 Before realization, `collect_preserved_by_span` records every `EquationElem`
 and every node that `content_slots::is_slot_container` recognises (lists,
 tables, figures, etc.). These nodes would become opaque layout output after
-realization. After realization, `restore_preserved` substitutes them back by
-span, recursing through `SequenceElem`, `StyledElem`, and `ParElem`.
+realization. The preserved index is `HashMap<Span, VecDeque<Content>>`, not
+`HashMap<Span, Content>`, because repeated calls to a Typst function can expand
+the same function-body expression multiple times with the same source span. In
+that case each invocation must restore its own pre-realization container; a
+single map entry would overwrite earlier invocations and make all realized
+blocks restore as the last one. After realization, `restore_preserved`
+substitutes preserved nodes back by span and consumes one queued replacement per
+realized node in document order, recursing through `SequenceElem`, `StyledElem`,
+and `ParElem`.
 
 The realized output is then re-wrapped into a `Content::sequence` where each
 item carries its inline styles (non-page styles), and the whole sequence is

@@ -17,10 +17,12 @@
 //!
 //! `EquationElem` and "slot container" nodes (lists, figures, tables, …) would become
 //! opaque layout output after realization. They are captured by span before realization
-//! and spliced back in afterwards, keeping them diffable as structured content.
+//! and spliced back in afterwards, keeping them diffable as structured content. A span
+//! can appear more than once when a function body expands repeatedly, so preserved
+//! nodes are stored as per-span queues and restored in document order.
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
@@ -156,7 +158,7 @@ fn realize_to_content(
     let style_map = styles.to_map().outside();
     let root_page_styles = page_styles(&style_map);
     let styles = StyleChain::new(&style_map);
-    let preserved = collect_preserved_by_span(content);
+    let mut preserved = collect_preserved_by_span(content);
     let footnotes = collect_footnotes(content);
 
     let traced = Traced::default();
@@ -192,7 +194,7 @@ fn realize_to_content(
     }
 
     let realized = Content::sequence(realized.iter().map(|(realized_content, styles)| {
-        let content = restore_preserved((*realized_content).clone(), &preserved);
+        let content = restore_preserved((*realized_content).clone(), &mut preserved);
         let styles = if realized_content.is::<PagebreakElem>() {
             marginal_styles(&styles.to_map())
         } else {
@@ -207,11 +209,20 @@ fn realize_to_content(
 
 /// Walk the pre-realization tree and index every `EquationElem` and slot-container
 /// node by span so they can be swapped back in after realization.
-fn collect_preserved_by_span(content: &Content) -> HashMap<Span, Content> {
-    let mut preserved = HashMap::new();
+///
+/// Typst may assign the same source span to multiple realized nodes when a
+/// function body is expanded more than once. A plain `HashMap<Span, Content>`
+/// would collapse those invocations and make every realized node restore to the
+/// last preserved value. The queue keeps all preserved nodes for a span and lets
+/// `restore_preserved` consume them in traversal order.
+fn collect_preserved_by_span(content: &Content) -> HashMap<Span, VecDeque<Content>> {
+    let mut preserved: HashMap<Span, VecDeque<Content>> = HashMap::new();
     let _ = content.traverse::<_, ()>(&mut |content| {
         if content.is::<EquationElem>() || is_slot_container(&content) {
-            preserved.insert(content.span(), content.clone());
+            preserved
+                .entry(content.span())
+                .or_default()
+                .push_back(content.clone());
         }
         std::ops::ControlFlow::Continue(())
     });
@@ -338,9 +349,16 @@ fn is_footnote_marker(content: &Content, number: usize) -> bool {
         .is_some_and(|text| text.text.as_str() == number.to_string())
 }
 
-fn restore_preserved(content: Content, preserved: &HashMap<Span, Content>) -> Content {
-    if let Some(replacement) = preserved.get(&content.span()) {
-        return replacement.clone();
+fn restore_preserved(
+    content: Content,
+    preserved: &mut HashMap<Span, VecDeque<Content>>,
+) -> Content {
+    // Preserve repeated function expansions with identical spans by consuming
+    // one queued replacement per realized node, in document order.
+    if let Some(replacements) = preserved.get_mut(&content.span())
+        && let Some(replacement) = replacements.pop_front()
+    {
+        return replacement;
     }
 
     let mut content = content;

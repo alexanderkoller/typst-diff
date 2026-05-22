@@ -61,6 +61,84 @@ Outputs land in `tests/corpus_output/<test-name>/`:
 | `stderr.txt` | Compiler/layout diagnostics |
 | `result.txt` | Pass / fail verdict |
 
+## Releasing a new version
+
+typst-diff is published to [crates.io](https://crates.io/crates/typst-diff),
+which is the Rust community package registry. When someone runs
+`cargo install typst-diff`, Cargo downloads the crate from there. Publishing
+is automated via a GitHub Actions workflow that triggers when you push a version
+tag.
+
+### One-time setup: crates.io token
+
+The workflow authenticates to crates.io with an API token stored as a GitHub
+repository secret. This only needs to be done once per crates.io account:
+
+1. Log in to [crates.io](https://crates.io) with your GitHub account.
+2. Go to **Account Settings → API Tokens** and generate a new token with
+   the *Publish new crates* and *Publish updates* scopes.
+3. In the GitHub repository, go to **Settings → Secrets and variables →
+   Actions** and create a secret named `CARGO_REGISTRY_TOKEN` with that token
+   as its value.
+
+### How to release
+
+1. **Bump the version** in `Cargo.toml`:
+   ```toml
+   [package]
+   version = "0.2.0"   # was 0.1.0
+   ```
+
+2. **Commit the bump:**
+   ```sh
+   git add Cargo.toml
+   git commit -m "release 0.2.0"
+   ```
+
+3. **Create and push a version tag.** The tag must start with `v` followed by
+   the version number:
+   ```sh
+   git tag v0.2.0
+   git push origin main
+   git push origin v0.2.0
+   ```
+   Pushing the tag is what triggers the workflow — pushing the commit alone does
+   not.
+
+That's it. GitHub Actions takes over from here.
+
+### What the GitHub Actions workflow does
+
+The workflow is defined in `.github/workflows/publish.yml`. It runs on
+`ubuntu-latest` and performs three steps:
+
+1. **Checkout** — checks out the repository at the tagged commit.
+2. **Install Rust** — installs the latest stable Rust toolchain via
+   `dtolnay/rust-toolchain`.
+3. **Test** — runs `cargo test`. If any test fails, the workflow stops and
+   nothing is published.
+4. **Publish** — runs `cargo publish`, which packages the crate and uploads it
+   to crates.io using the `CARGO_REGISTRY_TOKEN` secret.
+
+`cargo publish` uses the `exclude` list in `Cargo.toml` to decide what goes
+into the package. Tests, docs, and markdown files are excluded so the published
+crate contains only the source code needed to build the binary.
+
+### Things to know
+
+- **crates.io versions are immutable.** Once `0.2.0` is published you cannot
+  overwrite it. If a release has a critical bug, publish a patch version
+  (`0.2.1`).
+- **The tag and `Cargo.toml` version should match.** The workflow does not
+  enforce this, but mismatches are confusing. Tag `v0.2.0` should correspond
+  to `version = "0.2.0"` in `Cargo.toml`.
+- **You can do a dry run locally** before tagging to check that the package
+  looks right:
+  ```sh
+  cargo publish --dry-run
+  ```
+  This runs all the packaging steps but does not upload anything.
+
 ## Example pair
 
 A larger real-world example lives in `tests/examples/`. Run it with:
