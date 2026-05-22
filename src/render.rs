@@ -85,6 +85,8 @@ mod tests {
     use crate::world::SystemWorld;
     use std::fs;
     use tempfile::TempDir;
+    use typst::foundations::Content;
+    use typst::layout::PageElem;
     use typst::text::TextElem;
 
     #[test]
@@ -95,5 +97,46 @@ mod tests {
         let content = TextElem::packed("Hello, diff world.");
         let pdf = render_to_pdf(&content, &world).unwrap();
         assert!(pdf.starts_with(b"%PDF"), "expected PDF output");
+    }
+
+    #[test]
+    fn renders_sequence_to_pdf() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let content = Content::sequence([
+            TextElem::packed("First paragraph."),
+            TextElem::packed(" Second paragraph."),
+        ]);
+
+        let pdf = render_to_pdf(&content, &world).unwrap();
+
+        assert!(pdf.starts_with(b"%PDF"), "expected PDF output");
+        assert!(pdf.len() > 1000);
+    }
+
+    #[test]
+    fn renders_page_styled_content_to_pdf() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let content = TextElem::packed("Landscape text").styled(PageElem::flipped.set(true));
+
+        let pdf = render_to_pdf(&content, &world).unwrap();
+
+        assert!(pdf.starts_with(b"%PDF"), "expected PDF output");
+        assert!(pdf.len() > 1000);
+    }
+
+    #[test]
+    fn render_reports_layout_error_for_missing_reference() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "See @missing.").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let content = crate::eval_to_content(&world).unwrap();
+
+        let err = render_to_pdf(&content, &world).unwrap_err();
+
+        assert!(err.to_string().contains("layout errors"), "{err}");
     }
 }

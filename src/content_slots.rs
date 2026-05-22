@@ -749,3 +749,310 @@ pub fn replace_inline_content(template: &Content, replacement: &Content) -> Opti
 fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::eval_to_content;
+    use crate::world::SystemWorld;
+    use std::fs;
+    use tempfile::TempDir;
+    use typst::foundations::Packed;
+    use typst::text::TextElem;
+
+    fn eval(source: &str) -> (TempDir, Content) {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), source).unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let content = eval_to_content(&world).unwrap();
+        (dir, normalize_list_item_runs(content))
+    }
+
+    fn text(s: &str) -> Content {
+        TextElem::packed(s)
+    }
+
+    fn slot_texts(content: &Content) -> Vec<String> {
+        extract_slots(content)
+            .into_iter()
+            .map(|slot| slot.content.plain_text().to_string())
+            .collect()
+    }
+
+    fn replace_nth_slot(content: &Content, index: usize, replacement: &str) -> Content {
+        let slots = extract_slots(content);
+        replace_slot(content, &slots[index].path, text(replacement)).unwrap()
+    }
+
+    #[test]
+    fn list_slots_extract_and_replace_each_item_body() {
+        let content = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(text("Alpha"))),
+            Packed::new(ListItem::new(text("Beta"))),
+            Packed::new(ListItem::new(text("Gamma"))),
+        ]));
+
+        let slots = extract_slots(&content);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SlotStep::ListItem(0)],
+                vec![SlotStep::ListItem(1)],
+                vec![SlotStep::ListItem(2)]
+            ]
+        );
+
+        let replaced = replace_slot(&content, &slots[1].path, text("Better")).unwrap();
+        assert_eq!(slot_texts(&replaced), ["Alpha", "Better", "Gamma"]);
+        assert_eq!(slot_texts(&content), ["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn enum_slots_extract_and_replace_each_item_body() {
+        let content = Content::new(EnumElem::new(vec![
+            Packed::new(EnumItem::new(text("One"))),
+            Packed::new(EnumItem::new(text("Two"))),
+        ]));
+
+        let slots = extract_slots(&content);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![SlotStep::EnumItem(0)], vec![SlotStep::EnumItem(1)]]
+        );
+
+        let replaced = replace_slot(&content, &slots[0].path, text("First")).unwrap();
+        assert_eq!(slot_texts(&replaced), ["First", "Two"]);
+    }
+
+    #[test]
+    fn term_slots_extract_and_replace_term_and_description() {
+        let content = Content::new(TermsElem::new(vec![Packed::new(TermItem::new(
+            text("API"),
+            text("Old description"),
+        ))]));
+
+        let slots = extract_slots(&content);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![SlotStep::Term(0)], vec![SlotStep::TermDescription(0)]]
+        );
+
+        let replaced = replace_slot(&content, &slots[0].path, text("SDK")).unwrap();
+        let replaced = replace_slot(&replaced, &slots[1].path, text("New description")).unwrap();
+        assert_eq!(slot_texts(&replaced), ["SDK", "New description"]);
+    }
+
+    #[test]
+    fn figure_slots_extract_body_and_caption() {
+        let (_dir, content) = eval("#figure(rect(width: 10pt, height: 4pt), caption: [Old cap])");
+        let slots = extract_slots(&content);
+
+        assert!(
+            slots
+                .iter()
+                .any(|slot| slot.path.ends_with(&[SlotStep::FigureBody]))
+        );
+        assert!(
+            slots
+                .iter()
+                .any(|slot| slot.path.ends_with(&[SlotStep::FigureCaption]))
+        );
+
+        let caption = slots
+            .iter()
+            .find(|slot| slot.path.ends_with(&[SlotStep::FigureCaption]))
+            .unwrap();
+        let replaced = replace_slot(&content, &caption.path, text("New cap")).unwrap();
+        assert!(replaced.plain_text().contains("New cap"));
+        assert!(!replaced.plain_text().contains("Old cap"));
+    }
+
+    #[test]
+    fn footnote_slots_extract_and_replace_body() {
+        let (_dir, content) = eval("Text#footnote[Old note].");
+        let slots = extract_slots(&content);
+        let footnote = slots
+            .iter()
+            .find(|slot| slot.path.ends_with(&[SlotStep::FootnoteBody]))
+            .unwrap();
+
+        let replaced = replace_slot(&content, &footnote.path, text("New note")).unwrap();
+        assert!(replaced.plain_text().contains("New note"));
+        assert!(!replaced.plain_text().contains("Old note"));
+    }
+
+    #[test]
+    fn quote_slots_extract_and_replace_body() {
+        let (_dir, content) = eval("#quote[Old quote]");
+        let slots = extract_slots(&content);
+        assert!(
+            slots
+                .iter()
+                .any(|slot| slot.path == vec![SlotStep::QuoteBody])
+        );
+
+        let replaced = replace_nth_slot(&content, 0, "New quote");
+        assert_eq!(replaced.plain_text(), "New quote");
+    }
+
+    #[test]
+    fn table_slots_extract_and_replace_cells_in_document_order() {
+        let (_dir, content) = eval("#table(columns: 2, [A], [B], [C], [D])");
+        assert_eq!(slot_texts(&content), ["A", "B", "C", "D"]);
+
+        let replaced = replace_nth_slot(&content, 2, "Changed");
+        assert_eq!(slot_texts(&replaced), ["A", "B", "Changed", "D"]);
+    }
+
+    #[test]
+    fn grid_slots_extract_and_replace_cells_in_document_order() {
+        let (_dir, content) = eval("#grid(columns: 2, [A], [B], [C], [D])");
+        assert_eq!(slot_texts(&content), ["A", "B", "C", "D"]);
+
+        let replaced = replace_nth_slot(&content, 3, "Changed");
+        assert_eq!(slot_texts(&replaced), ["A", "B", "C", "Changed"]);
+    }
+
+    #[test]
+    fn stack_slots_extract_and_replace_block_children() {
+        let (_dir, content) = eval("#stack(dir: ttb, [Top], [Bottom])");
+        assert_eq!(slot_texts(&content), ["Top", "Bottom"]);
+
+        let replaced = replace_nth_slot(&content, 1, "Lower");
+        assert_eq!(slot_texts(&replaced), ["Top", "Lower"]);
+    }
+
+    #[test]
+    fn wrapper_slots_extract_and_replace_body() {
+        let cases = [
+            "#align(center)[Old]",
+            "#pad(5pt)[Old]",
+            "#place(top)[Old]",
+            "#columns(2)[Old]",
+            "#box[Old]",
+            "#block[Old]",
+            "#rect[Old]",
+            "#circle[Old]",
+            "#ellipse[Old]",
+        ];
+
+        for source in cases {
+            let (_dir, content) = eval(source);
+            let slots = extract_slots(&content);
+            assert_eq!(slots.len(), 1, "{source}: {slots:?}");
+            assert!(
+                slots[0].path.ends_with(&[SlotStep::WrapperBody]),
+                "{source}"
+            );
+
+            let replaced = replace_slot(&content, &slots[0].path, text("New")).unwrap();
+            assert!(replaced.plain_text().contains("New"), "{source}");
+            assert!(!replaced.plain_text().contains("Old"), "{source}");
+        }
+    }
+
+    #[test]
+    fn replace_slot_returns_none_for_invalid_paths() {
+        let content = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
+            "Only",
+        )))]));
+
+        assert!(replace_slot(&content, &[], text("Nope")).is_none());
+        assert!(replace_slot(&content, &[SlotStep::ListItem(3)], text("Nope")).is_none());
+        assert!(replace_slot(&content, &[SlotStep::FigureCaption], text("Nope")).is_none());
+    }
+
+    #[test]
+    fn normalize_list_item_runs_groups_items_and_preserves_siblings() {
+        let content = Content::sequence([
+            text("Before"),
+            Content::new(ListItem::new(text("Alpha"))),
+            Content::new(ListItem::new(text("Beta"))),
+            text("After"),
+        ]);
+
+        let normalized = normalize_list_item_runs(content);
+        let seq = normalized.to_packed::<SequenceElem>().unwrap();
+        assert!(seq.children[0].plain_text().contains("Before"));
+        assert!(seq.children[1].is::<ListElem>());
+        assert!(seq.children[2].plain_text().contains("After"));
+        assert_eq!(slot_texts(&seq.children[1]), ["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn normalize_list_item_runs_recurses_into_slot_content() {
+        let quote = Content::new(QuoteElem::new(Content::sequence([
+            Content::new(ListItem::new(text("Alpha"))),
+            Content::new(ListItem::new(text("Beta"))),
+        ])));
+
+        let normalized = normalize_list_item_runs(quote);
+        let slots = extract_slots(&normalized);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slot_texts(&slots[0].content), ["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn replace_inline_content_targets_paragraph_styled_and_inline_sequence() {
+        let replacement = Content::sequence([text("New"), text(" text")]);
+
+        let par = Content::new(ParElem::new(text("Old")));
+        assert_eq!(
+            replace_inline_content(&par, &replacement)
+                .unwrap()
+                .plain_text(),
+            "New text"
+        );
+
+        let styled = Content::sequence([text("Old"), text(" text")]).styled(
+            typst::text::TextElem::fill.set(typst::visualize::Color::from_u8(1, 2, 3, 255).into()),
+        );
+        assert_eq!(
+            replace_inline_content(&styled, &replacement)
+                .unwrap()
+                .plain_text(),
+            "New text"
+        );
+
+        let inline_seq = Content::sequence([text("Old"), text(" text")]);
+        assert_eq!(
+            replace_inline_content(&inline_seq, &replacement)
+                .unwrap()
+                .plain_text(),
+            "New text"
+        );
+    }
+
+    #[test]
+    fn is_slot_container_matches_representative_extractable_elements() {
+        let containers = [
+            Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
+                "Item",
+            )))])),
+            Content::new(EnumElem::new(vec![Packed::new(EnumItem::new(text(
+                "Item",
+            )))])),
+            Content::new(TermsElem::new(vec![Packed::new(TermItem::new(
+                text("Term"),
+                text("Description"),
+            ))])),
+            Content::new(QuoteElem::new(text("Quote"))),
+        ];
+
+        for container in containers {
+            assert!(is_slot_container(&container));
+            assert!(!extract_slots(&container).is_empty());
+        }
+        assert!(!is_slot_container(&text("Plain")));
+        assert!(extract_slots(&text("Plain")).is_empty());
+    }
+}

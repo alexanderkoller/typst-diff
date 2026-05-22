@@ -435,7 +435,11 @@ mod tests {
     use crate::world::SystemWorld;
     use std::fs;
     use tempfile::TempDir;
+    use typst::foundations::Packed;
+    use typst::layout::{BlockBody, BlockElem};
+    use typst::model::{FootnoteBody, ListElem, ListItem};
     use typst::text::TextElem;
+    use typst::visualize::Color;
 
     #[test]
     fn eval_extracts_text_nodes() {
@@ -464,5 +468,147 @@ mod tests {
         let content = eval_to_content(&world).unwrap();
         let plain = content.plain_text();
         assert!(plain.contains("Included text."));
+    }
+
+    fn text(s: &str) -> Content {
+        TextElem::packed(s)
+    }
+
+    fn block(body: &str) -> Content {
+        Content::new(BlockElem::new().with_body(Some(BlockBody::Content(TextElem::packed(body)))))
+            .spanned(Span::detached())
+    }
+
+    fn count_elem<T: NativeElement>(content: &Content) -> usize {
+        let mut count = 0;
+        let _ = content.traverse::<_, ()>(&mut |c| {
+            if c.is::<T>() {
+                count += 1;
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        count
+    }
+
+    #[test]
+    fn collect_preserved_by_span_keeps_multiple_values_for_same_span() {
+        let first = block("First");
+        let second = block("Second");
+        let content = Content::sequence([first.clone(), second.clone()]);
+
+        let preserved = collect_preserved_by_span(&content);
+        let queue = preserved.get(&Span::detached()).unwrap();
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].plain_text(), "First");
+        assert_eq!(queue[1].plain_text(), "Second");
+    }
+
+    #[test]
+    fn restore_preserved_consumes_same_span_values_in_order() {
+        let preserved_content = Content::sequence([block("First"), block("Second")]);
+        let mut preserved = collect_preserved_by_span(&preserved_content);
+
+        let realized_a = text("realized a").spanned(Span::detached());
+        let realized_b = text("realized b").spanned(Span::detached());
+
+        assert_eq!(
+            restore_preserved(realized_a, &mut preserved).plain_text(),
+            "First"
+        );
+        assert_eq!(
+            restore_preserved(realized_b, &mut preserved).plain_text(),
+            "Second"
+        );
+    }
+
+    #[test]
+    fn restore_preserved_recurses_into_slot_container_children() {
+        let preserved_child = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
+            "Preserved item",
+        )))]))
+        .spanned(Span::detached());
+        let mut preserved = collect_preserved_by_span(&preserved_child);
+
+        let realized = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
+            "Realized item",
+        )))]));
+        let restored = restore_preserved(realized, &mut preserved);
+
+        assert_eq!(restored.plain_text(), "Preserved item");
+    }
+
+    #[test]
+    fn restore_preserved_leaves_unknown_content_unchanged() {
+        let mut preserved = HashMap::new();
+        let restored = restore_preserved(text("Plain"), &mut preserved);
+        assert_eq!(restored.plain_text(), "Plain");
+    }
+
+    #[test]
+    fn restore_footnote_markers_replaces_markers_in_document_order() {
+        let first = Content::new(FootnoteElem::new(FootnoteBody::Content(text("First note"))));
+        let second = Content::new(FootnoteElem::new(FootnoteBody::Content(text(
+            "Second note",
+        ))));
+        let content = Content::sequence([text("Text"), text("1"), text(" more"), text("2")]);
+
+        let restored = restore_footnote_markers(content, &[first, second]);
+
+        assert!(restored.plain_text().contains("First note"));
+        assert!(restored.plain_text().contains("Second note"));
+        assert_eq!(count_elem::<FootnoteElem>(&restored), 2);
+    }
+
+    #[test]
+    fn restore_footnote_markers_handles_styled_marker() {
+        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(text(
+            "Styled note",
+        ))));
+        let marker = text("1").styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
+
+        let restored = restore_footnote_markers(marker, &[footnote]);
+
+        assert_eq!(restored.plain_text(), "Styled note");
+        assert_eq!(count_elem::<FootnoteElem>(&restored), 1);
+    }
+
+    #[test]
+    fn restore_footnote_markers_does_not_replace_non_matching_numbers() {
+        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(text("Note"))));
+        let content = Content::sequence([text("2")]);
+
+        let restored = restore_footnote_markers(content, &[footnote]);
+
+        assert_eq!(restored.plain_text(), "2");
+        assert_eq!(count_elem::<FootnoteElem>(&restored), 0);
+    }
+
+    #[test]
+    fn style_partitioning_separates_page_and_non_page_styles() {
+        let mut styles = Styles::new();
+        styles.push(PageElem::flipped.set(true));
+        styles.push(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
+
+        let pages = page_styles(&styles);
+        let non_pages = non_page_styles(styles.clone());
+        let marginal = marginal_styles(&styles);
+
+        assert!(!pages.is_empty());
+        assert!(pages.iter().all(|style| {
+            style
+                .element()
+                .is_some_and(|element| element == PageElem::ELEM)
+        }));
+        assert!(non_pages.iter().all(|style| {
+            style
+                .element()
+                .is_none_or(|element| element != PageElem::ELEM)
+        }));
+        assert!(marginal.iter().any(|style| {
+            style
+                .element()
+                .is_some_and(|element| element == PageElem::ELEM)
+        }));
     }
 }

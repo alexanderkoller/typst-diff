@@ -65,6 +65,15 @@ fn assert_contains_in_order(text: &str, needles: &[&str]) {
     }
 }
 
+fn assert_command_success(output: std::process::Output, label: &str) {
+    assert!(
+        output.status.success(),
+        "{label} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
@@ -95,25 +104,112 @@ fn cli_diffs_working_tree_against_git_revision() {
 
     std::fs::write(dir.path().join("chapter.typ"), "The new text.").unwrap();
     let output = dir.path().join("diff.pdf");
-    let status = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
         .current_dir(dir.path())
         .args(["main.typ", "--revision", "HEAD", "-o"])
         .arg(&output)
-        .status()
+        .output()
         .unwrap();
 
-    assert!(status.success(), "CLI failed");
+    assert_command_success(cli, "typst-diff");
     let pdf = std::fs::read(output).unwrap();
     assert_valid_pdf(&pdf);
 }
 
+#[test]
+fn cli_requires_new_document_or_revision() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("main.typ"), "Hello").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .arg("main.typ")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing new document path"), "{stderr}");
+}
+
+#[test]
+fn cli_rejects_missing_input_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("new.typ"), "Hello").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["missing.typ", "new.typ"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to load old document"), "{stderr}");
+}
+
+#[test]
+fn cli_writes_modification_log_when_requested() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("old.typ"), "The old text.").unwrap();
+    std::fs::write(dir.path().join("new.typ"), "The new text.").unwrap();
+    let pdf_path = dir.path().join("diff.pdf");
+    let log_path = dir.path().join("mods.txt");
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["old.typ", "new.typ", "-o"])
+        .arg(&pdf_path)
+        .args(["-l"])
+        .arg(&log_path)
+        .output()
+        .unwrap();
+
+    assert_command_success(cli, "typst-diff");
+    assert_valid_pdf(&std::fs::read(pdf_path).unwrap());
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("modify"), "{log}");
+    assert!(log.contains("old"), "{log}");
+    assert!(log.contains("new"), "{log}");
+}
+
+#[test]
+fn cli_revision_mode_handles_file_in_subdirectory_with_include() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("chapters")).unwrap();
+    std::fs::write(
+        dir.path().join("chapters/main.typ"),
+        "#include \"part.typ\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("chapters/part.typ"), "The old text.").unwrap();
+
+    git(dir.path(), &["init"]);
+    git(dir.path(), &["config", "user.email", "test@example.com"]);
+    git(dir.path(), &["config", "user.name", "Typst Diff Test"]);
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-m", "old"]);
+
+    std::fs::write(dir.path().join("chapters/part.typ"), "The new text.").unwrap();
+    let output = dir.path().join("diff.pdf");
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path().join("chapters"))
+        .args(["main.typ", "--revision", "HEAD", "-o"])
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_command_success(cli, "typst-diff");
+    assert_valid_pdf(&std::fs::read(output).unwrap());
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git")
+    let output = Command::new("git")
         .current_dir(cwd)
         .args(args)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "git {:?} failed", args);
+    assert_command_success(output, &format!("git {args:?}"));
 }
 
 #[test]

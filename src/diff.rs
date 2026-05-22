@@ -1631,4 +1631,153 @@ mod tests {
         });
         assert!(has_slot_change);
     }
+
+    #[test]
+    fn extract_blocks_keeps_structured_containers_as_single_blocks() {
+        use typst::foundations::Packed;
+        use typst::model::{FigureElem, ListElem, ListItem, TableCell, TableElem};
+
+        let list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Beta"))),
+        ]));
+        let table = Content::new(TableElem::new(vec![typst::model::TableChild::Item(
+            typst::model::TableItem::Cell(Packed::new(TableCell::new(TextElem::packed("Cell")))),
+        )]));
+        let figure = Content::new(FigureElem::new(TextElem::packed("Body")));
+        let content = seq([list, table, figure]);
+
+        let blocks = extract_blocks(&content);
+
+        assert_eq!(blocks.len(), 3);
+        assert!(blocks[0].is::<ListElem>());
+        assert!(blocks[1].is::<TableElem>());
+        assert!(blocks[2].is::<FigureElem>());
+    }
+
+    #[test]
+    fn extract_words_preserves_punctuation_with_non_whitespace_runs_and_unicode_words() {
+        let tokens = extract_words(&TextElem::packed("Hello, café 世界!"));
+        let texts: Vec<_> = tokens.iter().map(|token| token.text.as_str()).collect();
+
+        assert!(texts.contains(&"Hello,"));
+        assert!(texts.contains(&"café"));
+        assert!(texts.contains(&"世界!"));
+    }
+
+    #[test]
+    fn extract_words_tokenizes_slots_inside_containers() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha item"))),
+            Packed::new(ListItem::new(TextElem::packed("Beta item"))),
+        ]));
+        let tokens = extract_words(&list);
+        let texts: Vec<_> = tokens.iter().map(|token| token.text.as_str()).collect();
+
+        assert!(texts.contains(&"Alpha"));
+        assert!(texts.contains(&"Beta"));
+    }
+
+    #[test]
+    fn diff_slots_same_shape_reports_only_changed_slots() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let old = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Beta"))),
+            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
+        ]));
+        let new = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Better"))),
+            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
+        ]));
+
+        let slots = diff_slots(&old, &new).unwrap();
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(
+            slots[0].path,
+            vec![crate::content_slots::SlotStep::ListItem(1)]
+        );
+    }
+
+    #[test]
+    fn diff_slots_shape_mismatch_falls_back_to_block_diff() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let old = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
+            TextElem::packed("Alpha"),
+        ))]));
+        let new = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Beta"))),
+        ]));
+
+        assert!(diff_slots(&old, &new).is_none());
+    }
+
+    #[test]
+    fn modification_log_includes_slot_path_and_omits_unchanged_slots() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let old = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Stable"))),
+            Packed::new(ListItem::new(TextElem::packed("Old value"))),
+        ]));
+        let new = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Stable"))),
+            Packed::new(ListItem::new(TextElem::packed("New value"))),
+        ]));
+
+        let log = diff_content(&old, &new).modification_log();
+
+        assert!(log.contains("modify slot"), "{log}");
+        assert!(log.contains("ListItem(1)"), "{log}");
+        assert!(log.contains("Old"), "{log}");
+        assert!(log.contains("New"), "{log}");
+        assert!(!log.contains("Stable"), "{log}");
+    }
+
+    #[test]
+    fn modification_log_collapses_multiline_text_to_single_line() {
+        let old = seq([TextElem::packed("Old\nvalue")]);
+        let new = seq([TextElem::packed("New\nvalue")]);
+
+        let log = diff_content(&old, &new).modification_log();
+
+        assert!(log.contains("block: New value"), "{log}");
+        assert!(log.contains("deleted: Old"), "{log}");
+        assert!(log.contains("inserted: New"), "{log}");
+        assert!(!log.contains("Old\nvalue"), "{log}");
+        assert!(!log.contains("New\nvalue"), "{log}");
+    }
+
+    #[test]
+    fn match_edit_zones_pairs_best_similar_blocks() {
+        let old = vec![
+            TextElem::packed("Alpha beta gamma delta epsilon old zeta eta theta."),
+            TextElem::packed("Completely different old paragraph."),
+        ];
+        let new = vec![
+            TextElem::packed("Completely different new paragraph."),
+            TextElem::packed("Alpha beta gamma delta epsilon new zeta eta theta."),
+        ];
+
+        let ops = match_edit_zones(diff_blocks_raw(&old, &new));
+
+        assert!(ops.iter().any(|op| match op {
+            BlockOp::Replace(old, new) => {
+                old.content.plain_text().contains("epsilon")
+                    && new.content.plain_text().contains("epsilon")
+            }
+            _ => false,
+        }));
+    }
 }

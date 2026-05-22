@@ -26,3 +26,61 @@ fn format_one(world: &dyn World, d: &SourceDiagnostic) -> String {
         None => d.message.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::SystemWorld;
+    use std::fs;
+    use tempfile::TempDir;
+    use typst::syntax::Span;
+
+    #[test]
+    fn format_diagnostics_empty_returns_empty_string() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+
+        assert_eq!(format_diagnostics(&world, &[]), "");
+    }
+
+    #[test]
+    fn format_diagnostics_includes_virtual_path_line_col() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "first\nsecond\n").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let source = world.source(world.main()).unwrap();
+        let span = source.root().span();
+        let diagnostic = SourceDiagnostic::error(span, "problem");
+
+        let formatted = format_diagnostics(&world, &[diagnostic]);
+
+        assert!(formatted.contains("main.typ:1:1: problem"), "{formatted}");
+    }
+
+    #[test]
+    fn format_diagnostics_falls_back_for_detached_span() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let diagnostic = SourceDiagnostic::error(Span::detached(), "detached problem");
+
+        assert_eq!(
+            format_diagnostics(&world, &[diagnostic]),
+            "detached problem"
+        );
+    }
+
+    #[test]
+    fn format_diagnostics_formats_multiple_diagnostics() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "content").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let diagnostics = [
+            SourceDiagnostic::error(Span::detached(), "first"),
+            SourceDiagnostic::warning(Span::detached(), "second"),
+        ];
+
+        assert_eq!(format_diagnostics(&world, &diagnostics), "first\nsecond");
+    }
+}

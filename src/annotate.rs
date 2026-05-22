@@ -21,7 +21,7 @@ use typst::foundations::Content;
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::Abs;
 use typst::math::{CancelElem, EquationElem};
-use typst::model::ParElem;
+use typst::model::{HeadingElem, ParElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
@@ -61,7 +61,7 @@ pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool)
                 let colored = plain_content(&c.content).styled(TextElem::fill.set(red().into()));
                 let struck = Content::new(StrikeElem::new(colored));
                 DiffBlock {
-                    content: replace_text_container(&c.content, &struck).unwrap_or(struck),
+                    content: struck,
                     page_styles: c.page_styles.clone(),
                 }
             }
@@ -247,6 +247,11 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
         return Some(content);
     }
 
+    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
+        heading.body = replacement.clone();
+        return Some(content);
+    }
+
     if let Some(styled) = content.to_packed_mut::<StyledElem>()
         && let Some(child) = replace_text_container(&styled.child, replacement)
     {
@@ -298,7 +303,10 @@ fn replace_modified_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{DiffResult, DiffResultOp, Token, WordOp};
+    use crate::content_slots::SlotStep;
+    use crate::diff::{DiffResult, DiffResultOp, SlotDiff, Token, WordOp};
+    use typst::foundations::{NativeElement, Packed};
+    use typst::model::{HeadingElem, ListElem, ListItem};
     use typst::text::TextElem;
 
     fn word_token(s: &str) -> Token {
@@ -313,6 +321,17 @@ mod tests {
             content,
             page_styles: Default::default(),
         }
+    }
+
+    fn count_elem<T: NativeElement>(content: &Content) -> usize {
+        let mut count = 0;
+        let _ = content.traverse::<_, ()>(&mut |c| {
+            if c.is::<T>() {
+                count += 1;
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        count
     }
 
     #[test]
@@ -355,8 +374,6 @@ mod tests {
 
     #[test]
     fn deleted_block_is_rendered_as_plain_text() {
-        use typst::model::HeadingElem;
-
         let result = DiffResult {
             block_ops: vec![DiffResultOp::Deleted(block(Content::new(
                 HeadingElem::new(TextElem::packed("Old heading")),
@@ -384,5 +401,131 @@ mod tests {
             "deleted block should not keep structural side effects"
         );
         assert!(found_old_text, "deleted block text should remain visible");
+    }
+
+    #[test]
+    fn compact_substitutions_drop_deleted_text_and_color_inserted_text() {
+        let result = DiffResult {
+            block_ops: vec![DiffResultOp::Modified(
+                block(TextElem::packed("The new text.")),
+                vec![
+                    WordOp::Equal(vec![word_token("The ")]),
+                    WordOp::Delete(vec![word_token("old")]),
+                    WordOp::Insert(vec![word_token("new")]),
+                    WordOp::Equal(vec![word_token(" text.")]),
+                ],
+            )],
+            root_styles: Default::default(),
+        };
+
+        let compact = build_annotated_content(&result, true);
+
+        assert_eq!(count_elem::<StrikeElem>(&compact), 0);
+        assert!(compact.plain_text().contains("new"));
+        assert!(!compact.plain_text().contains("old"));
+    }
+
+    #[test]
+    fn modified_heading_preserves_heading_element() {
+        let heading = Content::new(HeadingElem::new(TextElem::packed("New heading")));
+        let result = DiffResult {
+            block_ops: vec![DiffResultOp::Modified(
+                block(heading),
+                vec![
+                    WordOp::Delete(vec![word_token("Old")]),
+                    WordOp::Insert(vec![word_token("New")]),
+                    WordOp::Equal(vec![word_token(" heading")]),
+                ],
+            )],
+            root_styles: Default::default(),
+        };
+
+        let annotated = build_annotated_content(&result, false);
+
+        assert_eq!(count_elem::<HeadingElem>(&annotated), 1);
+        assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
+        assert!(annotated.plain_text().contains("New"));
+    }
+
+    #[test]
+    fn modified_list_slot_preserves_list_and_unchanged_items() {
+        let list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Better"))),
+            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
+        ]));
+        let result = DiffResult {
+            block_ops: vec![DiffResultOp::ModifiedSlots(
+                block(list),
+                vec![SlotDiff {
+                    path: vec![SlotStep::ListItem(1)],
+                    word_ops: vec![
+                        WordOp::Delete(vec![word_token("Beta")]),
+                        WordOp::Insert(vec![word_token("Better")]),
+                    ],
+                }],
+            )],
+            root_styles: Default::default(),
+        };
+
+        let annotated = build_annotated_content(&result, false);
+        let plain = annotated.plain_text();
+
+        assert_eq!(count_elem::<ListElem>(&annotated), 1);
+        assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
+        assert!(plain.contains("Alpha"), "{plain}");
+        assert!(plain.contains("Beta"), "{plain}");
+        assert!(plain.contains("Better"), "{plain}");
+        assert!(plain.contains("Gamma"), "{plain}");
+    }
+
+    #[test]
+    fn modified_table_slot_preserves_table_structure() {
+        use typst::model::{TableCell, TableChild, TableElem, TableItem};
+
+        let table = Content::new(TableElem::new(vec![
+            TableChild::Item(TableItem::Cell(Packed::new(TableCell::new(
+                TextElem::packed("Metric"),
+            )))),
+            TableChild::Item(TableItem::Cell(Packed::new(TableCell::new(
+                TextElem::packed("New value"),
+            )))),
+        ]));
+        let result = DiffResult {
+            block_ops: vec![DiffResultOp::ModifiedSlots(
+                block(table),
+                vec![SlotDiff {
+                    path: vec![SlotStep::TableCell(1)],
+                    word_ops: vec![
+                        WordOp::Delete(vec![word_token("Old")]),
+                        WordOp::Insert(vec![word_token("New")]),
+                        WordOp::Equal(vec![word_token(" value")]),
+                    ],
+                }],
+            )],
+            root_styles: Default::default(),
+        };
+
+        let annotated = build_annotated_content(&result, false);
+
+        assert_eq!(count_elem::<TableElem>(&annotated), 1);
+        assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
+        assert!(annotated.plain_text().contains("Metric"));
+        assert!(annotated.plain_text().contains("Old"));
+        assert!(annotated.plain_text().contains("New"));
+    }
+
+    #[test]
+    fn annotated_inline_content_inserts_separator_between_adjacent_changes() {
+        let inline = annotated_inline_content(
+            &[
+                WordOp::Delete(vec![word_token("old")]),
+                WordOp::Insert(vec![word_token("new")]),
+            ],
+            false,
+        );
+
+        assert_eq!(inline.plain_text(), "old new");
+        assert_eq!(count_elem::<StrikeElem>(&inline), 1);
     }
 }

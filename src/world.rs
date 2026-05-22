@@ -172,4 +172,63 @@ mod tests {
         let src = world.source(ch_id).unwrap();
         assert_eq!(src.text(), "Chapter text");
     }
+
+    #[test]
+    fn new_rejects_missing_entry_file() {
+        let dir = TempDir::new().unwrap();
+        let err = match SystemWorld::new(dir.path().join("missing.typ")) {
+            Ok(_) => panic!("missing entry should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cannot find"), "{err}");
+    }
+
+    #[test]
+    fn source_cache_returns_original_contents_after_disk_change() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("main.typ");
+        fs::write(&path, "Original").unwrap();
+        let world = SystemWorld::new(&path).unwrap();
+
+        fs::write(&path, "Changed").unwrap();
+        let src = world.source(world.main()).unwrap();
+
+        assert_eq!(src.text(), "Original");
+    }
+
+    #[test]
+    fn file_reads_and_caches_binary_assets() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let asset = dir.path().join("asset.bin");
+        fs::write(&asset, [1_u8, 2, 3]).unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let id = FileId::new(None, VirtualPath::new("/asset.bin"));
+
+        let first = world.file(id).unwrap();
+        fs::write(&asset, [9_u8, 9, 9]).unwrap();
+        let second = world.file(id).unwrap();
+
+        assert_eq!(first.as_slice(), &[1, 2, 3]);
+        assert_eq!(second.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn missing_source_returns_file_error() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let id = FileId::new(None, VirtualPath::new("/missing.typ"));
+
+        assert!(world.source(id).is_err());
+    }
+
+    #[test]
+    fn today_returns_none_for_reproducible_output() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+
+        assert!(world.today(None).is_none());
+    }
 }
