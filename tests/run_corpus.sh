@@ -76,7 +76,7 @@ fi
 
 # ── list mode ─────────────────────────────────────────────────────────────────
 if [[ $LIST_ONLY -eq 1 ]]; then
-  find "$CORPUS_DIR" -mindepth 1 -maxdepth 1 -type d | sort | xargs -n1 basename
+  find "$CORPUS_DIR" -mindepth 1 -maxdepth 1 -type d | sort -V | xargs -n1 basename
   exit 0
 fi
 
@@ -314,13 +314,6 @@ while IFS= read -r test_dir; do
       fail=$((fail + 1))
       failed_names+=("$name")
       printf "${RED}FAIL${RST}  %-42s  ${DIM}%ds${RST}\n" "$name" "$elapsed"
-      for r in "${reasons[@]}"; do
-        printf "      ${RED}reason:${RST} %s\n" "$r"
-      done
-      if [[ -s "$out_stderr" ]]; then
-        printf "      ${DIM}stderr:${RST}\n"
-        sed 's/^/        /' "$out_stderr"
-      fi
       if [[ $VERBOSE -eq 1 && -s "$out_mods" ]]; then
         printf "      ${DIM}modifications:${RST}\n"
         sed 's/^/        /' "$out_mods"
@@ -328,7 +321,7 @@ while IFS= read -r test_dir; do
       ;;
   esac
 
-done < <(find "$CORPUS_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+done < <(find "$CORPUS_DIR" -mindepth 1 -maxdepth 1 -type d | sort -V)
 
 # ── summary ───────────────────────────────────────────────────────────────────
 total=$((pass + fail + new + skip))
