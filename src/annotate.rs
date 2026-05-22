@@ -61,7 +61,7 @@ pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool)
                 let colored = plain_content(&c.content).styled(TextElem::fill.set(red().into()));
                 let struck = Content::new(StrikeElem::new(colored));
                 DiffBlock {
-                    content: struck,
+                    content: replace_text_container(&c.content, &struck).unwrap_or(struck),
                     page_styles: c.page_styles.clone(),
                 }
             }
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_block_is_rendered_as_plain_text() {
+    fn deleted_heading_keeps_heading_formatting() {
         let result = DiffResult {
             block_ops: vec![DiffResultOp::Deleted(block(Content::new(
                 HeadingElem::new(TextElem::packed("Old heading")),
@@ -397,10 +397,11 @@ mod tests {
         });
 
         assert!(
-            !found_heading,
-            "deleted block should not keep structural side effects"
+            found_heading,
+            "deleted heading should keep heading formatting"
         );
         assert!(found_old_text, "deleted block text should remain visible");
+        assert_eq!(count_elem::<StrikeElem>(&content), 1);
     }
 
     #[test]

@@ -34,7 +34,7 @@ use typst::introspection::TagElem;
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{HElem, PageElem, PagebreakElem};
 use typst::math::EquationElem;
-use typst::model::{DocumentInfo, FootnoteElem, ParElem};
+use typst::model::{DocumentInfo, FootnoteElem, HeadingElem, ParElem};
 use typst::routines::{Arenas, RealizationKind};
 use typst::syntax::Span;
 use typst::text::TextElem;
@@ -207,8 +207,8 @@ fn realize_to_content(
     Ok(restore_footnote_markers(realized, &footnotes))
 }
 
-/// Walk the pre-realization tree and index every `EquationElem` and slot-container
-/// node by span so they can be swapped back in after realization.
+/// Walk the pre-realization tree and index every `EquationElem`, `HeadingElem`, and
+/// slot-container node by span so they can be swapped back in after realization.
 ///
 /// Typst may assign the same source span to multiple realized nodes when a
 /// function body is expanded more than once. A plain `HashMap<Span, Content>`
@@ -218,7 +218,10 @@ fn realize_to_content(
 fn collect_preserved_by_span(content: &Content) -> HashMap<Span, VecDeque<Content>> {
     let mut preserved: HashMap<Span, VecDeque<Content>> = HashMap::new();
     let _ = content.traverse::<_, ()>(&mut |content| {
-        if content.is::<EquationElem>() || is_slot_container(&content) {
+        if content.is::<EquationElem>()
+            || content.is::<HeadingElem>()
+            || is_slot_container(&content)
+        {
             preserved
                 .entry(content.span())
                 .or_default()

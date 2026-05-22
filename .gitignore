@@ -6,3 +6,5 @@ tests/examples/diff.pdf
 tests/examples/modifications.txt
 tests/examples/new.pdf
 tests/examples/new-direct.pdf
+.claude/
+CLAUDE.md

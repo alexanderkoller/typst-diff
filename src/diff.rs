@@ -382,7 +382,11 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             collect_tokens(child, out);
         }
     } else if let Some(styled) = content.to_packed::<StyledElem>() {
+        let before = out.len();
         collect_tokens(&styled.child, out);
+        for token in &mut out[before..] {
+            token.content = token.content.clone().styled_with_map(styled.styles.clone());
+        }
     } else if let Some(par) = content.to_packed::<ParElem>() {
         collect_tokens(&par.body, out);
     } else if let Some(equation) = content.to_packed::<EquationElem>() {
@@ -1679,6 +1683,21 @@ mod tests {
 
         assert!(texts.contains(&"Alpha"));
         assert!(texts.contains(&"Beta"));
+    }
+
+    #[test]
+    fn extract_words_preserves_styles_on_split_tokens() {
+        use typst::visualize::Color;
+
+        let styled = TextElem::packed("old technical concept")
+            .styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
+        let tokens = extract_words(&styled);
+
+        assert!(tokens.iter().any(|token| token.text == "technical"));
+        assert!(
+            tokens.iter().all(|token| token.content.is::<StyledElem>()),
+            "{tokens:?}"
+        );
     }
 
     #[test]

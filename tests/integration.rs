@@ -74,6 +74,57 @@ fn assert_command_success(output: std::process::Output, label: &str) {
     );
 }
 
+fn max_style_count_for_text(content: &Content, needle: &str) -> usize {
+    fn inner(content: &Content, needle: &str, styles: usize) -> usize {
+        if let Some(text) = content.to_packed::<typst::text::TextElem>()
+            && text.text.as_str().contains(needle)
+        {
+            return styles;
+        }
+        if let Some(seq) = content.to_packed::<typst::foundations::SequenceElem>() {
+            return seq
+                .children
+                .iter()
+                .map(|child| inner(child, needle, styles))
+                .max()
+                .unwrap_or(0);
+        }
+        if let Some(styled) = content.to_packed::<typst::foundations::StyledElem>() {
+            return inner(&styled.child, needle, styles + styled.styles.iter().count());
+        }
+        if let Some(par) = content.to_packed::<typst::model::ParElem>() {
+            return inner(&par.body, needle, styles);
+        }
+        if let Some(heading) = content.to_packed::<typst::model::HeadingElem>() {
+            return inner(&heading.body, needle, styles);
+        }
+        if let Some(strong) = content.to_packed::<typst::model::StrongElem>() {
+            return inner(&strong.body, needle, styles + 1);
+        }
+        if let Some(emph) = content.to_packed::<typst::model::EmphElem>() {
+            return inner(&emph.body, needle, styles + 1);
+        }
+        if let Some(strike) = content.to_packed::<typst::text::StrikeElem>() {
+            return inner(&strike.body, needle, styles + 1);
+        }
+        if content.plain_text().contains(needle) {
+            return styles;
+        }
+        0
+    }
+
+    inner(content, needle, 0)
+}
+
+fn annotated_corpus(name: &str) -> Content {
+    let old_world = corpus_world(&format!("{name}/old.typ"));
+    let new_world = corpus_world(&format!("{name}/new.typ"));
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_content(&old, &new);
+    typst_diff::build_annotated_content(&result, false)
+}
+
 #[test]
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
@@ -84,6 +135,85 @@ fn simple_diff_produces_valid_pdf() {
     let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_headings_keep_heading_formatting() {
+    let annotated = annotated_corpus("12-heading-deleted");
+    let plain = annotated.plain_text();
+
+    assert!(plain.contains("Chapter Two"), "{plain}");
+    assert!(max_style_count_for_text(&annotated, "Chapter Two") >= 2);
+    assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
+}
+
+#[test]
+fn bold_changes_keep_strong_formatting() {
+    let annotated = annotated_corpus("14-bold-content-changed");
+    let plain = annotated.plain_text();
+
+    assert!(plain.contains("old"), "{plain}");
+    assert!(plain.contains("new"), "{plain}");
+    assert!(plain.contains("technical concept"), "{plain}");
+    assert!(
+        max_style_count_for_text(&annotated, "old") >= 2,
+        "old style count: {}\n{plain}",
+        max_style_count_for_text(&annotated, "old")
+    );
+    assert!(
+        max_style_count_for_text(&annotated, "new") >= 2,
+        "new style count: {}\n{plain}",
+        max_style_count_for_text(&annotated, "new")
+    );
+    assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
+}
+
+#[test]
+fn emphasis_changes_keep_emphasis_formatting() {
+    let annotated = annotated_corpus("15-emph-content-changed");
+    let plain = annotated.plain_text();
+
+    assert!(plain.contains("Felis"), "{plain}");
+    assert!(plain.contains("domesticus"), "{plain}");
+    assert!(plain.contains("catus"), "{plain}");
+    assert!(
+        max_style_count_for_text(&annotated, "domesticus") >= 2,
+        "domesticus style count: {}\n{plain}",
+        max_style_count_for_text(&annotated, "domesticus")
+    );
+    assert!(
+        max_style_count_for_text(&annotated, "catus") >= 2,
+        "catus style count: {}\n{plain}",
+        max_style_count_for_text(&annotated, "catus")
+    );
+    assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
+}
+
+#[test]
+fn source_strikethrough_survives_annotation() {
+    let annotated = annotated_corpus("17-source-has-strikethrough");
+    let plain = annotated.plain_text();
+
+    assert!(plain.contains("€120"), "{plain}");
+    assert!(plain.contains("€95"), "{plain}");
+    assert!(plain.contains("€89"), "{plain}");
+    assert!(count_nodes::<typst::text::StrikeElem>(&annotated) >= 3);
+}
+
+#[test]
+fn whole_document_rewrite_keeps_deleted_and_inserted_heading_formatting() {
+    let annotated = annotated_corpus("27-whole-document-rewrite");
+    let plain = annotated.plain_text();
+
+    assert!(plain.contains("Medieval History"), "{plain}");
+    assert!(plain.contains("Modern Computing"), "{plain}");
+    assert!(max_style_count_for_text(&annotated, "Medieval") >= 2);
+    assert!(
+        max_style_count_for_text(&annotated, "Modern") >= 2,
+        "Modern style count: {}\n{plain}",
+        max_style_count_for_text(&annotated, "Modern")
+    );
+    assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
 }
 
 #[test]
