@@ -198,14 +198,18 @@ fn collect_slots(content: &Content, prefix: &mut Vec<SlotStep>, slots: &mut Vec<
     }
 
     if let Some(par) = content.to_packed::<ParElem>() {
-        let before = slots.len();
+        // Only descend into the body to surface sub-slots (e.g. a nested list
+        // inside the paragraph). Do NOT push a fallback "ParBody" slot for
+        // inline-only bodies — if we did, `diff_slots` would recurse via
+        // `diff_content` into the body, which `extract_block_units` would wrap
+        // in a fresh `ParElem` whose own `ParBody` slot is the same body
+        // content, causing infinite recursion. For inline-only paragraphs we
+        // want `extract_slots` to report no slots so `diff_slots` returns
+        // `None` and the diff falls through to a flat word-level diff at the
+        // paragraph block level.
         prefix.push(SlotStep::ParBody);
         collect_slots(&par.body, prefix, slots);
         prefix.pop();
-        if slots.len() > before {
-            return;
-        }
-        push_slot(prefix, SlotStep::ParBody, par.body.clone(), slots);
         return;
     }
 

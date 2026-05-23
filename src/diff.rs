@@ -176,6 +176,8 @@ fn collect_blocks_from_children(
                     content: apply_block_styles(block.content, &styles),
                     page_styles: block.page_styles,
                 }));
+            } else if !has_page_style_updates && is_known_inline(&styled.child) {
+                para.push(child);
             } else {
                 flush_para(para, blocks, &page_styles);
                 blocks.push(DiffBlock {
@@ -947,6 +949,7 @@ fn coalesce(ops: &mut Vec<WordOp>, next: WordOp) {
 ///
 /// All variants carry the *new* block (or the only block for `Equal`/`Deleted`).
 /// `Modified` and `ModifiedSlots` also carry the word-level or slot-level diffs.
+#[derive(Clone)]
 pub enum DiffResultOp {
     Equal(DiffBlock),
     Deleted(DiffBlock),
@@ -964,49 +967,69 @@ pub struct DiffResult {
     pub root_styles: Styles,
 }
 
-/// A word-level diff for one named slot inside a structured container.
+/// A recursive sub-document diff for one named slot inside a structured container.
 ///
 /// `path` identifies the slot within its parent element (e.g. `[ListItem(1)]`);
-/// `word_ops` is the word diff for that slot's content.
+/// `ops` is the block-level diff of that slot's content, produced by recursively calling
+/// `diff_content` on the old and new slot bodies. For a plain-text slot this will contain a
+/// single `Modified` op; for a slot whose body has nested structure (e.g. a list item that
+/// itself contains a sub-list) it will contain multiple ops that preserve that structure.
 #[derive(Clone)]
 pub struct SlotDiff {
     pub path: Vec<SlotStep>,
-    pub word_ops: Vec<WordOp>,
+    pub ops: Vec<DiffResultOp>,
 }
 
 impl DiffResult {
     pub fn modification_log(&self) -> String {
         let mut log = String::new();
-        for (index, op) in self.block_ops.iter().enumerate() {
-            match op {
-                DiffResultOp::Equal(_) => {}
-                DiffResultOp::Deleted(content) => {
+        log_ops(&mut log, &[], &self.block_ops);
+        log
+    }
+}
+
+fn log_ops(log: &mut String, slot_path_prefix: &[SlotStep], ops: &[DiffResultOp]) {
+    for (index, op) in ops.iter().enumerate() {
+        match op {
+            DiffResultOp::Equal(_) => {}
+            DiffResultOp::Deleted(content) => {
+                let kind = if slot_path_prefix.is_empty() {
+                    "delete".to_string()
+                } else {
+                    format!("delete in slot {:?}", slot_path_prefix)
+                };
+                push_log_entry(
+                    log,
+                    index,
+                    &kind,
+                    &[("text", content.content.plain_text().to_string())],
+                );
+            }
+            DiffResultOp::Inserted(content) => {
+                let kind = if slot_path_prefix.is_empty() {
+                    "insert".to_string()
+                } else {
+                    format!("insert in slot {:?}", slot_path_prefix)
+                };
+                push_log_entry(
+                    log,
+                    index,
+                    &kind,
+                    &[("text", content.content.plain_text().to_string())],
+                );
+            }
+            DiffResultOp::Modified(new_block, word_ops) => {
+                let deletes = collect_word_op_text(word_ops, |op| match op {
+                    WordOp::Delete(tokens) => Some(tokens),
+                    _ => None,
+                });
+                let inserts = collect_word_op_text(word_ops, |op| match op {
+                    WordOp::Insert(tokens) => Some(tokens),
+                    _ => None,
+                });
+                if slot_path_prefix.is_empty() {
                     push_log_entry(
-                        &mut log,
-                        index,
-                        "delete",
-                        &[("text", content.content.plain_text().to_string())],
-                    );
-                }
-                DiffResultOp::Inserted(content) => {
-                    push_log_entry(
-                        &mut log,
-                        index,
-                        "insert",
-                        &[("text", content.content.plain_text().to_string())],
-                    );
-                }
-                DiffResultOp::Modified(new_block, word_ops) => {
-                    let deletes = collect_word_op_text(word_ops, |op| match op {
-                        WordOp::Delete(tokens) => Some(tokens),
-                        _ => None,
-                    });
-                    let inserts = collect_word_op_text(word_ops, |op| match op {
-                        WordOp::Insert(tokens) => Some(tokens),
-                        _ => None,
-                    });
-                    push_log_entry(
-                        &mut log,
+                        log,
                         index,
                         "modify",
                         &[
@@ -1015,32 +1038,27 @@ impl DiffResult {
                             ("inserted", inserts),
                         ],
                     );
+                } else {
+                    push_log_entry(
+                        log,
+                        index,
+                        "modify slot",
+                        &[
+                            ("slot", format!("{slot_path_prefix:?}")),
+                            ("deleted", deletes),
+                            ("inserted", inserts),
+                        ],
+                    );
                 }
-                DiffResultOp::ModifiedSlots(_, slot_diffs) => {
-                    for slot_diff in slot_diffs {
-                        let deletes = collect_word_op_text(&slot_diff.word_ops, |op| match op {
-                            WordOp::Delete(tokens) => Some(tokens),
-                            _ => None,
-                        });
-                        let inserts = collect_word_op_text(&slot_diff.word_ops, |op| match op {
-                            WordOp::Insert(tokens) => Some(tokens),
-                            _ => None,
-                        });
-                        push_log_entry(
-                            &mut log,
-                            index,
-                            "modify slot",
-                            &[
-                                ("slot", format!("{:?}", slot_diff.path)),
-                                ("deleted", deletes),
-                                ("inserted", inserts),
-                            ],
-                        );
-                    }
+            }
+            DiffResultOp::ModifiedSlots(_, slot_diffs) => {
+                for slot_diff in slot_diffs {
+                    let mut sub_prefix = slot_path_prefix.to_vec();
+                    sub_prefix.extend_from_slice(&slot_diff.path);
+                    log_ops(log, &sub_prefix, &slot_diff.ops);
                 }
             }
         }
-        log
     }
 }
 
@@ -1142,17 +1160,18 @@ fn diff_slots(old: &Content, new: &Content) -> Option<Vec<SlotDiff>> {
             .into_iter()
             .zip(new_slots)
             .filter_map(|(old_slot, new_slot)| {
-                let word_ops = diff_words(
-                    &extract_words(&old_slot.content),
-                    &extract_words(&new_slot.content),
-                );
-                has_textual_word_change(&word_ops).then_some(SlotDiff {
+                let sub = diff_content(&old_slot.content, &new_slot.content);
+                slot_sub_diff_has_changes(&sub.block_ops).then_some(SlotDiff {
                     path: new_slot.path,
-                    word_ops,
+                    ops: sub.block_ops,
                 })
             })
             .collect(),
     )
+}
+
+fn slot_sub_diff_has_changes(ops: &[DiffResultOp]) -> bool {
+    ops.iter().any(|op| !matches!(op, DiffResultOp::Equal(_)))
 }
 
 fn same_slot_shape(old: &[ContentSlot], new: &[ContentSlot]) -> bool {
@@ -1319,6 +1338,90 @@ mod tests {
                 .filter(|block| !block.is::<ParbreakElem>())
                 .all(|block| block.is::<StyledElem>())
         );
+    }
+
+    #[test]
+    fn inline_styled_wrapper_does_not_fragment_paragraph_into_multiple_blocks() {
+        use typst::visualize::Color;
+
+        // A paragraph body with an inline-styled wrapper between two text runs
+        // (the shape Typst's realization produces for "text _emph_ text").
+        // The styled element wraps a single TextElem (not a SequenceElem) — the
+        // exact case that previously caused fragmentation and led to text loss
+        // when the diff recursed into a ParBody slot.
+        let par_body = seq([
+            TextElem::packed("The species is known as "),
+            TextElem::packed("Felis domesticus")
+                .styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into())),
+            TextElem::packed(" in older literature."),
+        ]);
+        let blocks = extract_block_units(&par_body);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "inline-styled wrapper inside a paragraph must not fragment the para into multiple blocks"
+        );
+        // The single block must include all three pieces of text.
+        let text = blocks[0].content.plain_text();
+        assert!(text.contains("The species is known as"), "{text}");
+        assert!(text.contains("Felis domesticus"), "{text}");
+        assert!(text.contains("in older literature"), "{text}");
+    }
+
+    #[test]
+    fn diff_content_on_paragraph_with_inline_styling_produces_single_modified_op() {
+        use typst::visualize::Color;
+
+        let emph_style = TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into());
+        let old = seq([
+            TextElem::packed("The species is known as "),
+            TextElem::packed("Felis domesticus").styled(emph_style.clone()),
+            TextElem::packed(" in older literature."),
+        ]);
+        let new = seq([
+            TextElem::packed("The species is known as "),
+            TextElem::packed("Felis catus").styled(emph_style),
+            TextElem::packed(" in modern taxonomy."),
+        ]);
+
+        let result = diff_content(&old, &new);
+
+        // All edits should be captured in a single top-level Modified op, not
+        // fragmented into multiple ops or nested ModifiedSlots at different depths.
+        assert_eq!(result.block_ops.len(), 1, "expected 1 block op, got {}", result.block_ops.len());
+        match &result.block_ops[0] {
+            DiffResultOp::Modified(_, word_ops) => {
+                let mut deletes: Vec<&str> = Vec::new();
+                let mut inserts: Vec<&str> = Vec::new();
+                for op in word_ops {
+                    match op {
+                        WordOp::Delete(tokens) => {
+                            for t in tokens {
+                                deletes.push(t.text.as_str());
+                            }
+                        }
+                        WordOp::Insert(tokens) => {
+                            for t in tokens {
+                                inserts.push(t.text.as_str());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let joined_del = deletes.join(" ");
+                let joined_ins = inserts.join(" ");
+                assert!(joined_del.contains("domesticus"), "deletes: {joined_del:?}");
+                assert!(joined_del.contains("older"), "deletes: {joined_del:?}");
+                assert!(joined_ins.contains("catus"), "inserts: {joined_ins:?}");
+                assert!(joined_ins.contains("modern"), "inserts: {joined_ins:?}");
+            }
+            DiffResultOp::Equal(_) => panic!("expected Modified, got Equal"),
+            DiffResultOp::Deleted(_) => panic!("expected Modified, got Deleted"),
+            DiffResultOp::Inserted(_) => panic!("expected Modified, got Inserted"),
+            DiffResultOp::ModifiedSlots(_, _) => {
+                panic!("expected Modified, got ModifiedSlots — fragmentation bug regression")
+            }
+        }
     }
 
     #[test]
@@ -1739,6 +1842,54 @@ mod tests {
         ]));
 
         assert!(diff_slots(&old, &new).is_none());
+    }
+
+    #[test]
+    fn diff_slots_recurses_into_nested_list_item_body() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        // Build: - outer item\n  - inner old\n- other
+        let inner_old = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("inner old"))),
+        ]));
+        let inner_new = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("inner new"))),
+        ]));
+        let old = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(Content::sequence([
+                TextElem::packed("outer"),
+                inner_old,
+            ]))),
+            Packed::new(ListItem::new(TextElem::packed("other"))),
+        ]));
+        let new = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(Content::sequence([
+                TextElem::packed("outer"),
+                inner_new,
+            ]))),
+            Packed::new(ListItem::new(TextElem::packed("other"))),
+        ]));
+
+        let result = diff_content(&old, &new);
+
+        // Should produce a ModifiedSlots for the outer list with a sub-diff that
+        // recurses through ListItem(0) to reach the changed inner leaf.
+        let found = result.block_ops.iter().any(|op| match op {
+            DiffResultOp::ModifiedSlots(_, slots) => {
+                slots.iter().any(|slot| {
+                    // slot for outer item 0 carries a sub-diff that has further
+                    // nested structure — not just a flat Modified.
+                    slot.path == vec![crate::content_slots::SlotStep::ListItem(0)]
+                        && slot.ops.iter().any(|sub| {
+                            matches!(sub, DiffResultOp::ModifiedSlots(_, _))
+                                || matches!(sub, DiffResultOp::Modified(_, _))
+                        })
+                })
+            }
+            _ => false,
+        });
+        assert!(found, "expected recursive slot diff for nested list: {result:?}", result = result.modification_log());
     }
 
     #[test]

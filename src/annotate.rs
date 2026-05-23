@@ -25,7 +25,7 @@ use typst::model::{HeadingElem, ParElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
-use crate::content_slots::{extract_slots, replace_inline_content, replace_slot};
+use crate::content_slots::{extract_slots, replace_slot};
 use crate::diff::{DiffBlock, DiffResult, DiffResultOp, WordOp};
 
 fn green() -> Color {
@@ -48,12 +48,41 @@ pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool)
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles = None;
 
-    for op in &result.block_ops {
-        let block = match op {
+    for block in build_annotated_blocks(&result.block_ops, compact_substitutions) {
+        if current_page_styles
+            .as_ref()
+            .is_some_and(|styles| styles != &block.page_styles)
+        {
+            flush_group(&mut groups, &mut current_blocks, current_page_styles.take());
+        }
+        current_page_styles.get_or_insert_with(|| block.page_styles.clone());
+        current_blocks.push(block.content);
+    }
+
+    flush_group(&mut groups, &mut current_blocks, current_page_styles);
+    Content::sequence(groups).styled_with_map(result.root_styles.clone())
+}
+
+/// Annotate a sequence of block ops, returning one [`DiffBlock`] per input op.
+///
+/// This is the recursable kernel used both at the top level (by
+/// [`build_annotated_content`]) and when annotating slot sub-documents.
+/// Unlike the top-level function it does NOT apply page-style grouping — that
+/// only happens at the document root.
+pub(crate) fn build_annotated_blocks(
+    ops: &[DiffResultOp],
+    compact_substitutions: bool,
+) -> Vec<DiffBlock> {
+    ops.iter()
+        .map(|op| match op {
             DiffResultOp::Equal(c) => c.clone(),
 
             DiffResultOp::Inserted(c) => DiffBlock {
-                content: c.content.clone().styled(TextElem::fill.set(green().into())),
+                content: if c.content.plain_text().is_empty() {
+                    c.content.clone()
+                } else {
+                    apply_fill_inside(&c.content, green())
+                },
                 page_styles: c.page_styles.clone(),
             },
 
@@ -83,21 +112,8 @@ pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool)
                 .unwrap_or_else(|| new_block.content.clone()),
                 page_styles: new_block.page_styles.clone(),
             },
-        };
-
-        if current_page_styles
-            .as_ref()
-            .is_some_and(|styles| styles != &block.page_styles)
-        {
-            flush_group(&mut groups, &mut current_blocks, current_page_styles.take());
-        }
-
-        current_page_styles.get_or_insert_with(|| block.page_styles.clone());
-        current_blocks.push(block.content);
-    }
-
-    flush_group(&mut groups, &mut current_blocks, current_page_styles);
-    Content::sequence(groups).styled_with_map(result.root_styles.clone())
+        })
+        .collect()
 }
 
 fn flush_group(
@@ -283,6 +299,30 @@ fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
 }
 
+/// Apply `fill` to the text content of `content` without wrapping the outermost
+/// structural element in a `StyledElem`.
+///
+/// For slot-bearing elements (lists, tables, figures, …) the fill is applied to
+/// each slot's content individually, so the outer element (e.g. `ListElem`) stays
+/// as a bare block — preserving Typst's tight list/table spacing between consecutive
+/// elements of the same type.  For elements with no slots (plain text, headings,
+/// raw blocks, …) the method falls back to wrapping in `StyledElem`, which is fine
+/// because those types don't rely on consecutive-block spacing heuristics.
+fn apply_fill_inside(content: &Content, fill: Color) -> Content {
+    let slots = extract_slots(content);
+    if slots.is_empty() {
+        return content.clone().styled(TextElem::fill.set(fill.into()));
+    }
+    let mut result = content.clone();
+    for slot in slots {
+        let colored = slot.content.styled(TextElem::fill.set(fill.into()));
+        if let Some(next) = replace_slot(&result, &slot.path, colored) {
+            result = next;
+        }
+    }
+    result
+}
+
 fn replace_modified_slots(
     template: &Content,
     slot_diffs: &[crate::diff::SlotDiff],
@@ -290,11 +330,8 @@ fn replace_modified_slots(
 ) -> Option<Content> {
     let mut content = template.clone();
     for slot_diff in slot_diffs {
-        let inline = annotated_inline_content(&slot_diff.word_ops, compact_substitutions);
-        let current_slot = extract_slots(&content)
-            .into_iter()
-            .find(|slot| slot.path == slot_diff.path)?;
-        let replacement = replace_inline_content(&current_slot.content, &inline).unwrap_or(inline);
+        let sub_blocks = build_annotated_blocks(&slot_diff.ops, compact_substitutions);
+        let replacement = Content::sequence(sub_blocks.into_iter().map(|b| b.content));
         content = replace_slot(&content, &slot_diff.path, replacement)?;
     }
     Some(content)
@@ -344,6 +381,29 @@ mod tests {
         };
         let content = build_annotated_content(&result, false);
         assert!(!content.is_empty());
+    }
+
+    #[test]
+    fn inserted_list_block_stays_bare_list_not_styled_wrapper() {
+        // An inserted ListElem must NOT be wrapped in a top-level StyledElem.
+        // If it were, Typst's tight spacing between consecutive ListElem blocks
+        // would break, producing paragraph-sized gaps (the #19/#69 spacing bug).
+        let list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("New item"))),
+        ]));
+        let blocks = build_annotated_blocks(
+            &[DiffResultOp::Inserted(block(list))],
+            false,
+        );
+        assert_eq!(blocks.len(), 1);
+        // The block content must be a ListElem, not a StyledElem wrapping a ListElem.
+        assert!(
+            blocks[0].content.is::<ListElem>(),
+            "inserted ListElem should remain a bare ListElem, got: {:?}",
+            blocks[0].content.func().name()
+        );
+        // Text must still be present.
+        assert!(blocks[0].content.plain_text().contains("New item"));
     }
 
     #[test]
@@ -460,10 +520,13 @@ mod tests {
                 block(list),
                 vec![SlotDiff {
                     path: vec![SlotStep::ListItem(1)],
-                    word_ops: vec![
-                        WordOp::Delete(vec![word_token("Beta")]),
-                        WordOp::Insert(vec![word_token("Better")]),
-                    ],
+                    ops: vec![DiffResultOp::Modified(
+                        block(TextElem::packed("Better")),
+                        vec![
+                            WordOp::Delete(vec![word_token("Beta")]),
+                            WordOp::Insert(vec![word_token("Better")]),
+                        ],
+                    )],
                 }],
             )],
             root_styles: Default::default(),
@@ -497,11 +560,14 @@ mod tests {
                 block(table),
                 vec![SlotDiff {
                     path: vec![SlotStep::TableCell(1)],
-                    word_ops: vec![
-                        WordOp::Delete(vec![word_token("Old")]),
-                        WordOp::Insert(vec![word_token("New")]),
-                        WordOp::Equal(vec![word_token(" value")]),
-                    ],
+                    ops: vec![DiffResultOp::Modified(
+                        block(TextElem::packed("New value")),
+                        vec![
+                            WordOp::Delete(vec![word_token("Old")]),
+                            WordOp::Insert(vec![word_token("New")]),
+                            WordOp::Equal(vec![word_token(" value")]),
+                        ],
+                    )],
                 }],
             )],
             root_styles: Default::default(),
@@ -517,6 +583,85 @@ mod tests {
     }
 
     #[test]
+    fn nested_list_slot_preserves_both_list_levels_and_annotates_leaf() {
+        // Two-level list: outer item 0 contains an inner list with "Beta" → "Better".
+        let inner = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Better"))),
+        ]));
+        let outer_list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(inner.clone())),
+            Packed::new(ListItem::new(TextElem::packed("Stable"))),
+        ]));
+        let result = DiffResult {
+            block_ops: vec![DiffResultOp::ModifiedSlots(
+                block(outer_list),
+                vec![SlotDiff {
+                    path: vec![SlotStep::ListItem(0)],
+                    ops: vec![DiffResultOp::ModifiedSlots(
+                        block(inner),
+                        vec![SlotDiff {
+                            path: vec![SlotStep::ListItem(0)],
+                            ops: vec![DiffResultOp::Modified(
+                                block(TextElem::packed("Better")),
+                                vec![
+                                    WordOp::Delete(vec![word_token("Beta")]),
+                                    WordOp::Insert(vec![word_token("Better")]),
+                                ],
+                            )],
+                        }],
+                    )],
+                }],
+            )],
+            root_styles: Default::default(),
+        };
+
+        let annotated = build_annotated_content(&result, false);
+        let plain = annotated.plain_text();
+
+        assert_eq!(count_elem::<ListElem>(&annotated), 2, "both list levels preserved");
+        assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
+        assert!(plain.contains("Beta"), "{plain}");
+        assert!(plain.contains("Better"), "{plain}");
+        assert!(plain.contains("Stable"), "{plain}");
+    }
+
+    #[test]
+    fn mixed_body_inline_change_detected_and_nested_structure_preserved() {
+        // Item body: inline paragraph "old title" followed by a nested list.
+        // Only the inline paragraph changes; nested list stays the same.
+        use crate::diff::diff_content;
+        use typst::model::ParbreakElem;
+
+        let inner = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Leaf"))),
+        ]));
+        let body_old = Content::sequence([
+            TextElem::packed("old title"),
+            Content::new(ParbreakElem::new()),
+            inner.clone(),
+        ]);
+        let body_new = Content::sequence([
+            TextElem::packed("new title"),
+            Content::new(ParbreakElem::new()),
+            inner.clone(),
+        ]);
+        let old = Content::new(ListElem::new(vec![Packed::new(ListItem::new(body_old))]));
+        let new = Content::new(ListElem::new(vec![Packed::new(ListItem::new(body_new))]));
+
+        let result = diff_content(&old, &new);
+        let annotated = build_annotated_content(&result, false);
+        let plain = annotated.plain_text();
+
+        // The nested ListElem must survive in the output.
+        assert!(count_elem::<ListElem>(&annotated) >= 1, "nested list preserved");
+        // The inline change must appear.
+        assert!(plain.contains("old"), "{plain}");
+        assert!(plain.contains("new"), "{plain}");
+        // The unchanged leaf must still be present.
+        assert!(plain.contains("Leaf"), "{plain}");
+    }
+
+    #[test]
     fn annotated_inline_content_inserts_separator_between_adjacent_changes() {
         let inline = annotated_inline_content(
             &[
@@ -528,5 +673,46 @@ mod tests {
 
         assert_eq!(inline.plain_text(), "old new");
         assert_eq!(count_elem::<StrikeElem>(&inline), 1);
+    }
+
+    #[test]
+    fn inserted_parbreak_is_not_wrapped_in_styled_elem() {
+        // ParbreakElem has empty plain_text; wrapping it in StyledElem(green) would
+        // make Typst treat it as a generic styled block and insert paragraph-level
+        // vertical space instead of tight inter-bullet spacing (corpus #19 bug).
+        use typst::model::ParbreakElem;
+
+        let parbreak = Content::new(ParbreakElem::new());
+        assert!(parbreak.plain_text().is_empty(), "sanity: ParbreakElem has no text");
+
+        let blocks = build_annotated_blocks(
+            &[DiffResultOp::Inserted(block(parbreak))],
+            false,
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0].content.is::<ParbreakElem>(),
+            "inserted ParbreakElem must remain bare, not wrapped in StyledElem, got: {:?}",
+            blocks[0].content.func().name()
+        );
+    }
+
+    #[test]
+    fn inserted_visible_block_still_gets_green_fill() {
+        // Verify the empty-text guard doesn't suppress coloring on visible content.
+        let text = TextElem::packed("Visible text");
+        assert!(!text.plain_text().is_empty(), "sanity: TextElem has text");
+
+        let blocks = build_annotated_blocks(
+            &[DiffResultOp::Inserted(block(text))],
+            false,
+        );
+        assert_eq!(blocks.len(), 1);
+        // The block must NOT be a bare TextElem — it must have been processed by
+        // apply_fill_inside (which wraps in StyledElem with green fill).
+        assert!(
+            !blocks[0].content.is::<typst::text::TextElem>(),
+            "inserted visible block should be styled/colored, not a bare TextElem"
+        );
     }
 }
