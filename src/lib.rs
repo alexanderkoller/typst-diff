@@ -17,6 +17,7 @@
 //! the old world is discarded after evaluation.
 
 pub mod annotate;
+pub mod annotated;
 pub mod content_slots;
 pub mod diag;
 pub mod diff;
