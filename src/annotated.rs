@@ -585,9 +585,16 @@ pub fn annotate_footnote_markers(
 
 fn is_footnote_marker_text(content: &Content, number: usize) -> bool {
     use typst::text::TextElem;
-    content
-        .to_packed::<TextElem>()
-        .is_some_and(|t| t.text.as_str() == number.to_string())
+    if let Some(t) = content.to_packed::<TextElem>() {
+        return t.text.as_str() == number.to_string();
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return is_footnote_marker_text(&styled.child, number);
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq.children.iter().any(|c| is_footnote_marker_text(c, number));
+    }
+    false
 }
 
 #[cfg(test)]
@@ -960,5 +967,31 @@ mod tests {
         assert_eq!(node.children[0].realized.plain_text(), "R1");
         assert_eq!(node.children[1].realized.plain_text(), "R2");
         assert_eq!(node.children[2].realized.plain_text(), "R3");
+    }
+
+    #[test]
+    fn annotate_footnote_marker_detects_styled_marker() {
+        // Styled footnote markers (e.g. superscript) wrap TextElem in StyledElem.
+        // annotate_footnote_markers must look through the wrapper.
+        use typst::model::FootnoteElem;
+        use typst::model::FootnoteBody;
+
+        let footnote_body = text("Note body");
+        let footnotes = vec![Content::new(FootnoteElem::new(FootnoteBody::Content(footnote_body)))];
+
+        // Simulate a realized tree where the marker is a styled "1" (e.g. superscript)
+        let marker = text("1").styled(TextElem::fill.set(
+            typst::visualize::Color::from_u8(0, 0, 0, 255).into()
+        ));
+        let mut node = AnnotatedContent {
+            realized: marker,
+            annotation: Annotation::default(),
+            children: vec![],
+        };
+        let mut next = 0;
+        annotate_footnote_markers(&mut node, &footnotes, &mut next);
+
+        assert_eq!(next, 1, "footnote should have been matched");
+        assert!(node.annotation.footnote.is_some(), "footnote info should be attached");
     }
 }
