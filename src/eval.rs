@@ -4,7 +4,7 @@
 //! - [`eval_to_content`] — shallow eval only (Typst AST → unevaluated `Content`).
 //! - [`eval_to_realized_content`] — full pipeline used by the diff: eval → layout →
 //!   realization, producing a stable content tree where show rules and counters have
-//!   been expanded and footnote markers and equations are in their original form.
+//!   been expanded.
 //!
 //! # Why realization is needed
 //!
@@ -12,36 +12,21 @@
 //! Typst's realization step expands show rules (e.g. `show heading: …`) so that the
 //! resulting tree reflects the document's logical structure. Without it, two headings
 //! with identical text but different show rules would look identical in the diff.
-//!
-//! # Preserved elements
-//!
-//! `EquationElem` and "slot container" nodes (lists, figures, tables, …) would become
-//! opaque layout output after realization. They are captured by span before realization
-//! and spliced back in afterwards, keeping them diffable as structured content. A span
-//! can appear more than once when a function body expands repeatedly, so preserved
-//! nodes are stored as per-span queues and restored in document order.
 
 use anyhow::Result;
-use std::collections::{HashMap, VecDeque};
 use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
 use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{
-    Content, NativeElement, SequenceElem, Style, StyleChain, StyledElem, Styles, Target, TargetElem,
+    Content, NativeElement, Style, StyleChain, Styles, Target, TargetElem,
 };
-use typst::introspection::TagElem;
 use typst::introspection::{Introspector, Locator};
-use typst::layout::{HElem, PageElem, PagebreakElem};
-use typst::math::EquationElem;
-use typst::model::{DocumentInfo, FootnoteElem, HeadingElem, ParElem};
+use typst::layout::{PageElem, PagebreakElem};
+use typst::model::{DocumentInfo, FootnoteElem};
 use typst::routines::{Arenas, RealizationKind};
-use typst::syntax::Span;
-use typst::text::TextElem;
 
-use crate::content_slots::{
-    extract_slots, is_slot_container, normalize_list_item_runs, replace_slot,
-};
+use crate::content_slots::normalize_list_item_runs;
 use crate::diag::format_diagnostics;
 
 /// Evaluate the entry file and return the raw, unrealized [`Content`] tree.
@@ -164,8 +149,6 @@ fn realize_to_content(
     let style_map = styles.to_map().outside();
     let root_page_styles = page_styles(&style_map);
     let styles = StyleChain::new(&style_map);
-    let mut preserved = collect_preserved_by_span(content);
-    let footnotes = collect_footnotes(content);
 
     let traced = Traced::default();
     let mut sink = Sink::new();
@@ -200,42 +183,16 @@ fn realize_to_content(
     }
 
     let realized = Content::sequence(realized.iter().map(|(realized_content, styles)| {
-        let content = restore_preserved((*realized_content).clone(), &mut preserved);
         let styles = if realized_content.is::<PagebreakElem>() {
             marginal_styles(&styles.to_map())
         } else {
             non_page_styles(styles.to_map())
         };
-        content.styled_with_map(styles)
+        (*realized_content).clone().styled_with_map(styles)
     }))
     .styled_with_map(root_page_styles);
 
-    Ok(restore_footnote_markers(realized, &footnotes))
-}
-
-/// Walk the pre-realization tree and index every `EquationElem`, `HeadingElem`, and
-/// slot-container node by span so they can be swapped back in after realization.
-///
-/// Typst may assign the same source span to multiple realized nodes when a
-/// function body is expanded more than once. A plain `HashMap<Span, Content>`
-/// would collapse those invocations and make every realized node restore to the
-/// last preserved value. The queue keeps all preserved nodes for a span and lets
-/// `restore_preserved` consume them in traversal order.
-fn collect_preserved_by_span(content: &Content) -> HashMap<Span, VecDeque<Content>> {
-    let mut preserved: HashMap<Span, VecDeque<Content>> = HashMap::new();
-    let _ = content.traverse::<_, ()>(&mut |content| {
-        if content.is::<EquationElem>()
-            || content.is::<HeadingElem>()
-            || is_slot_container(&content)
-        {
-            preserved
-                .entry(content.span())
-                .or_default()
-                .push_back(content.clone());
-        }
-        std::ops::ControlFlow::Continue(())
-    });
-    preserved
+    Ok(realized)
 }
 
 /// Collect all `FootnoteElem` nodes in document order from the pre-realization tree.
@@ -255,144 +212,6 @@ fn collect_footnotes(content: &Content) -> Vec<Content> {
     footnotes
 }
 
-fn restore_footnote_markers(content: Content, footnotes: &[Content]) -> Content {
-    let mut next = 0;
-    restore_footnote_markers_inner(content, footnotes, &mut next)
-}
-
-fn restore_footnote_markers_inner(
-    content: Content,
-    footnotes: &[Content],
-    next: &mut usize,
-) -> Content {
-    if footnotes.is_empty() {
-        return content;
-    }
-
-    if is_footnote_marker(&content, *next + 1)
-        && let Some(footnote) = footnotes.get(*next)
-    {
-        *next += 1;
-        return footnote.clone();
-    }
-
-    let mut content = content;
-    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
-        seq.children = restore_footnote_markers_in_sequence(&seq.children, footnotes, next);
-    } else if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        styled.child = restore_footnote_markers_inner(styled.child.clone(), footnotes, next);
-    } else if let Some(par) = content.to_packed_mut::<ParElem>() {
-        par.body = restore_footnote_markers_inner(par.body.clone(), footnotes, next);
-    }
-
-    content
-}
-
-fn restore_footnote_markers_in_sequence(
-    children: &[Content],
-    footnotes: &[Content],
-    next: &mut usize,
-) -> Vec<Content> {
-    let mut out = Vec::new();
-    let mut i = 0;
-
-    while i < children.len() {
-        if is_footnote_marker_deep(&children[i], *next + 1)
-            && let Some(footnote) = footnotes.get(*next)
-        {
-            while out.last().is_some_and(is_footnote_scaffold) {
-                out.pop();
-            }
-            out.push(footnote.clone());
-            *next += 1;
-            i += 1;
-            while i < children.len() && is_footnote_scaffold(&children[i]) {
-                i += 1;
-            }
-            continue;
-        }
-
-        out.push(restore_footnote_markers_inner(
-            children[i].clone(),
-            footnotes,
-            next,
-        ));
-        i += 1;
-    }
-
-    out
-}
-
-fn is_footnote_marker_deep(content: &Content, number: usize) -> bool {
-    if is_footnote_marker(content, number) {
-        return true;
-    }
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return is_footnote_marker_deep(&styled.child, number);
-    }
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq
-            .children
-            .iter()
-            .any(|child| is_footnote_marker_deep(child, number));
-    }
-    false
-}
-
-fn is_footnote_scaffold(content: &Content) -> bool {
-    if content.is::<TagElem>() || content.is::<HElem>() {
-        return true;
-    }
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return is_footnote_scaffold(&styled.child);
-    }
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq.children.iter().all(is_footnote_scaffold);
-    }
-    false
-}
-
-fn is_footnote_marker(content: &Content, number: usize) -> bool {
-    content
-        .to_packed::<TextElem>()
-        .is_some_and(|text| text.text.as_str() == number.to_string())
-}
-
-fn restore_preserved(
-    content: Content,
-    preserved: &mut HashMap<Span, VecDeque<Content>>,
-) -> Content {
-    // Preserve repeated function expansions with identical spans by consuming
-    // one queued replacement per realized node, in document order.
-    if let Some(replacements) = preserved.get_mut(&content.span())
-        && let Some(replacement) = replacements.pop_front()
-    {
-        return replacement;
-    }
-
-    let mut content = content;
-    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
-        seq.children = seq
-            .children
-            .iter()
-            .cloned()
-            .map(|child| restore_preserved(child, preserved))
-            .collect();
-    } else if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        styled.child = restore_preserved(styled.child.clone(), preserved);
-    } else if let Some(par) = content.to_packed_mut::<ParElem>() {
-        par.body = restore_preserved(par.body.clone(), preserved);
-    } else {
-        for slot in extract_slots(&content) {
-            let restored = restore_preserved(slot.content, preserved);
-            if let Some(next) = replace_slot(&content, &slot.path, restored) {
-                content = next;
-            }
-        }
-    }
-
-    content
-}
 
 /// Strip `PageElem` styles from a style map, keeping only inline/block styles.
 ///
@@ -444,9 +263,6 @@ mod tests {
     use crate::world::SystemWorld;
     use std::fs;
     use tempfile::TempDir;
-    use typst::foundations::Packed;
-    use typst::layout::{BlockBody, BlockElem};
-    use typst::model::{FootnoteBody, ListElem, ListItem};
     use typst::text::TextElem;
     use typst::visualize::Color;
 
@@ -489,15 +305,6 @@ mod tests {
         assert!(plain.contains("Included text."));
     }
 
-    fn text(s: &str) -> Content {
-        TextElem::packed(s)
-    }
-
-    fn block(body: &str) -> Content {
-        Content::new(BlockElem::new().with_body(Some(BlockBody::Content(TextElem::packed(body)))))
-            .spanned(Span::detached())
-    }
-
     fn count_elem<T: NativeElement>(content: &Content) -> usize {
         let mut count = 0;
         let _ = content.traverse::<_, ()>(&mut |c| {
@@ -510,97 +317,20 @@ mod tests {
     }
 
     #[test]
-    fn collect_preserved_by_span_keeps_multiple_values_for_same_span() {
-        let first = block("First");
-        let second = block("Second");
-        let content = Content::sequence([first.clone(), second.clone()]);
+    fn annotate_realized_handles_repeated_function_expansions_with_distinct_content() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        fs::write(dir_a.path().join("main.typ"),
+            "#let f(body) = [#body]\n#f[a]\n#f[b]").unwrap();
+        fs::write(dir_b.path().join("main.typ"),
+            "#let f(body) = [#body]\n#f[x]\n#f[b]").unwrap();
+        let world_old = SystemWorld::new(dir_a.path().join("main.typ")).unwrap();
+        let world_new = SystemWorld::new(dir_b.path().join("main.typ")).unwrap();
 
-        let preserved = collect_preserved_by_span(&content);
-        let queue = preserved.get(&Span::detached()).unwrap();
-
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue[0].plain_text(), "First");
-        assert_eq!(queue[1].plain_text(), "Second");
-    }
-
-    #[test]
-    fn restore_preserved_consumes_same_span_values_in_order() {
-        let preserved_content = Content::sequence([block("First"), block("Second")]);
-        let mut preserved = collect_preserved_by_span(&preserved_content);
-
-        let realized_a = text("realized a").spanned(Span::detached());
-        let realized_b = text("realized b").spanned(Span::detached());
-
-        assert_eq!(
-            restore_preserved(realized_a, &mut preserved).plain_text(),
-            "First"
-        );
-        assert_eq!(
-            restore_preserved(realized_b, &mut preserved).plain_text(),
-            "Second"
-        );
-    }
-
-    #[test]
-    fn restore_preserved_recurses_into_slot_container_children() {
-        let preserved_child = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
-            "Preserved item",
-        )))]))
-        .spanned(Span::detached());
-        let mut preserved = collect_preserved_by_span(&preserved_child);
-
-        let realized = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
-            "Realized item",
-        )))]));
-        let restored = restore_preserved(realized, &mut preserved);
-
-        assert_eq!(restored.plain_text(), "Preserved item");
-    }
-
-    #[test]
-    fn restore_preserved_leaves_unknown_content_unchanged() {
-        let mut preserved = HashMap::new();
-        let restored = restore_preserved(text("Plain"), &mut preserved);
-        assert_eq!(restored.plain_text(), "Plain");
-    }
-
-    #[test]
-    fn restore_footnote_markers_replaces_markers_in_document_order() {
-        let first = Content::new(FootnoteElem::new(FootnoteBody::Content(text("First note"))));
-        let second = Content::new(FootnoteElem::new(FootnoteBody::Content(text(
-            "Second note",
-        ))));
-        let content = Content::sequence([text("Text"), text("1"), text(" more"), text("2")]);
-
-        let restored = restore_footnote_markers(content, &[first, second]);
-
-        assert!(restored.plain_text().contains("First note"));
-        assert!(restored.plain_text().contains("Second note"));
-        assert_eq!(count_elem::<FootnoteElem>(&restored), 2);
-    }
-
-    #[test]
-    fn restore_footnote_markers_handles_styled_marker() {
-        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(text(
-            "Styled note",
-        ))));
-        let marker = text("1").styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
-
-        let restored = restore_footnote_markers(marker, &[footnote]);
-
-        assert_eq!(restored.plain_text(), "Styled note");
-        assert_eq!(count_elem::<FootnoteElem>(&restored), 1);
-    }
-
-    #[test]
-    fn restore_footnote_markers_does_not_replace_non_matching_numbers() {
-        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(text("Note"))));
-        let content = Content::sequence([text("2")]);
-
-        let restored = restore_footnote_markers(content, &[footnote]);
-
-        assert_eq!(restored.plain_text(), "2");
-        assert_eq!(count_elem::<FootnoteElem>(&restored), 0);
+        let _old = eval_to_realized_content(&world_old).unwrap();
+        let new = eval_to_realized_content(&world_new).unwrap();
+        assert!(new.realized.plain_text().contains('x'), "{}", new.realized.plain_text());
+        assert!(new.realized.plain_text().contains('b'), "{}", new.realized.plain_text());
     }
 
     #[test]
