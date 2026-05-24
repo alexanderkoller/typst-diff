@@ -1371,42 +1371,31 @@ fn diff_result_op_to_node(op: DiffResultOp, new_ac: &AnnotatedContent) -> DiffNo
     }
 }
 
-fn find_or_wrap_annotated(content: &Content, root: &AnnotatedContent) -> AnnotatedContent {
-    fn find(node: &AnnotatedContent, target: &Content) -> Option<AnnotatedContent> {
-        if &node.realized == target {
-            return Some(AnnotatedContent {
-                realized: node.realized.clone(),
-                annotation: Annotation {
-                    semantic_kind: node.annotation.semantic_kind.clone(),
-                    slots: node.annotation.slots.clone(),
-                    // Intentionally None: footnote info is attached in a post-pass and is
-                    // not needed by the tree-diff path in Phase A.
-                    footnote: None,
-                    span: node.annotation.span,
-                },
-                children: node
-                    .children
-                    .iter()
-                    .map(|c| AnnotatedContent {
-                        realized: c.realized.clone(),
-                        annotation: Annotation {
-                            semantic_kind: c.annotation.semantic_kind.clone(),
-                            slots: c.annotation.slots.clone(),
-                            footnote: None,
-                            span: c.annotation.span,
-                        },
-                        children: vec![],
-                    })
-                    .collect(),
-            });
-        }
-        node.children.iter().find_map(|child| find(child, target))
-    }
-    find(root, content).unwrap_or_else(|| AnnotatedContent {
+/// Wrap a block-level `content` (from `extract_block_units`) as an `AnnotatedContent`
+/// for the new tree-shaped diff result.
+///
+/// In an earlier draft this function also searched the annotated tree for a node
+/// whose `realized` matched `content` and returned a clone of that node (so that
+/// the resulting `DiffNode` could carry `semantic_kind` / `slots` from the
+/// annotated tree). That path is currently disabled: the realized content stored
+/// in the annotated tree carries introspector state (locators, tag references)
+/// from the original realize pass, and feeding it back into `layout_document`
+/// causes the layout engine to hang. The block content produced by
+/// `extract_block_units` goes through `apply_block_styles` which rebuilds the
+/// wrapping styles into a fresh `StyledElem`, breaking those references — so we
+/// always wrap the block content directly.
+///
+/// The Phase A statuses (`Unchanged`, `Inserted`, `Modified`) only read
+/// `node.realized`, so dropping the annotation here costs nothing in the current
+/// pipeline. When `HasChangedDescendants` is wired up in Phase B, the matched-node
+/// path will need to be re-introduced — but it will need to surface the
+/// annotation without re-using the stored realized content.
+fn find_or_wrap_annotated(content: &Content, _root: &AnnotatedContent) -> AnnotatedContent {
+    AnnotatedContent {
         realized: content.clone(),
         annotation: Annotation::default(),
         children: vec![],
-    })
+    }
 }
 
 #[cfg(test)]
