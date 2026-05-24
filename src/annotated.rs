@@ -385,6 +385,11 @@ fn map_terms_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedCon
     // Each term item contributes 2 slots: term + description.
     // Expected realized children count = 2 * items.len()
     let realized_children = collect_leaf_block_children(realized);
+    // Note: this assumes the realized form exposes 2*N leaf children (one term + one
+    // description per item) via collect_leaf_block_children. If Typst realizes
+    // TermsElem differently (e.g. as a StackElem), the count will mismatch and slots
+    // will be empty, falling back to flat word-diff. Verify against actual realized
+    // form when wiring in Stage 5.
     let expected = terms.children.len() * 2;
     if realized_children.len() != expected {
         return (vec![], vec![]);
@@ -558,7 +563,9 @@ mod tests {
         let labels: Vec<String> = node.annotation.slots.iter()
             .map(|s| format!("{:?}", s.label))
             .collect();
-        assert!(labels[0].contains("Term(0)"), "{labels:?}");
-        assert!(labels[1].contains("TermDescription(0)"), "{labels:?}");
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::Term(0)), "{labels:?}");
+        assert!(matches!(node.annotation.slots[1].label, SlotStep::TermDescription(0)), "{labels:?}");
+        assert_eq!(node.children[0].realized.plain_text(), "API");
+        assert_eq!(node.children[1].realized.plain_text(), "Definition");
     }
 }
