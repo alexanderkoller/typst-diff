@@ -3,12 +3,12 @@
 //! # Pipeline
 //!
 //! ```text
-//! old.typ ──► SystemWorld ──► eval_to_realized_content ──► old_content: Content
-//! new.typ ──► SystemWorld ──► eval_to_realized_content ──► new_content: Content
+//! old.typ ──► SystemWorld ──► eval_to_realized_content ──► old: AnnotatedContent
+//! new.typ ──► SystemWorld ──► eval_to_realized_content ──► new: AnnotatedContent
 //!                                       │
-//!                          diff::diff_content(old, new) ──► DiffResult
+//!                          diff::diff_annotated(old, new) ──► DiffResult
 //!                                       │
-//!               annotate::build_annotated_content(result) ──► Content
+//!               annotate::build_annotated_content_from_tree(result) ──► Content
 //!                                       │
 //!                render::render_to_pdf(content, new_world) ──► Vec<u8>
 //! ```

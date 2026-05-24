@@ -35,7 +35,7 @@ use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
 use crate::annotated::{AnnotatedContent, Annotation};
-use crate::content_slots::{ContentSlot, SlotStep, extract_slots};
+use crate::content_slots::SlotStep;
 
 /// A block-level unit of content together with the page styles active at its position.
 ///
@@ -418,16 +418,11 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
     }
 }
 
-fn collect_slot_tokens(content: &Content, out: &mut Vec<Token>) -> bool {
-    let slots = extract_slots(content);
-    if slots.is_empty() {
-        return false;
-    }
-
-    for slot in slots {
-        collect_tokens(&slot.content, out);
-    }
-    true
+fn collect_slot_tokens(_content: &Content, _out: &mut Vec<Token>) -> bool {
+    // Phase A: slot-bearing elements fall through to atomic plain-text
+    // tokenization. Slot-level diffing is now handled via annotation.slots
+    // in the new tree path (diff_annotated).
+    false
 }
 
 fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
@@ -1122,19 +1117,13 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResultFlat {
             BlockOp::Delete(old_block) => DiffResultOp::Deleted(old_block),
             BlockOp::Insert(new_block) => DiffResultOp::Inserted(new_block),
             BlockOp::Replace(old_block, new_block) => {
-                if let Some(slot_diffs) = diff_slots(&old_block.content, &new_block.content)
-                    && !slot_diffs.is_empty()
-                {
-                    DiffResultOp::ModifiedSlots(new_block, slot_diffs)
+                let old_tokens = extract_words(&old_block.content);
+                let new_tokens = extract_words(&new_block.content);
+                let word_ops = diff_words(&old_tokens, &new_tokens);
+                if has_textual_word_change(&word_ops) {
+                    DiffResultOp::Modified(new_block, word_ops)
                 } else {
-                    let old_tokens = extract_words(&old_block.content);
-                    let new_tokens = extract_words(&new_block.content);
-                    let word_ops = diff_words(&old_tokens, &new_tokens);
-                    if has_textual_word_change(&word_ops) {
-                        DiffResultOp::Modified(new_block, word_ops)
-                    } else {
-                        DiffResultOp::Equal(new_block)
-                    }
+                    DiffResultOp::Equal(new_block)
                 }
             }
         })
@@ -1144,41 +1133,6 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResultFlat {
         block_ops,
         root_styles: root_page_styles(new),
     }
-}
-
-fn diff_slots(old: &Content, new: &Content) -> Option<Vec<SlotDiff>> {
-    let old_slots = extract_slots(old);
-    let new_slots = extract_slots(new);
-    if old_slots.is_empty() || old_slots.len() != new_slots.len() {
-        return None;
-    }
-    if !same_slot_shape(&old_slots, &new_slots) {
-        return None;
-    }
-
-    Some(
-        old_slots
-            .into_iter()
-            .zip(new_slots)
-            .filter_map(|(old_slot, new_slot)| {
-                let sub = diff_content(&old_slot.content, &new_slot.content);
-                slot_sub_diff_has_changes(&sub.block_ops).then_some(SlotDiff {
-                    path: new_slot.path,
-                    ops: sub.block_ops,
-                })
-            })
-            .collect(),
-    )
-}
-
-fn slot_sub_diff_has_changes(ops: &[DiffResultOp]) -> bool {
-    ops.iter().any(|op| !matches!(op, DiffResultOp::Equal(_)))
-}
-
-fn same_slot_shape(old: &[ContentSlot], new: &[ContentSlot]) -> bool {
-    old.iter()
-        .zip(new)
-        .all(|(old_slot, new_slot)| old_slot.path == new_slot.path)
 }
 
 fn root_page_styles(content: &Content) -> Styles {
@@ -1918,32 +1872,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_content_detects_list_item_slot_change() {
-        use typst::foundations::Packed;
-        use typst::model::{ListElem, ListItem};
-
-        let old = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
-            Packed::new(ListItem::new(TextElem::packed("Beta"))),
-        ]));
-        let new = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
-            Packed::new(ListItem::new(TextElem::packed("Better"))),
-        ]));
-
-        let result = diff_content(&old, &new);
-        let has_slot_change = result.block_ops.iter().any(|op| match op {
-            DiffResultOp::ModifiedSlots(_, slots) => slots.iter().any(|slot| {
-                slot.path
-                    .iter()
-                    .any(|step| format!("{step:?}") == "ListItem(1)")
-            }),
-            _ => false,
-        });
-        assert!(has_slot_change);
-    }
-
-    #[test]
     fn extract_blocks_keeps_structured_containers_as_single_blocks() {
         use typst::foundations::Packed;
         use typst::model::{FigureElem, ListElem, ListItem, TableCell, TableElem};
@@ -1977,22 +1905,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_words_tokenizes_slots_inside_containers() {
-        use typst::foundations::Packed;
-        use typst::model::{ListElem, ListItem};
-
-        let list = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha item"))),
-            Packed::new(ListItem::new(TextElem::packed("Beta item"))),
-        ]));
-        let tokens = extract_words(&list);
-        let texts: Vec<_> = tokens.iter().map(|token| token.text.as_str()).collect();
-
-        assert!(texts.contains(&"Alpha"));
-        assert!(texts.contains(&"Beta"));
-    }
-
-    #[test]
     fn extract_words_preserves_styles_on_split_tokens() {
         use typst::visualize::Color;
 
@@ -2005,118 +1917,6 @@ mod tests {
             tokens.iter().all(|token| token.content.is::<StyledElem>()),
             "{tokens:?}"
         );
-    }
-
-    #[test]
-    fn diff_slots_same_shape_reports_only_changed_slots() {
-        use typst::foundations::Packed;
-        use typst::model::{ListElem, ListItem};
-
-        let old = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
-            Packed::new(ListItem::new(TextElem::packed("Beta"))),
-            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
-        ]));
-        let new = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
-            Packed::new(ListItem::new(TextElem::packed("Better"))),
-            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
-        ]));
-
-        let slots = diff_slots(&old, &new).unwrap();
-
-        assert_eq!(slots.len(), 1);
-        assert_eq!(
-            slots[0].path,
-            vec![crate::content_slots::SlotStep::ListItem(1)]
-        );
-    }
-
-    #[test]
-    fn diff_slots_shape_mismatch_falls_back_to_block_diff() {
-        use typst::foundations::Packed;
-        use typst::model::{ListElem, ListItem};
-
-        let old = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
-            TextElem::packed("Alpha"),
-        ))]));
-        let new = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
-            Packed::new(ListItem::new(TextElem::packed("Beta"))),
-        ]));
-
-        assert!(diff_slots(&old, &new).is_none());
-    }
-
-    #[test]
-    fn diff_slots_recurses_into_nested_list_item_body() {
-        use typst::foundations::Packed;
-        use typst::model::{ListElem, ListItem};
-
-        // Build: - outer item\n  - inner old\n- other
-        let inner_old = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("inner old"))),
-        ]));
-        let inner_new = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("inner new"))),
-        ]));
-        let old = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(Content::sequence([
-                TextElem::packed("outer"),
-                inner_old,
-            ]))),
-            Packed::new(ListItem::new(TextElem::packed("other"))),
-        ]));
-        let new = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(Content::sequence([
-                TextElem::packed("outer"),
-                inner_new,
-            ]))),
-            Packed::new(ListItem::new(TextElem::packed("other"))),
-        ]));
-
-        let result = diff_content(&old, &new);
-
-        // Should produce a ModifiedSlots for the outer list with a sub-diff that
-        // recurses through ListItem(0) to reach the changed inner leaf.
-        let found = result.block_ops.iter().any(|op| match op {
-            DiffResultOp::ModifiedSlots(_, slots) => {
-                slots.iter().any(|slot| {
-                    // slot for outer item 0 carries a sub-diff that has further
-                    // nested structure — not just a flat Modified.
-                    slot.path == vec![crate::content_slots::SlotStep::ListItem(0)]
-                        && slot.ops.iter().any(|sub| {
-                            matches!(sub, DiffResultOp::ModifiedSlots(_, _))
-                                || matches!(sub, DiffResultOp::Modified(_, _))
-                        })
-                })
-            }
-            _ => false,
-        });
-        assert!(found, "expected recursive slot diff for nested list: {result:?}", result = result.modification_log());
-    }
-
-    #[test]
-    fn modification_log_includes_slot_path_and_omits_unchanged_slots() {
-        use typst::foundations::Packed;
-        use typst::model::{ListElem, ListItem};
-
-        let old = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Stable"))),
-            Packed::new(ListItem::new(TextElem::packed("Old value"))),
-        ]));
-        let new = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Stable"))),
-            Packed::new(ListItem::new(TextElem::packed("New value"))),
-        ]));
-
-        let log = diff_content(&old, &new).modification_log();
-
-        assert!(log.contains("modify slot"), "{log}");
-        assert!(log.contains("ListItem(1)"), "{log}");
-        assert!(log.contains("Old"), "{log}");
-        assert!(log.contains("New"), "{log}");
-        assert!(!log.contains("Stable"), "{log}");
     }
 
     #[test]

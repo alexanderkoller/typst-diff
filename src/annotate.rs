@@ -25,7 +25,7 @@ use typst::model::{HeadingElem, ParElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
-use crate::content_slots::{extract_slots, replace_slot};
+use crate::content_slots::replace_slot;
 use crate::diff::{DiffBlock, DiffNode, DiffResultFlat, DiffResultOp, NodeStatus, WordOp};
 
 fn green() -> Color {
@@ -299,28 +299,13 @@ fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
 }
 
-/// Apply `fill` to the text content of `content` without wrapping the outermost
-/// structural element in a `StyledElem`.
+/// Apply `fill` to the text content of `content` at the outer block level.
 ///
-/// For slot-bearing elements (lists, tables, figures, …) the fill is applied to
-/// each slot's content individually, so the outer element (e.g. `ListElem`) stays
-/// as a bare block — preserving Typst's tight list/table spacing between consecutive
-/// elements of the same type.  For elements with no slots (plain text, headings,
-/// raw blocks, …) the method falls back to wrapping in `StyledElem`, which is fine
-/// because those types don't rely on consecutive-block spacing heuristics.
+/// Phase A applies the fill by wrapping the whole block in a `StyledElem`. Slot-level
+/// fill application (applying fill inside each slot individually) will be re-introduced
+/// via the new tree path once `DiffNode` carries slot information.
 fn apply_fill_inside(content: &Content, fill: Color) -> Content {
-    let slots = extract_slots(content);
-    if slots.is_empty() {
-        return content.clone().styled(TextElem::fill.set(fill.into()));
-    }
-    let mut result = content.clone();
-    for slot in slots {
-        let colored = slot.content.styled(TextElem::fill.set(fill.into()));
-        if let Some(next) = replace_slot(&result, &slot.path, colored) {
-            result = next;
-        }
-    }
-    result
+    content.clone().styled(TextElem::fill.set(fill.into()))
 }
 
 /// Build annotated content from the new tree-shaped [`crate::diff::DiffResult`].
@@ -419,6 +404,7 @@ fn apply_changed_descendants(
     result
 }
 
+#[allow(dead_code)]
 fn replace_modified_slots(
     template: &Content,
     slot_diffs: &[crate::diff::SlotDiff],
@@ -477,29 +463,6 @@ mod tests {
         };
         let content = build_annotated_content(&result, false);
         assert!(!content.is_empty());
-    }
-
-    #[test]
-    fn inserted_list_block_stays_bare_list_not_styled_wrapper() {
-        // An inserted ListElem must NOT be wrapped in a top-level StyledElem.
-        // If it were, Typst's tight spacing between consecutive ListElem blocks
-        // would break, producing paragraph-sized gaps (the #19/#69 spacing bug).
-        let list = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("New item"))),
-        ]));
-        let blocks = build_annotated_blocks(
-            &[DiffResultOp::Inserted(block(list))],
-            false,
-        );
-        assert_eq!(blocks.len(), 1);
-        // The block content must be a ListElem, not a StyledElem wrapping a ListElem.
-        assert!(
-            blocks[0].content.is::<ListElem>(),
-            "inserted ListElem should remain a bare ListElem, got: {:?}",
-            blocks[0].content.func().name()
-        );
-        // Text must still be present.
-        assert!(blocks[0].content.plain_text().contains("New item"));
     }
 
     #[test]

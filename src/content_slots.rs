@@ -1,23 +1,14 @@
 //! Named content "slots" — addressable text-bearing sub-positions inside structured elements.
 //!
-//! Many Typst elements (lists, tables, figures, …) contain multiple independent
-//! text regions. The diff needs to identify *which* sub-region changed, not just that
-//! the whole block changed.
-//!
 //! A **slot** is a leaf text-bearing position identified by a [`Vec<SlotStep>`] path from
-//! the element root. [`extract_slots`] walks a `Content` tree and collects every slot.
-//! [`replace_slot`] takes a path and a replacement `Content` and writes it back into a
-//! clone of the original tree.
+//! the element root. [`replace_slot`] takes a path and a replacement `Content` and writes
+//! it back into a clone of the original tree.
 //!
-//! # Element coverage
-//!
-//! Slots are extracted from: `ListElem` / `ListItem`, `EnumElem` / `EnumItem`,
-//! `TermsElem` / `TermItem`, `FigureElem` (body + caption), `FootnoteElem`,
-//! `QuoteElem`, `TableElem`, `GridElem`, `StackElem`, and single-body wrappers
-//! (`AlignElem`, `PadElem`, `PlaceElem`, `ColumnsElem`, `BoxElem`, `BlockElem`,
-//! `RectElem`, `CircleElem`, `EllipseElem`).
+//! The old `extract_slots` / `collect_slots` machinery has been removed; slot paths are
+//! now supplied by the annotated tree (`annotation.slots`) rather than extracted from
+//! realized content.
 
-use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
+use typst::foundations::{Content, SequenceElem, StyledElem};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridChild, GridElem, GridItem, PadElem,
     PlaceElem, StackChild, StackElem,
@@ -49,62 +40,12 @@ pub enum SlotStep {
     StackChild(usize),
 }
 
-/// A named text-bearing position inside a structured element.
-///
-/// `path` uniquely addresses the slot from the element root; `content` is the
-/// current text payload at that address.
-#[derive(Clone, Debug)]
-pub struct ContentSlot {
-    pub path: Vec<SlotStep>,
-    pub content: Content,
-}
-
-/// Collect every named slot from `content` in document order.
-///
-/// Returns an empty vec for elements that have no addressable slots (e.g. plain
-/// `TextElem`, `HeadingElem`, `RawElem`). Non-empty results are used by the diff
-/// to attempt slot-level diffing before falling back to whole-block word-diffing.
-pub fn extract_slots(content: &Content) -> Vec<ContentSlot> {
-    let mut slots = Vec::new();
-    collect_slots(content, &mut Vec::new(), &mut slots);
-    slots
-}
-
-/// Returns `true` if `content` is a structured element that [`extract_slots`] knows
-/// how to descend into.
-///
-/// Used in `eval.rs` to identify nodes that must be preserved before realization
-/// (realization turns them into opaque layout output).
-pub fn is_slot_container(content: &Content) -> bool {
-    content.is::<ListElem>()
-        || content.is::<ListItem>()
-        || content.is::<EnumElem>()
-        || content.is::<EnumItem>()
-        || content.is::<TermsElem>()
-        || content.is::<TermItem>()
-        || content.is::<FigureElem>()
-        || content.is::<FootnoteElem>()
-        || content.is::<QuoteElem>()
-        || content.is::<TableElem>()
-        || content.is::<GridElem>()
-        || content.is::<StackElem>()
-        || content.is::<AlignElem>()
-        || content.is::<PadElem>()
-        || content.is::<PlaceElem>()
-        || content.is::<ColumnsElem>()
-        || content.is::<BoxElem>()
-        || content.is::<BlockElem>()
-        || content.is::<RectElem>()
-        || content.is::<CircleElem>()
-        || content.is::<EllipseElem>()
-}
-
 /// Wrap consecutive bare `ListItem` / `EnumItem` / `TermItem` nodes into their
 /// container elements (`ListElem`, `EnumElem`, `TermsElem`).
 ///
 /// Typst's evaluator sometimes emits list items as siblings in a `SequenceElem`
 /// rather than inside a `ListElem`. This normalization step ensures the content
-/// tree always uses the container form, which [`extract_slots`] understands.
+/// tree always uses the container form that the annotated tree understands.
 pub fn normalize_list_item_runs(content: Content) -> Content {
     let mut content = content;
 
@@ -127,13 +68,6 @@ pub fn normalize_list_item_runs(content: Content) -> Content {
     if let Some(par) = content.to_packed_mut::<ParElem>() {
         par.body = normalize_list_item_runs(par.body.clone());
         return content;
-    }
-
-    for slot in extract_slots(&content) {
-        let normalized = normalize_list_item_runs(slot.content);
-        if let Some(next) = replace_slot(&content, &slot.path, normalized) {
-            content = next;
-        }
     }
 
     content
@@ -178,262 +112,6 @@ fn group_list_item_runs(children: Vec<Content>) -> Vec<Content> {
     }
 
     grouped
-}
-
-fn collect_slots(content: &Content, prefix: &mut Vec<SlotStep>, slots: &mut Vec<ContentSlot>) {
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        for (index, child) in seq.children.iter().enumerate() {
-            prefix.push(SlotStep::SequenceChild(index));
-            collect_slots(child, prefix, slots);
-            prefix.pop();
-        }
-        return;
-    }
-
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        prefix.push(SlotStep::StyledChild);
-        collect_slots(&styled.child, prefix, slots);
-        prefix.pop();
-        return;
-    }
-
-    if let Some(par) = content.to_packed::<ParElem>() {
-        // Only descend into the body to surface sub-slots (e.g. a nested list
-        // inside the paragraph). Do NOT push a fallback "ParBody" slot for
-        // inline-only bodies — if we did, `diff_slots` would recurse via
-        // `diff_content` into the body, which `extract_block_units` would wrap
-        // in a fresh `ParElem` whose own `ParBody` slot is the same body
-        // content, causing infinite recursion. For inline-only paragraphs we
-        // want `extract_slots` to report no slots so `diff_slots` returns
-        // `None` and the diff falls through to a flat word-level diff at the
-        // paragraph block level.
-        prefix.push(SlotStep::ParBody);
-        collect_slots(&par.body, prefix, slots);
-        prefix.pop();
-        return;
-    }
-
-    if let Some(item) = content.to_packed::<ListItem>() {
-        push_slot(prefix, SlotStep::ItemBody, item.body.clone(), slots);
-        return;
-    }
-
-    if let Some(item) = content.to_packed::<EnumItem>() {
-        push_slot(prefix, SlotStep::ItemBody, item.body.clone(), slots);
-        return;
-    }
-
-    if let Some(item) = content.to_packed::<TermItem>() {
-        push_slot(prefix, SlotStep::Term(0), item.term.clone(), slots);
-        push_slot(
-            prefix,
-            SlotStep::TermDescription(0),
-            item.description.clone(),
-            slots,
-        );
-        return;
-    }
-
-    if let Some(list) = content.to_packed::<ListElem>() {
-        for (index, item) in list.children.iter().enumerate() {
-            push_slot(prefix, SlotStep::ListItem(index), item.body.clone(), slots);
-        }
-        return;
-    }
-
-    if let Some(enm) = content.to_packed::<EnumElem>() {
-        for (index, item) in enm.children.iter().enumerate() {
-            push_slot(prefix, SlotStep::EnumItem(index), item.body.clone(), slots);
-        }
-        return;
-    }
-
-    if let Some(terms) = content.to_packed::<TermsElem>() {
-        for (index, item) in terms.children.iter().enumerate() {
-            push_slot(prefix, SlotStep::Term(index), item.term.clone(), slots);
-            push_slot(
-                prefix,
-                SlotStep::TermDescription(index),
-                item.description.clone(),
-                slots,
-            );
-        }
-        return;
-    }
-
-    if let Some(figure) = content.to_packed::<FigureElem>() {
-        push_slot(prefix, SlotStep::FigureBody, figure.body.clone(), slots);
-        if let Some(caption) = figure.caption.get_cloned(StyleChain::default()) {
-            push_slot(prefix, SlotStep::FigureCaption, caption.body.clone(), slots);
-        }
-        return;
-    }
-
-    if let Some(footnote) = content.to_packed::<FootnoteElem>() {
-        if let FootnoteBody::Content(body) = &footnote.body {
-            push_slot(prefix, SlotStep::FootnoteBody, body.clone(), slots);
-        }
-        return;
-    }
-
-    if let Some(quote) = content.to_packed::<QuoteElem>() {
-        push_slot(prefix, SlotStep::QuoteBody, quote.body.clone(), slots);
-        return;
-    }
-
-    if let Some(table) = content.to_packed::<TableElem>() {
-        let mut index = 0;
-        collect_table_slots(&table.children, prefix, slots, &mut index);
-        return;
-    }
-
-    if let Some(grid) = content.to_packed::<GridElem>() {
-        let mut index = 0;
-        collect_grid_slots(&grid.children, prefix, slots, &mut index);
-        return;
-    }
-
-    if let Some(stack) = content.to_packed::<StackElem>() {
-        for (index, child) in stack.children.iter().enumerate() {
-            if let StackChild::Block(body) = child {
-                push_slot(prefix, SlotStep::StackChild(index), body.clone(), slots);
-            }
-        }
-        return;
-    }
-
-    if let Some(body) = wrapper_body(content) {
-        push_slot(prefix, SlotStep::WrapperBody, body, slots);
-    }
-}
-
-fn push_slot(prefix: &[SlotStep], step: SlotStep, content: Content, slots: &mut Vec<ContentSlot>) {
-    let mut path = prefix.to_vec();
-    path.push(step);
-    slots.push(ContentSlot { path, content });
-}
-
-fn wrapper_body(content: &Content) -> Option<Content> {
-    if let Some(elem) = content.to_packed::<AlignElem>() {
-        return Some(elem.body.clone());
-    }
-    if let Some(elem) = content.to_packed::<PadElem>() {
-        return Some(elem.body.clone());
-    }
-    if let Some(elem) = content.to_packed::<PlaceElem>() {
-        return Some(elem.body.clone());
-    }
-    if let Some(elem) = content.to_packed::<ColumnsElem>() {
-        return Some(elem.body.clone());
-    }
-    if let Some(elem) = content.to_packed::<BoxElem>() {
-        return elem.body.get_cloned(StyleChain::default());
-    }
-    if let Some(elem) = content.to_packed::<BlockElem>() {
-        return match elem.body.get_cloned(StyleChain::default()) {
-            Some(BlockBody::Content(body)) => Some(body.clone()),
-            _ => None,
-        };
-    }
-    if let Some(elem) = content.to_packed::<RectElem>() {
-        return elem.body.get_cloned(StyleChain::default());
-    }
-    if let Some(elem) = content.to_packed::<CircleElem>() {
-        return elem.body.get_cloned(StyleChain::default());
-    }
-    if let Some(elem) = content.to_packed::<EllipseElem>() {
-        return elem.body.get_cloned(StyleChain::default());
-    }
-    None
-}
-
-fn collect_table_slots(
-    children: &[TableChild],
-    prefix: &[SlotStep],
-    slots: &mut Vec<ContentSlot>,
-    index: &mut usize,
-) {
-    for child in children {
-        match child {
-            TableChild::Header(header) => {
-                collect_table_item_slots(&header.children, prefix, slots, index)
-            }
-            TableChild::Footer(footer) => {
-                collect_table_item_slots(&footer.children, prefix, slots, index)
-            }
-            TableChild::Item(item) => collect_table_item_slot(item, prefix, slots, index),
-        }
-    }
-}
-
-fn collect_table_item_slots(
-    items: &[TableItem],
-    prefix: &[SlotStep],
-    slots: &mut Vec<ContentSlot>,
-    index: &mut usize,
-) {
-    for item in items {
-        collect_table_item_slot(item, prefix, slots, index);
-    }
-}
-
-fn collect_table_item_slot(
-    item: &TableItem,
-    prefix: &[SlotStep],
-    slots: &mut Vec<ContentSlot>,
-    index: &mut usize,
-) {
-    if let TableItem::Cell(cell) = item {
-        push_slot(
-            prefix,
-            SlotStep::TableCell(*index),
-            cell.body.clone(),
-            slots,
-        );
-        *index += 1;
-    }
-}
-
-fn collect_grid_slots(
-    children: &[GridChild],
-    prefix: &[SlotStep],
-    slots: &mut Vec<ContentSlot>,
-    index: &mut usize,
-) {
-    for child in children {
-        match child {
-            GridChild::Header(header) => {
-                collect_grid_item_slots(&header.children, prefix, slots, index)
-            }
-            GridChild::Footer(footer) => {
-                collect_grid_item_slots(&footer.children, prefix, slots, index)
-            }
-            GridChild::Item(item) => collect_grid_item_slot(item, prefix, slots, index),
-        }
-    }
-}
-
-fn collect_grid_item_slots(
-    items: &[GridItem],
-    prefix: &[SlotStep],
-    slots: &mut Vec<ContentSlot>,
-    index: &mut usize,
-) {
-    for item in items {
-        collect_grid_item_slot(item, prefix, slots, index);
-    }
-}
-
-fn collect_grid_item_slot(
-    item: &GridItem,
-    prefix: &[SlotStep],
-    slots: &mut Vec<ContentSlot>,
-    index: &mut usize,
-) {
-    if let GridItem::Cell(cell) = item {
-        push_slot(prefix, SlotStep::GridCell(*index), cell.body.clone(), slots);
-        *index += 1;
-    }
 }
 
 /// Write `replacement` into the slot identified by `path` inside a clone of `template`.
@@ -757,211 +435,69 @@ fn is_inlineish(content: &Content) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::eval_to_content;
-    use crate::world::SystemWorld;
-    use std::fs;
-    use tempfile::TempDir;
     use typst::foundations::Packed;
     use typst::text::TextElem;
-
-    fn eval(source: &str) -> (TempDir, Content) {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("main.typ"), source).unwrap();
-        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
-        let content = eval_to_content(&world).unwrap();
-        (dir, normalize_list_item_runs(content))
-    }
 
     fn text(s: &str) -> Content {
         TextElem::packed(s)
     }
 
-    fn slot_texts(content: &Content) -> Vec<String> {
-        extract_slots(content)
-            .into_iter()
-            .map(|slot| slot.content.plain_text().to_string())
-            .collect()
-    }
-
-    fn replace_nth_slot(content: &Content, index: usize, replacement: &str) -> Content {
-        let slots = extract_slots(content);
-        replace_slot(content, &slots[index].path, text(replacement)).unwrap()
-    }
-
     #[test]
-    fn list_slots_extract_and_replace_each_item_body() {
+    fn replace_slot_list_item_body() {
         let content = Content::new(ListElem::new(vec![
             Packed::new(ListItem::new(text("Alpha"))),
             Packed::new(ListItem::new(text("Beta"))),
             Packed::new(ListItem::new(text("Gamma"))),
         ]));
 
-        let slots = extract_slots(&content);
+        let replaced = replace_slot(&content, &[SlotStep::ListItem(1)], text("Better")).unwrap();
         assert_eq!(
-            slots
-                .iter()
-                .map(|slot| slot.path.clone())
-                .collect::<Vec<_>>(),
-            vec![
-                vec![SlotStep::ListItem(0)],
-                vec![SlotStep::ListItem(1)],
-                vec![SlotStep::ListItem(2)]
-            ]
+            replaced.plain_text(),
+            Content::new(ListElem::new(vec![
+                Packed::new(ListItem::new(text("Alpha"))),
+                Packed::new(ListItem::new(text("Better"))),
+                Packed::new(ListItem::new(text("Gamma"))),
+            ]))
+            .plain_text()
         );
-
-        let replaced = replace_slot(&content, &slots[1].path, text("Better")).unwrap();
-        assert_eq!(slot_texts(&replaced), ["Alpha", "Better", "Gamma"]);
-        assert_eq!(slot_texts(&content), ["Alpha", "Beta", "Gamma"]);
+        // Original is unchanged
+        assert!(content.plain_text().contains("Beta"));
     }
 
     #[test]
-    fn enum_slots_extract_and_replace_each_item_body() {
+    fn replace_slot_enum_item_body() {
         let content = Content::new(EnumElem::new(vec![
             Packed::new(EnumItem::new(text("One"))),
             Packed::new(EnumItem::new(text("Two"))),
         ]));
 
-        let slots = extract_slots(&content);
-        assert_eq!(
-            slots
-                .iter()
-                .map(|slot| slot.path.clone())
-                .collect::<Vec<_>>(),
-            vec![vec![SlotStep::EnumItem(0)], vec![SlotStep::EnumItem(1)]]
-        );
-
-        let replaced = replace_slot(&content, &slots[0].path, text("First")).unwrap();
-        assert_eq!(slot_texts(&replaced), ["First", "Two"]);
+        let replaced = replace_slot(&content, &[SlotStep::EnumItem(0)], text("First")).unwrap();
+        assert!(replaced.plain_text().contains("First"));
+        assert!(!replaced.plain_text().contains("One"));
     }
 
     #[test]
-    fn term_slots_extract_and_replace_term_and_description() {
+    fn replace_slot_term_and_description() {
         let content = Content::new(TermsElem::new(vec![Packed::new(TermItem::new(
             text("API"),
             text("Old description"),
         ))]));
 
-        let slots = extract_slots(&content);
-        assert_eq!(
-            slots
-                .iter()
-                .map(|slot| slot.path.clone())
-                .collect::<Vec<_>>(),
-            vec![vec![SlotStep::Term(0)], vec![SlotStep::TermDescription(0)]]
-        );
-
-        let replaced = replace_slot(&content, &slots[0].path, text("SDK")).unwrap();
-        let replaced = replace_slot(&replaced, &slots[1].path, text("New description")).unwrap();
-        assert_eq!(slot_texts(&replaced), ["SDK", "New description"]);
+        let replaced = replace_slot(&content, &[SlotStep::Term(0)], text("SDK")).unwrap();
+        let replaced =
+            replace_slot(&replaced, &[SlotStep::TermDescription(0)], text("New description"))
+                .unwrap();
+        assert!(replaced.plain_text().contains("SDK"));
+        assert!(replaced.plain_text().contains("New description"));
+        assert!(!replaced.plain_text().contains("API"));
+        assert!(!replaced.plain_text().contains("Old description"));
     }
 
     #[test]
-    fn figure_slots_extract_body_and_caption() {
-        let (_dir, content) = eval("#figure(rect(width: 10pt, height: 4pt), caption: [Old cap])");
-        let slots = extract_slots(&content);
-
-        assert!(
-            slots
-                .iter()
-                .any(|slot| slot.path.ends_with(&[SlotStep::FigureBody]))
-        );
-        assert!(
-            slots
-                .iter()
-                .any(|slot| slot.path.ends_with(&[SlotStep::FigureCaption]))
-        );
-
-        let caption = slots
-            .iter()
-            .find(|slot| slot.path.ends_with(&[SlotStep::FigureCaption]))
-            .unwrap();
-        let replaced = replace_slot(&content, &caption.path, text("New cap")).unwrap();
-        assert!(replaced.plain_text().contains("New cap"));
-        assert!(!replaced.plain_text().contains("Old cap"));
-    }
-
-    #[test]
-    fn footnote_slots_extract_and_replace_body() {
-        let (_dir, content) = eval("Text#footnote[Old note].");
-        let slots = extract_slots(&content);
-        let footnote = slots
-            .iter()
-            .find(|slot| slot.path.ends_with(&[SlotStep::FootnoteBody]))
-            .unwrap();
-
-        let replaced = replace_slot(&content, &footnote.path, text("New note")).unwrap();
-        assert!(replaced.plain_text().contains("New note"));
-        assert!(!replaced.plain_text().contains("Old note"));
-    }
-
-    #[test]
-    fn quote_slots_extract_and_replace_body() {
-        let (_dir, content) = eval("#quote[Old quote]");
-        let slots = extract_slots(&content);
-        assert!(
-            slots
-                .iter()
-                .any(|slot| slot.path == vec![SlotStep::QuoteBody])
-        );
-
-        let replaced = replace_nth_slot(&content, 0, "New quote");
+    fn replace_slot_quote_body() {
+        let content = Content::new(QuoteElem::new(text("Old quote")));
+        let replaced = replace_slot(&content, &[SlotStep::QuoteBody], text("New quote")).unwrap();
         assert_eq!(replaced.plain_text(), "New quote");
-    }
-
-    #[test]
-    fn table_slots_extract_and_replace_cells_in_document_order() {
-        let (_dir, content) = eval("#table(columns: 2, [A], [B], [C], [D])");
-        assert_eq!(slot_texts(&content), ["A", "B", "C", "D"]);
-
-        let replaced = replace_nth_slot(&content, 2, "Changed");
-        assert_eq!(slot_texts(&replaced), ["A", "B", "Changed", "D"]);
-    }
-
-    #[test]
-    fn grid_slots_extract_and_replace_cells_in_document_order() {
-        let (_dir, content) = eval("#grid(columns: 2, [A], [B], [C], [D])");
-        assert_eq!(slot_texts(&content), ["A", "B", "C", "D"]);
-
-        let replaced = replace_nth_slot(&content, 3, "Changed");
-        assert_eq!(slot_texts(&replaced), ["A", "B", "C", "Changed"]);
-    }
-
-    #[test]
-    fn stack_slots_extract_and_replace_block_children() {
-        let (_dir, content) = eval("#stack(dir: ttb, [Top], [Bottom])");
-        assert_eq!(slot_texts(&content), ["Top", "Bottom"]);
-
-        let replaced = replace_nth_slot(&content, 1, "Lower");
-        assert_eq!(slot_texts(&replaced), ["Top", "Lower"]);
-    }
-
-    #[test]
-    fn wrapper_slots_extract_and_replace_body() {
-        let cases = [
-            "#align(center)[Old]",
-            "#pad(5pt)[Old]",
-            "#place(top)[Old]",
-            "#columns(2)[Old]",
-            "#box[Old]",
-            "#block[Old]",
-            "#rect[Old]",
-            "#circle[Old]",
-            "#ellipse[Old]",
-        ];
-
-        for source in cases {
-            let (_dir, content) = eval(source);
-            let slots = extract_slots(&content);
-            assert_eq!(slots.len(), 1, "{source}: {slots:?}");
-            assert!(
-                slots[0].path.ends_with(&[SlotStep::WrapperBody]),
-                "{source}"
-            );
-
-            let replaced = replace_slot(&content, &slots[0].path, text("New")).unwrap();
-            assert!(replaced.plain_text().contains("New"), "{source}");
-            assert!(!replaced.plain_text().contains("Old"), "{source}");
-        }
     }
 
     #[test]
@@ -989,20 +525,9 @@ mod tests {
         assert!(seq.children[0].plain_text().contains("Before"));
         assert!(seq.children[1].is::<ListElem>());
         assert!(seq.children[2].plain_text().contains("After"));
-        assert_eq!(slot_texts(&seq.children[1]), ["Alpha", "Beta"]);
-    }
-
-    #[test]
-    fn normalize_list_item_runs_recurses_into_slot_content() {
-        let quote = Content::new(QuoteElem::new(Content::sequence([
-            Content::new(ListItem::new(text("Alpha"))),
-            Content::new(ListItem::new(text("Beta"))),
-        ])));
-
-        let normalized = normalize_list_item_runs(quote);
-        let slots = extract_slots(&normalized);
-        assert_eq!(slots.len(), 1);
-        assert_eq!(slot_texts(&slots[0].content), ["Alpha", "Beta"]);
+        // The grouped ListElem contains both list items
+        assert!(seq.children[1].plain_text().contains("Alpha"));
+        assert!(seq.children[1].plain_text().contains("Beta"));
     }
 
     #[test]
@@ -1034,29 +559,5 @@ mod tests {
                 .plain_text(),
             "New text"
         );
-    }
-
-    #[test]
-    fn is_slot_container_matches_representative_extractable_elements() {
-        let containers = [
-            Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
-                "Item",
-            )))])),
-            Content::new(EnumElem::new(vec![Packed::new(EnumItem::new(text(
-                "Item",
-            )))])),
-            Content::new(TermsElem::new(vec![Packed::new(TermItem::new(
-                text("Term"),
-                text("Description"),
-            ))])),
-            Content::new(QuoteElem::new(text("Quote"))),
-        ];
-
-        for container in containers {
-            assert!(is_slot_container(&container));
-            assert!(!extract_slots(&container).is_empty());
-        }
-        assert!(!is_slot_container(&text("Plain")));
-        assert!(extract_slots(&text("Plain")).is_empty());
     }
 }
