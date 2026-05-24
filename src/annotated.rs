@@ -555,6 +555,41 @@ fn wrapper_body_of(content: &Content) -> Option<Content> {
     None
 }
 
+/// Walk `node` in document order and attach [`FootnoteInfo`] to any node whose realized
+/// form is a footnote marker (a `TextElem` whose text is a superscript number).
+///
+/// `footnotes` is the ordered list of `FootnoteElem` nodes from the pre-realization tree,
+/// collected once by the caller before `annotate_realized` runs.
+/// The attachment is a post-pass because the marker sites are not structurally
+/// predictable from the pre-realization tree.
+pub fn annotate_footnote_markers(
+    node: &mut AnnotatedContent,
+    footnotes: &[Content],
+    next: &mut usize,
+) {
+    if footnotes.is_empty() { return; }
+    if *next >= footnotes.len() { return; }
+
+    // Check if this realized node is a footnote marker number
+    if is_footnote_marker_text(&node.realized, *next + 1) {
+        node.annotation.footnote = Some(FootnoteInfo { body: footnotes[*next].clone() });
+        *next += 1;
+        return;
+    }
+
+    for child in &mut node.children {
+        annotate_footnote_markers(child, footnotes, next);
+        if *next >= footnotes.len() { return; }
+    }
+}
+
+fn is_footnote_marker_text(content: &Content, number: usize) -> bool {
+    use typst::text::TextElem;
+    content
+        .to_packed::<TextElem>()
+        .is_some_and(|t| t.text.as_str() == number.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,5 +945,20 @@ mod tests {
         assert!(matches!(node.annotation.slots[0].label, SlotStep::QuoteBody));
         assert_eq!(node.annotation.slots[0].child_index, 0);
         assert_eq!(node.children[0].realized.plain_text(), "Quote body");
+    }
+
+    #[test]
+    fn annotate_handles_repeated_function_expansions_with_distinct_content() {
+        // Three sequence children with the same detached span (simulates repeated fn expansion)
+        // The walker must match each pre child to its positionally-corresponding realized child.
+        let pre = seq([text("First"), text("Second"), text("Third")]);
+        let realized = seq([text("R1"), text("R2"), text("R3")]);
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.children.len(), 3);
+        // Realized content must be the REALIZED text, not the pre text
+        assert_eq!(node.children[0].realized.plain_text(), "R1");
+        assert_eq!(node.children[1].realized.plain_text(), "R2");
+        assert_eq!(node.children[2].realized.plain_text(), "R3");
     }
 }
