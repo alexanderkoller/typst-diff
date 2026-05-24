@@ -842,4 +842,73 @@ mod tests {
         assert!(node.realized.plain_text().contains('1'));
         assert!(node.realized.plain_text().contains("Intro"));
     }
+
+    #[test]
+    fn annotate_grid_maps_each_cell_by_document_order_index() {
+        use typst::foundations::Packed;
+        use typst::layout::{GridCell, GridChild, GridElem, GridItem};
+
+        let pre = Content::new(GridElem::new(vec![
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("X"))))),
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("Y"))))),
+        ]));
+        let realized = seq([text("X"), text("Y")]);
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Grid));
+        assert_eq!(node.annotation.slots.len(), 2);
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::GridCell(0)));
+        assert!(matches!(node.annotation.slots[1].label, SlotStep::GridCell(1)));
+        assert_eq!(node.children[0].realized.plain_text(), "X");
+        assert_eq!(node.children[1].realized.plain_text(), "Y");
+    }
+
+    #[test]
+    fn annotate_stack_maps_block_children() {
+        use typst::layout::{StackChild, StackElem};
+
+        let pre = Content::new(StackElem::new(vec![
+            StackChild::Block(text("Block0")),
+            StackChild::Block(text("Block1")),
+        ]));
+        let realized = seq([text("Block0"), text("Block1")]);
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Stack));
+        assert_eq!(node.annotation.slots.len(), 2);
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::StackChild(0)));
+        assert!(matches!(node.annotation.slots[1].label, SlotStep::StackChild(1)));
+        assert_eq!(node.children[0].realized.plain_text(), "Block0");
+        assert_eq!(node.children[1].realized.plain_text(), "Block1");
+    }
+
+    #[test]
+    fn annotate_footnote_maps_body_as_single_slot() {
+        use typst::model::{FootnoteBody, FootnoteElem};
+
+        let body_content = text("Footnote text");
+        let pre = Content::new(FootnoteElem::new(FootnoteBody::Content(body_content)));
+        let realized = text("Footnote text");
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Footnote));
+        assert_eq!(node.annotation.slots.len(), 1);
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::FootnoteBody));
+        assert_eq!(node.children[0].realized.plain_text(), "Footnote text");
+    }
+
+    #[test]
+    fn annotate_quote_maps_body_as_single_slot() {
+        use typst::model::QuoteElem;
+
+        let pre = Content::new(QuoteElem::new(text("Quote body")));
+        let realized = text("Quote body");
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Quote));
+        assert_eq!(node.annotation.slots.len(), 1);
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::QuoteBody));
+        assert_eq!(node.annotation.slots[0].child_index, 0);
+        assert_eq!(node.children[0].realized.plain_text(), "Quote body");
+    }
 }
