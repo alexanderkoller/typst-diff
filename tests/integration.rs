@@ -125,6 +125,14 @@ fn annotated_corpus(name: &str) -> Content {
     typst_diff::build_annotated_content(&result, false)
 }
 
+fn diff_annotated_corpus(name: &str) -> typst_diff::diff::DiffResult {
+    let old_world = corpus_world(&format!("{name}/old.typ"));
+    let new_world = corpus_world(&format!("{name}/new.typ"));
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    typst_diff::diff::diff_annotated(&old, &new)
+}
+
 #[test]
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
@@ -340,6 +348,55 @@ fn git(cwd: &std::path::Path, args: &[&str]) {
         .output()
         .unwrap();
     assert_command_success(output, &format!("git {args:?}"));
+}
+
+// Corpus #18: same-shape list (4 items → 4 items), second item text changed.
+// diff_annotated must descend into the list structure rather than treating the
+// whole block as a flat Modified. Expected:
+//   list block       → HasChangedDescendants
+//   items 0, 2, 3   → Unchanged
+//   item 1           → Modified (word diff of the item body text)
+#[test]
+fn list_item_change_produces_has_changed_descendants_not_flat_modified() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("18-list-item-changed");
+
+    let list_block = result
+        .blocks
+        .iter()
+        .find(|b| !matches!(b.status, NodeStatus::Unchanged))
+        .expect("expected at least one changed block");
+
+    assert!(
+        matches!(list_block.status, NodeStatus::HasChangedDescendants),
+        "list block should be HasChangedDescendants, got {:?}",
+        list_block.status
+    );
+
+    let unchanged_count = list_block
+        .children
+        .iter()
+        .filter(|c| matches!(c.status, NodeStatus::Unchanged))
+        .count();
+    assert_eq!(unchanged_count, 3, "expected 3 unchanged list items, got {unchanged_count}");
+
+    let changed_children: Vec<_> = list_block
+        .children
+        .iter()
+        .filter(|c| !matches!(c.status, NodeStatus::Unchanged))
+        .collect();
+    assert_eq!(
+        changed_children.len(),
+        1,
+        "expected exactly 1 changed list item, got {}",
+        changed_children.len()
+    );
+    assert!(
+        matches!(changed_children[0].status, NodeStatus::Modified(_)),
+        "changed item should be Modified (word diff), got {:?}",
+        changed_children[0].status
+    );
 }
 
 #[test]
