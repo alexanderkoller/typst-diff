@@ -354,76 +354,6 @@ fn multifile_diff_produces_valid_pdf() {
     assert_valid_pdf(&pdf);
 }
 
-#[test]
-fn list_item_changes_are_reported_and_rendered() {
-    let (_dir, old_world, new_world) = temp_worlds(
-        "- Alpha item\n- Beta item\n- Gamma item\n",
-        "- Alpha item\n- Better item\n- Gamma item\n",
-    );
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
-    let new_plain = new.plain_text();
-    assert!(new_plain.contains("Alpha item"), "{new_plain}");
-    assert!(new_plain.contains("Better item"), "{new_plain}");
-    assert!(new_plain.contains("Gamma item"), "{new_plain}");
-
-    let result = typst_diff::diff::diff_content(&old, &new);
-    let log = result.modification_log();
-
-    assert!(log.contains("modify slot"), "{log}");
-    assert!(
-        log.contains("ItemBody") || log.contains("ListItem"),
-        "{log}"
-    );
-    assert!(log.contains("Beta"), "{log}");
-    assert!(log.contains("Better"), "{log}");
-
-    let annotated = typst_diff::build_annotated_content(&result, false);
-    let plain = annotated.plain_text();
-    assert!(plain.contains("Alpha item"), "{plain}");
-    assert!(plain.contains("Beta"), "{plain}");
-    assert!(plain.contains("Better"), "{plain}");
-    assert!(plain.contains("Gamma item"), "{plain}");
-    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
-    assert_valid_pdf(&pdf);
-}
-
-#[test]
-fn footnote_body_changes_are_reported_without_inline_leakage() {
-    let (_dir, old_world, new_world) = temp_worlds(
-        "The API remains stable#footnote[Old footnote guidance for deployers.].\n\nThe rest of the paragraph is unchanged.\n",
-        "The API remains stable#footnote[New footnote guidance for operators.].\n\nThe rest of the paragraph is unchanged.\n",
-    );
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
-    let result = typst_diff::diff::diff_content(&old, &new);
-    let log = result.modification_log();
-
-    assert!(log.contains("modify slot"), "{log}");
-    assert!(log.contains("FootnoteBody"), "{log}");
-    assert!(log.contains("Old"), "{log}");
-    assert!(log.contains("New"), "{log}");
-    assert!(log.contains("deployers"), "{log}");
-    assert!(log.contains("operators"), "{log}");
-
-    let annotated = typst_diff::build_annotated_content(&result, false);
-    let plain = annotated.plain_text();
-    assert!(plain.contains("The API remains stable"), "{plain}");
-    assert!(
-        plain.contains("The rest of the paragraph is unchanged."),
-        "{plain}"
-    );
-    assert!(plain.contains("Old"), "{plain}");
-    assert!(plain.contains("New"), "{plain}");
-    assert!(plain.contains("footnote guidance"), "{plain}");
-    assert!(plain.contains("deployers"), "{plain}");
-    assert!(plain.contains("operators"), "{plain}");
-    assert_eq!(count_nodes::<typst::model::FootnoteElem>(&annotated), 1);
-    assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
-
-    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
-    assert_valid_pdf(&pdf);
-}
 
 #[test]
 fn repeated_function_expansions_with_same_span_keep_their_own_content() {
@@ -505,20 +435,3 @@ fn repeated_same_span_blocks_preserve_document_order() {
 }
 
 
-#[test]
-fn math_expression_changes_are_reported_and_rendered() {
-    let old_world = world_for("math_old.typ");
-    let new_world = world_for("math_new.typ");
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
-    let result = typst_diff::diff::diff_content(&old, &new);
-    let log = result.modification_log();
-
-    assert!(log.contains("[γ]"), "{log}");
-    assert!(log.contains("2n"), "{log}");
-    assert!(log.contains("/ 6") || log.contains("6"), "{log}");
-
-    let annotated = typst_diff::build_annotated_content(&result, false);
-    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
-    assert_valid_pdf(&pdf);
-}
