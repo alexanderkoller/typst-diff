@@ -34,6 +34,7 @@ use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
+use crate::annotated::{AnnotatedContent, Annotation};
 use crate::content_slots::{ContentSlot, SlotStep, extract_slots};
 
 /// A block-level unit of content together with the page styles active at its position.
@@ -783,7 +784,7 @@ fn edit_distance_with_limit(a: &str, b: &str, max_distance: usize) -> Option<usi
 }
 
 /// A word-level diff operation over [`Token`] sequences.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WordOp {
     Equal(Vec<Token>),
     Delete(Vec<Token>),
@@ -962,7 +963,7 @@ pub enum DiffResultOp {
 
 /// The complete diff of two documents: a sequence of per-block operations and the
 /// root page styles from the new document (used to wrap the final annotated content).
-pub struct DiffResult {
+pub struct DiffResultFlat {
     pub block_ops: Vec<DiffResultOp>,
     pub root_styles: Styles,
 }
@@ -980,7 +981,7 @@ pub struct SlotDiff {
     pub ops: Vec<DiffResultOp>,
 }
 
-impl DiffResult {
+impl DiffResultFlat {
     pub fn modification_log(&self) -> String {
         let mut log = String::new();
         log_ops(&mut log, &[], &self.block_ops);
@@ -1108,7 +1109,7 @@ fn single_line(text: &str) -> String {
     result.trim().to_string()
 }
 
-pub fn diff_content(old: &Content, new: &Content) -> DiffResult {
+pub fn diff_content(old: &Content, new: &Content) -> DiffResultFlat {
     let old_blocks = extract_block_units(old);
     let new_blocks = extract_block_units(new);
     let raw = diff_block_units_raw(&old_blocks, &new_blocks);
@@ -1139,7 +1140,7 @@ pub fn diff_content(old: &Content, new: &Content) -> DiffResult {
         })
         .collect();
 
-    DiffResult {
+    DiffResultFlat {
         block_ops,
         root_styles: root_page_styles(new),
     }
@@ -1264,6 +1265,191 @@ fn is_page_style(style: &Style) -> bool {
         .is_some_and(|element| element == PageElem::ELEM)
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Tree-shaped diff types
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Tree-shaped diff result.
+pub struct DiffResult {
+    pub blocks: Vec<DiffNode>,
+    pub root_styles: Styles,
+}
+
+pub struct DiffNode {
+    pub node: AnnotatedContent,
+    pub status: NodeStatus,
+    /// Per-slot children, populated when status is `HasChangedDescendants`.
+    pub children: Vec<DiffNode>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeStatus {
+    Unchanged,
+    HasChangedDescendants,
+    Deleted,
+    Inserted,
+    Modified(Vec<WordOp>),
+}
+
+impl DiffResult {
+    pub fn modification_log(&self) -> String {
+        let mut log = String::new();
+        for (index, node) in self.blocks.iter().enumerate() {
+            log_diff_node(&mut log, node, index);
+        }
+        log
+    }
+}
+
+fn log_diff_node(log: &mut String, node: &DiffNode, index: usize) {
+    match &node.status {
+        NodeStatus::Unchanged => {}
+        NodeStatus::Deleted => push_log_entry(
+            log,
+            index,
+            "delete",
+            &[("text", node.node.realized.plain_text().to_string())],
+        ),
+        NodeStatus::Inserted => push_log_entry(
+            log,
+            index,
+            "insert",
+            &[("text", node.node.realized.plain_text().to_string())],
+        ),
+        NodeStatus::Modified(word_ops) => {
+            let deletes = collect_word_op_text(word_ops, |op| match op {
+                WordOp::Delete(t) => Some(t),
+                _ => None,
+            });
+            let inserts = collect_word_op_text(word_ops, |op| match op {
+                WordOp::Insert(t) => Some(t),
+                _ => None,
+            });
+            push_log_entry(
+                log,
+                index,
+                "modify",
+                &[
+                    ("block", node.node.realized.plain_text().to_string()),
+                    ("deleted", deletes),
+                    ("inserted", inserts),
+                ],
+            );
+        }
+        NodeStatus::HasChangedDescendants => {
+            for (ci, child) in node.children.iter().enumerate() {
+                log_diff_node(log, child, ci);
+            }
+        }
+    }
+}
+
+pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
+    let flat = diff_content(&old.realized, &new.realized);
+    let blocks = flat
+        .block_ops
+        .into_iter()
+        .map(|op| diff_result_op_to_node(op, new))
+        .collect();
+    DiffResult {
+        blocks,
+        root_styles: flat.root_styles,
+    }
+}
+
+fn diff_result_op_to_node(op: DiffResultOp, new_ac: &AnnotatedContent) -> DiffNode {
+    match op {
+        DiffResultOp::Equal(block) => DiffNode {
+            node: find_or_wrap_annotated(&block.content, new_ac),
+            status: NodeStatus::Unchanged,
+            children: vec![],
+        },
+        DiffResultOp::Deleted(block) => DiffNode {
+            node: AnnotatedContent {
+                realized: block.content.clone(),
+                annotation: Annotation::default(),
+                children: vec![],
+            },
+            status: NodeStatus::Deleted,
+            children: vec![],
+        },
+        DiffResultOp::Inserted(block) => DiffNode {
+            node: find_or_wrap_annotated(&block.content, new_ac),
+            status: NodeStatus::Inserted,
+            children: vec![],
+        },
+        DiffResultOp::Modified(block, word_ops) => DiffNode {
+            node: find_or_wrap_annotated(&block.content, new_ac),
+            status: NodeStatus::Modified(word_ops),
+            children: vec![],
+        },
+        DiffResultOp::ModifiedSlots(block, slot_diffs) => {
+            let node = find_or_wrap_annotated(&block.content, new_ac);
+            let children = slot_diffs
+                .into_iter()
+                .map(|sd| DiffNode {
+                    node: AnnotatedContent {
+                        realized: sd
+                            .ops
+                            .iter()
+                            .find_map(|op| match op {
+                                DiffResultOp::Modified(b, _) => Some(b.content.clone()),
+                                DiffResultOp::Equal(b) => Some(b.content.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| TextElem::packed("")),
+                        annotation: Annotation::default(),
+                        children: vec![],
+                    },
+                    status: NodeStatus::HasChangedDescendants,
+                    children: vec![],
+                })
+                .collect();
+            DiffNode {
+                node,
+                status: NodeStatus::HasChangedDescendants,
+                children,
+            }
+        }
+    }
+}
+
+fn find_or_wrap_annotated(content: &Content, root: &AnnotatedContent) -> AnnotatedContent {
+    fn find(node: &AnnotatedContent, target: &Content) -> Option<AnnotatedContent> {
+        if &node.realized == target {
+            return Some(AnnotatedContent {
+                realized: node.realized.clone(),
+                annotation: Annotation {
+                    semantic_kind: node.annotation.semantic_kind.clone(),
+                    slots: node.annotation.slots.clone(),
+                    footnote: None,
+                    span: node.annotation.span,
+                },
+                children: node
+                    .children
+                    .iter()
+                    .map(|c| AnnotatedContent {
+                        realized: c.realized.clone(),
+                        annotation: Annotation {
+                            semantic_kind: c.annotation.semantic_kind.clone(),
+                            slots: c.annotation.slots.clone(),
+                            footnote: None,
+                            span: c.annotation.span,
+                        },
+                        children: vec![],
+                    })
+                    .collect(),
+            });
+        }
+        node.children.iter().find_map(|child| find(child, target))
+    }
+    find(root, content).unwrap_or_else(|| AnnotatedContent {
+        realized: content.clone(),
+        annotation: Annotation::default(),
+        children: vec![],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,6 +1458,19 @@ mod tests {
 
     fn seq(items: impl IntoIterator<Item = Content>) -> Content {
         Content::sequence(items)
+    }
+
+    #[test]
+    fn diff_unchanged_document_produces_all_unchanged_nodes() {
+        use crate::annotated::{AnnotatedContent, Annotation};
+        let content_a = TextElem::packed("Same text.");
+        let node_a = AnnotatedContent {
+            realized: content_a.clone(),
+            annotation: Annotation::default(),
+            children: vec![],
+        };
+        let result = diff_annotated(&node_a, &node_a);
+        assert!(result.blocks.iter().all(|n| matches!(n.status, NodeStatus::Unchanged)));
     }
 
     // --- extract_blocks tests ---

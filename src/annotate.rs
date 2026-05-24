@@ -1,4 +1,4 @@
-//! Convert a [`DiffResult`] into an annotated Typst [`Content`] tree ready for rendering.
+//! Convert a [`DiffResultFlat`] into an annotated Typst [`Content`] tree ready for rendering.
 //!
 //! # Colour conventions
 //!
@@ -26,7 +26,7 @@ use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
 use crate::content_slots::{extract_slots, replace_slot};
-use crate::diff::{DiffBlock, DiffResult, DiffResultOp, WordOp};
+use crate::diff::{DiffBlock, DiffResultFlat, DiffResultOp, WordOp};
 
 fn green() -> Color {
     Color::from_u8(0, 180, 0, 255)
@@ -38,12 +38,12 @@ fn blue() -> Color {
     Color::from_u8(0, 100, 220, 255)
 }
 
-/// Build the annotated document from a [`DiffResult`].
+/// Build the annotated document from a [`DiffResultFlat`].
 ///
 /// `compact_substitutions`: when `true`, substitution pairs (adjacent delete+insert)
 /// are shown as blue insertions only — the red strikethrough is suppressed. Useful
 /// for authors who want to see "what it says now" without visual noise from deleted text.
-pub fn build_annotated_content(result: &DiffResult, compact_substitutions: bool) -> Content {
+pub fn build_annotated_content(result: &DiffResultFlat, compact_substitutions: bool) -> Content {
     let mut groups: Vec<Content> = Vec::new();
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles = None;
@@ -341,7 +341,7 @@ fn replace_modified_slots(
 mod tests {
     use super::*;
     use crate::content_slots::SlotStep;
-    use crate::diff::{DiffResult, DiffResultOp, SlotDiff, Token, WordOp};
+    use crate::diff::{DiffResultFlat, DiffResultOp, SlotDiff, Token, WordOp};
     use typst::foundations::{NativeElement, Packed};
     use typst::model::{HeadingElem, ListElem, ListItem};
     use typst::text::TextElem;
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn inserted_block_wrapped_green() {
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::Inserted(block(TextElem::packed(
                 "New paragraph",
             )))],
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn modified_block_contains_strike_for_deletion() {
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::Modified(
                 block(TextElem::packed("The new text.")),
                 vec![
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn deleted_heading_keeps_heading_formatting() {
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::Deleted(block(Content::new(
                 HeadingElem::new(TextElem::packed("Old heading")),
             )))],
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn compact_substitutions_drop_deleted_text_and_color_inserted_text() {
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::Modified(
                 block(TextElem::packed("The new text.")),
                 vec![
@@ -489,7 +489,7 @@ mod tests {
     #[test]
     fn modified_heading_preserves_heading_element() {
         let heading = Content::new(HeadingElem::new(TextElem::packed("New heading")));
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::Modified(
                 block(heading),
                 vec![
@@ -515,7 +515,7 @@ mod tests {
             Packed::new(ListItem::new(TextElem::packed("Better"))),
             Packed::new(ListItem::new(TextElem::packed("Gamma"))),
         ]));
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::ModifiedSlots(
                 block(list),
                 vec![SlotDiff {
@@ -555,7 +555,7 @@ mod tests {
                 TextElem::packed("New value"),
             )))),
         ]));
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::ModifiedSlots(
                 block(table),
                 vec![SlotDiff {
@@ -592,7 +592,7 @@ mod tests {
             Packed::new(ListItem::new(inner.clone())),
             Packed::new(ListItem::new(TextElem::packed("Stable"))),
         ]));
-        let result = DiffResult {
+        let result = DiffResultFlat {
             block_ops: vec![DiffResultOp::ModifiedSlots(
                 block(outer_list),
                 vec![SlotDiff {
