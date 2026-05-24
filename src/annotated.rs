@@ -348,10 +348,61 @@ pub fn collect_leaf_block_children(content: &Content) -> Vec<Content> {
     vec![content.clone()]
 }
 
-// Stub mappers — to be implemented in Tasks 3/4.
-fn map_list_to_children(_pre: &Content, _realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) { (vec![], vec![]) }
-fn map_enum_to_children(_pre: &Content, _realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) { (vec![], vec![]) }
-fn map_terms_to_children(_pre: &Content, _realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) { (vec![], vec![]) }
+fn map_list_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
+    let Some(list) = pre.to_packed::<ListElem>() else { return (vec![], vec![]); };
+    let realized_children = collect_leaf_block_children(realized);
+    if realized_children.len() != list.children.len() {
+        return (vec![], vec![]);
+    }
+    let children: Vec<AnnotatedContent> = list.children.iter()
+        .zip(realized_children.iter())
+        .map(|(item, real)| annotate_realized(&item.body, real))
+        .collect();
+    let slots: Vec<SemanticSlot> = (0..list.children.len())
+        .map(|i| SemanticSlot { label: SlotStep::ListItem(i), child_index: i })
+        .collect();
+    (children, slots)
+}
+
+fn map_enum_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
+    let Some(enm) = pre.to_packed::<EnumElem>() else { return (vec![], vec![]); };
+    let realized_children = collect_leaf_block_children(realized);
+    if realized_children.len() != enm.children.len() {
+        return (vec![], vec![]);
+    }
+    let children: Vec<AnnotatedContent> = enm.children.iter()
+        .zip(realized_children.iter())
+        .map(|(item, real)| annotate_realized(&item.body, real))
+        .collect();
+    let slots: Vec<SemanticSlot> = (0..enm.children.len())
+        .map(|i| SemanticSlot { label: SlotStep::EnumItem(i), child_index: i })
+        .collect();
+    (children, slots)
+}
+
+fn map_terms_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
+    let Some(terms) = pre.to_packed::<TermsElem>() else { return (vec![], vec![]); };
+    // Each term item contributes 2 slots: term + description.
+    // Expected realized children count = 2 * items.len()
+    let realized_children = collect_leaf_block_children(realized);
+    let expected = terms.children.len() * 2;
+    if realized_children.len() != expected {
+        return (vec![], vec![]);
+    }
+    let mut children = Vec::new();
+    let mut slots = Vec::new();
+    for (i, item) in terms.children.iter().enumerate() {
+        let term_real = &realized_children[i * 2];
+        let desc_real = &realized_children[i * 2 + 1];
+        slots.push(SemanticSlot { label: SlotStep::Term(i), child_index: children.len() });
+        children.push(annotate_realized(&item.term, term_real));
+        slots.push(SemanticSlot { label: SlotStep::TermDescription(i), child_index: children.len() });
+        children.push(annotate_realized(&item.description, desc_real));
+    }
+    (children, slots)
+}
+
+// Stub mappers — to be implemented in Task 4.
 fn map_table_to_children(_pre: &Content, _realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) { (vec![], vec![]) }
 fn map_grid_to_children(_pre: &Content, _realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) { (vec![], vec![]) }
 fn map_stack_to_children(_pre: &Content, _realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) { (vec![], vec![]) }
@@ -431,5 +482,83 @@ mod tests {
         let realized_clone = realized.clone();
         let node = annotate_realized(&pre, &realized);
         assert_eq!(node.realized, realized_clone);
+    }
+
+    #[test]
+    fn annotate_list_maps_each_item_body_to_a_realized_child() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let pre = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(text("Alpha"))),
+            Packed::new(ListItem::new(text("Beta"))),
+            Packed::new(ListItem::new(text("Gamma"))),
+        ]));
+        // Simulate realized form: a sequence of item bodies (simplified)
+        let realized = seq([text("Alpha"), text("Beta"), text("Gamma")]);
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
+        assert_eq!(node.annotation.slots.len(), 3);
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::ListItem(0)));
+        assert_eq!(node.annotation.slots[0].child_index, 0);
+        assert!(matches!(node.annotation.slots[2].label, SlotStep::ListItem(2)));
+        assert_eq!(node.children[0].realized.plain_text(), "Alpha");
+        assert_eq!(node.children[2].realized.plain_text(), "Gamma");
+    }
+
+    #[test]
+    fn annotate_list_falls_back_to_no_slots_on_item_count_mismatch() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let pre = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(text("Alpha"))),
+        ]));
+        let realized = seq([text("Alpha"), text("extra")]); // 2 realized children, 1 pre item
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
+        assert!(node.annotation.slots.is_empty(), "slot count mismatch must produce no slots");
+    }
+
+    #[test]
+    fn annotate_enum_maps_each_item_body_to_a_realized_child() {
+        use typst::foundations::Packed;
+        use typst::model::{EnumElem, EnumItem};
+
+        let pre = Content::new(EnumElem::new(vec![
+            Packed::new(EnumItem::new(text("One"))),
+            Packed::new(EnumItem::new(text("Two"))),
+        ]));
+        let realized = seq([text("One"), text("Two")]);
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Enum));
+        assert_eq!(node.annotation.slots.len(), 2);
+        assert!(matches!(node.annotation.slots[0].label, SlotStep::EnumItem(0)));
+        assert!(matches!(node.annotation.slots[1].label, SlotStep::EnumItem(1)));
+        assert_eq!(node.children[1].realized.plain_text(), "Two");
+    }
+
+    #[test]
+    fn annotate_terms_maps_term_and_description_separately() {
+        use typst::foundations::Packed;
+        use typst::model::{TermsElem, TermItem};
+
+        let pre = Content::new(TermsElem::new(vec![
+            Packed::new(TermItem::new(text("API"), text("Definition"))),
+        ]));
+        // Realized: 2 children for 1 term (term + description)
+        let realized = seq([text("API"), text("Definition")]);
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Terms));
+        assert_eq!(node.annotation.slots.len(), 2);
+        let labels: Vec<String> = node.annotation.slots.iter()
+            .map(|s| format!("{:?}", s.label))
+            .collect();
+        assert!(labels[0].contains("Term(0)"), "{labels:?}");
+        assert!(labels[1].contains("TermDescription(0)"), "{labels:?}");
     }
 }
