@@ -1385,6 +1385,9 @@ fn diff_result_op_to_node(op: DiffResultOp, new_ac: &AnnotatedContent) -> DiffNo
         },
         DiffResultOp::ModifiedSlots(block, slot_diffs) => {
             let node = find_or_wrap_annotated(&block.content, new_ac);
+            // Phase A scaffolding: each SlotDiff's `path` is discarded and child nodes are
+            // approximated from the ops. Slot identity will be wired from `annotation.slots`
+            // in Phase B.
             let children = slot_diffs
                 .into_iter()
                 .map(|sd| DiffNode {
@@ -1422,6 +1425,8 @@ fn find_or_wrap_annotated(content: &Content, root: &AnnotatedContent) -> Annotat
                 annotation: Annotation {
                     semantic_kind: node.annotation.semantic_kind.clone(),
                     slots: node.annotation.slots.clone(),
+                    // Intentionally None: footnote info is attached in a post-pass and is
+                    // not needed by the tree-diff path in Phase A.
                     footnote: None,
                     span: node.annotation.span,
                 },
