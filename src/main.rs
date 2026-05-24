@@ -1,4 +1,4 @@
-use typst_diff::{build_annotated_content, diff, eval_to_realized_content, render_to_pdf, world};
+use typst_diff::{annotate, diff, eval_to_realized_content, render_to_pdf, world};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -47,14 +47,14 @@ fn main() -> Result<()> {
 
     eprintln!("Evaluating old document...");
     let old_content =
-        eval_to_realized_content(&old_world).context("failed to evaluate old document")?.realized;
+        eval_to_realized_content(&old_world).context("failed to evaluate old document")?;
 
     eprintln!("Evaluating new document...");
     let new_content =
-        eval_to_realized_content(&new_world).context("failed to evaluate new document")?.realized;
+        eval_to_realized_content(&new_world).context("failed to evaluate new document")?;
 
     eprintln!("Diffing...");
-    let diff_result = diff::diff_content(&old_content, &new_content);
+    let diff_result = diff::diff_annotated(&old_content, &new_content);
     if let Some(path) = &args.log_modifications {
         std::fs::write(path, diff_result.modification_log())
             .with_context(|| format!("failed to write modification log {:?}", path))?;
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     }
 
     eprintln!("Annotating...");
-    let annotated = build_annotated_content(&diff_result, args.compact_substitutions);
+    let annotated = annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
 
     eprintln!("Rendering to PDF...");
     let pdf_bytes = render_to_pdf(&annotated, &new_world).context("failed to render PDF")?;

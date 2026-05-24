@@ -26,7 +26,7 @@ use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
 use crate::content_slots::{extract_slots, replace_slot};
-use crate::diff::{DiffBlock, DiffResultFlat, DiffResultOp, WordOp};
+use crate::diff::{DiffBlock, DiffNode, DiffResultFlat, DiffResultOp, NodeStatus, WordOp};
 
 fn green() -> Color {
     Color::from_u8(0, 180, 0, 255)
@@ -318,6 +318,102 @@ fn apply_fill_inside(content: &Content, fill: Color) -> Content {
         let colored = slot.content.styled(TextElem::fill.set(fill.into()));
         if let Some(next) = replace_slot(&result, &slot.path, colored) {
             result = next;
+        }
+    }
+    result
+}
+
+/// Build annotated content from the new tree-shaped [`crate::diff::DiffResult`].
+pub fn build_annotated_content_from_tree(
+    result: &crate::diff::DiffResult,
+    compact_substitutions: bool,
+) -> Content {
+    let mut groups: Vec<Content> = Vec::new();
+    let mut current_blocks: Vec<Content> = Vec::new();
+    let mut current_page_styles: Option<typst::foundations::Styles> = None;
+
+    // The grouping loop below is structurally complete, but in Phase A every block carries
+    // default page styles (see `annotate_single_node`), so `flush_group` is never triggered
+    // and the entire document lands in a single group.
+    for annotated_block in annotate_diff_nodes(&result.blocks, compact_substitutions) {
+        if current_page_styles
+            .as_ref()
+            .is_some_and(|s| s != &annotated_block.page_styles)
+        {
+            flush_group(&mut groups, &mut current_blocks, current_page_styles.take());
+        }
+        current_page_styles.get_or_insert_with(|| annotated_block.page_styles.clone());
+        current_blocks.push(annotated_block.content);
+    }
+    flush_group(&mut groups, &mut current_blocks, current_page_styles);
+    Content::sequence(groups).styled_with_map(result.root_styles.clone())
+}
+
+fn annotate_diff_nodes(nodes: &[DiffNode], compact: bool) -> Vec<DiffBlock> {
+    nodes.iter().map(|node| annotate_single_node(node, compact)).collect()
+}
+
+fn annotate_single_node(node: &DiffNode, compact: bool) -> DiffBlock {
+    // Phase A: `DiffNode` does not carry per-block page styles, so every block gets the
+    // default. A later phase will plumb page styles through `DiffNode` and enable real
+    // multi-group output from `build_annotated_content_from_tree`.
+    let page_styles = Default::default();
+    match &node.status {
+        NodeStatus::Unchanged => DiffBlock {
+            content: node.node.realized.clone(),
+            page_styles,
+        },
+        NodeStatus::Inserted => DiffBlock {
+            content: if node.node.realized.plain_text().is_empty() {
+                node.node.realized.clone()
+            } else {
+                apply_fill_inside(&node.node.realized, green())
+            },
+            page_styles,
+        },
+        NodeStatus::Deleted => {
+            let colored = plain_content(&node.node.realized)
+                .styled(TextElem::fill.set(red().into()));
+            let struck = Content::new(StrikeElem::new(colored));
+            DiffBlock {
+                content: replace_text_container(&node.node.realized, &struck)
+                    .unwrap_or(struck),
+                page_styles,
+            }
+        }
+        NodeStatus::Modified(word_ops) => {
+            let inline = annotated_inline_content(word_ops, compact);
+            DiffBlock {
+                content: replace_text_container(&node.node.realized, &inline)
+                    .unwrap_or(inline),
+                page_styles,
+            }
+        }
+        NodeStatus::HasChangedDescendants => {
+            let content = apply_changed_descendants(&node.node, &node.children, compact);
+            DiffBlock { content, page_styles }
+        }
+    }
+}
+
+fn apply_changed_descendants(
+    node: &crate::annotated::AnnotatedContent,
+    children: &[DiffNode],
+    compact: bool,
+) -> Content {
+    let mut result = node.realized.clone();
+    for diff_child in children {
+        let slot = node.annotation.slots.iter().find(|s| {
+            s.child_index < node.children.len()
+                && node.children[s.child_index].realized == diff_child.node.realized
+        });
+        if let Some(s) = slot {
+            let new_content = annotate_single_node(diff_child, compact).content;
+            if let Some(next) =
+                replace_slot(&result, &[s.label.clone()], new_content)
+            {
+                result = next;
+            }
         }
     }
     result
@@ -695,6 +791,28 @@ mod tests {
             "inserted ParbreakElem must remain bare, not wrapped in StyledElem, got: {:?}",
             blocks[0].content.func().name()
         );
+    }
+
+    #[test]
+    fn annotate_walks_diff_node_tree_and_emits_colors_at_correct_status() {
+        use crate::annotated::{AnnotatedContent, Annotation};
+        use crate::diff::{DiffNode, DiffResult, NodeStatus};
+
+        let node = DiffNode {
+            node: AnnotatedContent {
+                realized: TextElem::packed("new text"),
+                annotation: Annotation::default(),
+                children: vec![],
+            },
+            status: NodeStatus::Inserted,
+            children: vec![],
+        };
+        let result = DiffResult {
+            blocks: vec![node],
+            root_styles: Default::default(),
+        };
+        let content = build_annotated_content_from_tree(&result, false);
+        assert!(!content.is_empty());
     }
 
     #[test]
