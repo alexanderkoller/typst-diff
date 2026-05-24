@@ -119,8 +119,8 @@ fn max_style_count_for_text(content: &Content, needle: &str) -> usize {
 fn annotated_corpus(name: &str) -> Content {
     let old_world = corpus_world(&format!("{name}/old.typ"));
     let new_world = corpus_world(&format!("{name}/new.typ"));
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let result = typst_diff::diff::diff_content(&old, &new);
     typst_diff::build_annotated_content(&result, false)
 }
@@ -129,8 +129,8 @@ fn annotated_corpus(name: &str) -> Content {
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
     let new_world = world_for("simple_new.typ");
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let result = typst_diff::diff::diff_content(&old, &new);
     let annotated = typst_diff::build_annotated_content(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
@@ -389,8 +389,8 @@ fn list_item_changes_are_reported_and_rendered() {
         "- Alpha item\n- Beta item\n- Gamma item\n",
         "- Alpha item\n- Better item\n- Gamma item\n",
     );
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let new_plain = new.plain_text();
     assert!(new_plain.contains("Alpha item"), "{new_plain}");
     assert!(new_plain.contains("Better item"), "{new_plain}");
@@ -423,8 +423,8 @@ fn footnote_body_changes_are_reported_without_inline_leakage() {
         "The API remains stable#footnote[Old footnote guidance for deployers.].\n\nThe rest of the paragraph is unchanged.\n",
         "The API remains stable#footnote[New footnote guidance for operators.].\n\nThe rest of the paragraph is unchanged.\n",
     );
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let result = typst_diff::diff::diff_content(&old, &new);
     let log = result.modification_log();
 
@@ -458,8 +458,8 @@ fn footnote_body_changes_are_reported_without_inline_leakage() {
 fn repeated_function_expansions_with_same_span_keep_their_own_content() {
     let old_world = corpus_world("39-fn-content-args-changed/old.typ");
     let new_world = corpus_world("39-fn-content-args-changed/new.typ");
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
 
     let new_plain = new.plain_text();
     assert!(new_plain.contains("Definition 1"), "{new_plain}");
@@ -515,7 +515,7 @@ fn repeated_same_span_blocks_preserve_document_order() {
 "#,
     );
 
-    let content = typst_diff::eval_to_realized_content(&world).unwrap();
+    let content = typst_diff::eval_to_realized_content(&world).unwrap().realized;
     let plain = content.plain_text();
     assert_contains_in_order(
         &plain,
@@ -562,8 +562,8 @@ fn repeated_same_span_blocks_diff_only_changed_invocations() {
 "#,
     );
 
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let result = typst_diff::diff::diff_content(&old, &new);
     let log = result.modification_log();
 
@@ -637,8 +637,8 @@ fn repeated_same_span_nested_slots_keep_separate_children() {
 "#,
     );
 
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let new_plain = new.plain_text();
     assert_contains_in_order(
         &new_plain,
@@ -713,8 +713,8 @@ fn repeated_same_span_table_wrappers_preserve_cell_identity() {
 "#,
     );
 
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let new_plain = new.plain_text();
     assert_contains_in_order(&new_plain, &["North", "47 ms", "South", "18 ms"]);
 
@@ -769,8 +769,8 @@ fn figure_caption_changes_are_reported_and_rendered() {
 fn math_expression_changes_are_reported_and_rendered() {
     let old_world = world_for("math_old.typ");
     let new_world = world_for("math_new.typ");
-    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap().realized;
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap().realized;
     let result = typst_diff::diff::diff_content(&old, &new);
     let log = result.modification_log();
 

@@ -78,11 +78,17 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
 /// 5. Restore pre-realization `EquationElem` and slot-container nodes by span.
 /// 6. Restore original `FootnoteElem` nodes (realization replaces them with markers).
 ///
-/// The returned `Content` is what `diff::diff_content` operates on.
-pub fn eval_to_realized_content(world: &dyn World) -> Result<Content> {
-    let content = normalize_list_item_runs(eval_to_content(world)?);
-    let introspector = layout_introspector(world, &content)?;
-    realize_to_content(world, &content, introspector)
+/// The returned `AnnotatedContent` wraps the realized `Content` with semantic
+/// annotations built by walking the pre- and post-realization trees together.
+pub fn eval_to_realized_content(world: &dyn World) -> Result<crate::annotated::AnnotatedContent> {
+    let pre_content = normalize_list_item_runs(eval_to_content(world)?);
+    let introspector = layout_introspector(world, &pre_content)?;
+    let realized_content = realize_to_content(world, &pre_content, introspector)?;
+    let mut annotated = crate::annotated::annotate_realized(&pre_content, &realized_content);
+    let footnotes = collect_footnotes(&pre_content);
+    let mut next = 0;
+    crate::annotated::annotate_footnote_markers(&mut annotated, &footnotes, &mut next);
+    Ok(annotated)
 }
 
 /// Run layout up to 5 times until the [`Introspector`] converges.
@@ -443,6 +449,16 @@ mod tests {
     use typst::model::{FootnoteBody, ListElem, ListItem};
     use typst::text::TextElem;
     use typst::visualize::Color;
+
+    #[test]
+    fn eval_to_realized_content_returns_annotated_content_with_realized_field() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "Hello *world*.").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let annotated = eval_to_realized_content(&world).unwrap();
+        assert!(annotated.realized.plain_text().contains("Hello"));
+        assert!(annotated.realized.plain_text().contains("world"));
+    }
 
     #[test]
     fn eval_extracts_text_nodes() {

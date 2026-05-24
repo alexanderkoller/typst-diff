@@ -47,11 +47,11 @@ fn main() -> Result<()> {
 
     eprintln!("Evaluating old document...");
     let old_content =
-        eval_to_realized_content(&old_world).context("failed to evaluate old document")?;
+        eval_to_realized_content(&old_world).context("failed to evaluate old document")?.realized;
 
     eprintln!("Evaluating new document...");
     let new_content =
-        eval_to_realized_content(&new_world).context("failed to evaluate new document")?;
+        eval_to_realized_content(&new_world).context("failed to evaluate new document")?.realized;
 
     eprintln!("Diffing...");
     let diff_result = diff::diff_content(&old_content, &new_content);
