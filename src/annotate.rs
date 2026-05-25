@@ -560,12 +560,12 @@ fn replace_annotated_path_content(
     let Some((index, rest)) = path.split_first() else {
         return Some(replacement);
     };
-    let surface = render_surface(node);
-    let surface_child = container_ops::realized_child_contents(surface)
+    let surface = patchable_surface_for_index(node, *index)?;
+    let surface_child = container_ops::realized_child_contents(&surface)
         .get(*index)
         .cloned()?;
     let replaced_child = replace_content_path(&surface_child, rest, replacement)?;
-    container_ops::replace_realized_child(surface, *index, replaced_child)
+    container_ops::replace_realized_child(&surface, *index, replaced_child)
 }
 
 fn replace_content_path(
@@ -628,6 +628,21 @@ fn render_surface(node: &crate::annotated::AnnotatedContent) -> &Content {
         .patch_surface
         .as_ref()
         .unwrap_or(&node.realized)
+}
+
+fn patchable_surface_for_index(
+    node: &crate::annotated::AnnotatedContent,
+    index: usize,
+) -> Option<Content> {
+    let surface = render_surface(node);
+    if container_ops::realized_child_contents(surface)
+        .get(index)
+        .is_some()
+    {
+        return Some(surface.clone());
+    }
+    (index < node.children.len())
+        .then(|| Content::sequence(node.children.iter().map(effective_realized_content)))
 }
 
 #[cfg(test)]

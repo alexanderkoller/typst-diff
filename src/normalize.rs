@@ -34,6 +34,28 @@ pub(crate) fn normalize_list_item_runs(content: Content) -> Content {
         return content;
     }
 
+    if let Some(list) = content.to_packed_mut::<ListElem>() {
+        for item in &mut list.children {
+            item.body = normalize_list_item_runs(item.body.clone());
+        }
+        return content;
+    }
+
+    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
+        for item in &mut enm.children {
+            item.body = normalize_list_item_runs(item.body.clone());
+        }
+        return content;
+    }
+
+    if let Some(terms) = content.to_packed_mut::<TermsElem>() {
+        for item in &mut terms.children {
+            item.term = normalize_list_item_runs(item.term.clone());
+            item.description = normalize_list_item_runs(item.description.clone());
+        }
+        return content;
+    }
+
     content
 }
 
@@ -190,5 +212,30 @@ mod tests {
 
         let normalized = normalize_list_item_runs(list);
         assert!(normalized.is::<ListElem>());
+    }
+
+    #[test]
+    fn normalize_recurses_into_existing_list_item_bodies() {
+        let body = Content::sequence([
+            TextElem::packed("Parent"),
+            Content::new(ListItem::new(TextElem::packed("Nested A"))),
+            Content::new(ListItem::new(TextElem::packed("Nested B"))),
+        ]);
+        let list = Content::new(ListElem::new(vec![Packed::new(ListItem::new(body))]));
+
+        let normalized = normalize_list_item_runs(list);
+        let list = normalized.to_packed::<ListElem>().unwrap();
+        let body = &list.children[0].body;
+        let body = body.to_packed::<SequenceElem>().unwrap();
+
+        assert!(body.children[1].is::<ListElem>());
+        assert_eq!(
+            body.children[1]
+                .to_packed::<ListElem>()
+                .unwrap()
+                .children
+                .len(),
+            2
+        );
     }
 }

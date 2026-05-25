@@ -215,6 +215,40 @@ fn collect_modified_word_texts(blocks: &[typst_diff::diff::DiffBlockEdit]) -> (S
     (deleted.join(" | "), inserted.join(" | "))
 }
 
+fn collect_modified_bases(blocks: &[typst_diff::diff::DiffBlockEdit]) -> Vec<String> {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    fn walk_content(content: &EditContent, bases: &mut Vec<String>) {
+        match content {
+            EditContent::Modified { base, .. } => bases.push(base.plain_text().to_string()),
+            EditContent::Nested { edits, .. } => {
+                for edit in edits {
+                    walk_edit(edit, bases);
+                }
+            }
+            EditContent::Inserted(_) | EditContent::Deleted(_) => {}
+        }
+    }
+
+    fn walk_edit(edit: &RealizedEdit, bases: &mut Vec<String>) {
+        match edit {
+            RealizedEdit::ReplaceAt { content, .. }
+            | RealizedEdit::InsertBefore { content, .. }
+            | RealizedEdit::InsertAfter { content, .. }
+            | RealizedEdit::Append { content }
+            | RealizedEdit::WholeBlock(content) => walk_content(content, bases),
+        }
+    }
+
+    let mut bases = Vec::new();
+    for block in blocks {
+        for edit in &block.edits {
+            walk_edit(edit, &mut bases);
+        }
+    }
+    bases
+}
+
 fn count_edits(
     blocks: &[typst_diff::diff::DiffBlockEdit],
     matches_edit: fn(&typst_diff::diff::RealizedEdit) -> bool,
@@ -816,12 +850,23 @@ fn nested_list_item_change_produces_nested_modified_child() {
 
     let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
     assert!(
-        deleted.contains("old description of mammals"),
-        "expected nested old description in deleted word ops, got {deleted:?}"
+        deleted.contains("old") && deleted.contains("mammals"),
+        "expected changed words from nested old description in deleted word ops, got {deleted:?}"
     );
     assert!(
-        inserted.contains("updated description of warm-blooded vertebrates"),
-        "expected nested updated description in inserted word ops, got {inserted:?}"
+        inserted.contains("updated") && inserted.contains("warm-blooded vertebrates"),
+        "expected changed words from nested updated description in inserted word ops, got {inserted:?}"
+    );
+
+    let bases = collect_modified_bases(&result.blocks);
+    assert!(
+        bases.iter().any(|base| base
+            == "Class: Mammalia (updated description of warm-blooded vertebrates)"),
+        "expected modified base at level-3 class item, got {bases:?}"
+    );
+    assert!(
+        bases.iter().all(|base| !base.contains("Phylum: Chordata")),
+        "diff should not widen to the level-2 phylum item, got {bases:?}"
     );
 }
 

@@ -594,6 +594,11 @@ mod tests {
         Content::sequence(items)
     }
 
+    fn contains_kind(node: &AnnotatedContent, kind: &SemanticKind) -> bool {
+        node.annotation.semantic_kind.as_ref() == Some(kind)
+            || node.children.iter().any(|child| contains_kind(child, kind))
+    }
+
     #[test]
     fn annotate_leaf_wraps_realized_verbatim() {
         let pre = text("hello");
@@ -714,6 +719,59 @@ mod tests {
         ));
         assert_eq!(node.children[0].realized.plain_text(), "Alpha");
         assert_eq!(node.children[2].realized.plain_text(), "Gamma");
+    }
+
+    #[test]
+    fn annotate_list_item_slot_preserves_nested_list_semantics() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let nested_items = seq([
+            text("Parent"),
+            Content::new(ListItem::new(text("Nested A"))),
+            Content::new(ListItem::new(text("Nested B"))),
+        ]);
+        let pre = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
+            nested_items,
+        ))]));
+        let node = annotate_realized(&pre, &pre);
+        let child = node.get_path(&node.annotation.slots[0].path).unwrap();
+
+        assert!(contains_kind(child, &SemanticKind::List));
+    }
+
+    #[test]
+    fn annotate_table_cell_slot_preserves_nested_list_semantics() {
+        use typst::foundations::Packed;
+        use typst::model::{ListItem, TableCell, TableChild, TableElem, TableItem};
+
+        let cell = seq([
+            Content::new(ListItem::new(text("Nested A"))),
+            Content::new(ListItem::new(text("Nested B"))),
+        ]);
+        let pre = Content::new(TableElem::new(vec![TableChild::Item(TableItem::Cell(
+            Packed::new(TableCell::new(cell)),
+        ))]));
+        let node = annotate_realized(&pre, &pre);
+        let child = node.get_path(&node.annotation.slots[0].path).unwrap();
+
+        assert!(contains_kind(child, &SemanticKind::List));
+    }
+
+    #[test]
+    fn annotate_wrapper_slot_preserves_nested_list_semantics() {
+        use typst::layout::{BlockBody, BlockElem};
+        use typst::model::ListItem;
+
+        let body = seq([
+            Content::new(ListItem::new(text("Nested A"))),
+            Content::new(ListItem::new(text("Nested B"))),
+        ]);
+        let pre = Content::new(BlockElem::new().with_body(Some(BlockBody::Content(body))));
+        let node = annotate_realized(&pre, &pre);
+        let child = node.get_path(&node.annotation.slots[0].path).unwrap();
+
+        assert!(contains_kind(child, &SemanticKind::List));
     }
 
     #[test]

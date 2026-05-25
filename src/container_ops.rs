@@ -9,6 +9,7 @@ use crate::annotated::{
     AnnotatedContent, Annotation, SemanticKind, SemanticSlot, SlotStep, WrapperKind,
     annotate_realized,
 };
+use crate::normalize::normalize_list_item_runs;
 use typst::foundations::{Content, Packed, SequenceElem, StyleChain, StyledElem};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridCell, GridChild, GridElem, GridItem,
@@ -704,9 +705,12 @@ pub(crate) fn insert_realized_child(
 fn map_slot_parts(
     pre_container: &Content,
     realized: &Content,
-    parts: Vec<SlotPart>,
+    mut parts: Vec<SlotPart>,
 ) -> SlotMapping {
     let realized_paths = collect_leaf_block_child_paths(realized);
+    if let Some(mapping) = map_unique_partial_item_container(pre_container, realized, &mut parts) {
+        return mapping;
+    }
     let use_pre_as_patch_surface = realized_paths.len() < parts.len();
     let patch_surface = if use_pre_as_patch_surface {
         patch_surface_for_opaque_realization(realized, pre_container)
@@ -728,7 +732,8 @@ fn map_slot_parts(
         if realized_child.plain_text().is_empty() && !part.pre_content.plain_text().is_empty() {
             realized_child = part.pre_content.clone();
         }
-        let replacement = annotate_realized(&part.pre_content, &realized_child);
+        let pre_content = normalize_list_item_runs(part.pre_content);
+        let replacement = annotate_realized(&pre_content, &realized_child);
         if replace_annotated_at_path(&mut tree, &path, replacement) {
             slots.push(SemanticSlot {
                 label: part.label,
@@ -741,6 +746,61 @@ fn map_slot_parts(
         patch_surface: tree.realized,
         children: tree.children,
         slots,
+    }
+}
+
+fn map_unique_partial_item_container(
+    pre_container: &Content,
+    realized: &Content,
+    parts: &mut Vec<SlotPart>,
+) -> Option<SlotMapping> {
+    let realized_text = realized.plain_text();
+    if realized_text.is_empty() {
+        return None;
+    }
+    let matches: Vec<usize> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            (part.pre_content.plain_text() == realized_text).then_some(index)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+
+    let index = matches[0];
+    let patch_surface = single_item_patch_surface(pre_container, &parts[index])?;
+    let part = parts.remove(index);
+    let mut tree = anonymous_realized_tree(&patch_surface);
+    let path = vec![0];
+    let pre_content = normalize_list_item_runs(part.pre_content);
+    let replacement = annotate_realized(&pre_content, realized);
+    replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
+        patch_surface: tree.realized,
+        children: tree.children,
+        slots: vec![SemanticSlot {
+            label: part.label,
+            path,
+        }],
+    })
+}
+
+fn single_item_patch_surface(pre_container: &Content, part: &SlotPart) -> Option<Content> {
+    match part.label {
+        SlotStep::ListItem(_) if pre_container.is::<ListElem>() => Some(
+            Content::new(ListElem::new(vec![Packed::new(ListItem::new(
+                part.pre_content.clone(),
+            ))]))
+            .spanned(pre_container.span()),
+        ),
+        SlotStep::EnumItem(_) if pre_container.is::<EnumElem>() => Some(
+            Content::new(EnumElem::new(vec![Packed::new(EnumItem::new(
+                part.pre_content.clone(),
+            ))]))
+            .spanned(pre_container.span()),
+        ),
+        _ => None,
     }
 }
 
