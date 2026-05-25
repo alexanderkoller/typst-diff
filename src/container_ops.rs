@@ -6,9 +6,9 @@
 //! how to extract, replace, insert, and fall back to a patch surface.
 
 use crate::annotated::{
-    AnnotatedContent, Annotation, SemanticKind, SemanticSlot, WrapperKind, annotate_realized,
+    AnnotatedContent, Annotation, SemanticKind, SemanticSlot, SlotStep, WrapperKind,
+    annotate_realized,
 };
-use crate::content_slots::SlotStep;
 use typst::foundations::{Content, Packed, SequenceElem, StyleChain, StyledElem};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridCell, GridChild, GridElem, GridItem,
@@ -16,7 +16,7 @@ use typst::layout::{
 };
 use typst::model::{
     EnumElem, EnumItem, FigureElem, FootnoteBody, FootnoteElem, ListElem, ListItem, ParElem,
-    ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermItem, TermsElem,
+    ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermsElem,
 };
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
@@ -701,79 +701,6 @@ pub(crate) fn insert_realized_child(
     None
 }
 
-pub(crate) fn replace_slot(
-    template: &Content,
-    path: &[SlotStep],
-    replacement: Content,
-) -> Option<Content> {
-    let (step, rest) = path.split_first()?;
-    let mut content = template.clone();
-
-    match step {
-        SlotStep::SequenceChild(index) => {
-            let seq = content.to_packed_mut::<SequenceElem>()?;
-            let child = seq.children.get(*index)?;
-            seq.children[*index] = replace_slot(child, rest, replacement)?;
-            Some(content)
-        }
-        SlotStep::StyledChild => {
-            let styled = content.to_packed_mut::<StyledElem>()?;
-            styled.child = replace_slot(&styled.child, rest, replacement)?;
-            Some(content)
-        }
-        SlotStep::ParBody => {
-            let par = content.to_packed_mut::<typst::model::ParElem>()?;
-            if rest.is_empty() {
-                par.body = replacement;
-            } else {
-                par.body = replace_slot(&par.body, rest, replacement)?;
-            }
-            Some(content)
-        }
-        SlotStep::ItemBody if rest.is_empty() => replace_item_body(content, replacement),
-        SlotStep::ListItem(index) if rest.is_empty() => {
-            replace_realized_child(&content, *index, replacement)
-        }
-        SlotStep::EnumItem(index) if rest.is_empty() => {
-            replace_realized_child(&content, *index, replacement)
-        }
-        SlotStep::Term(index) if rest.is_empty() => replace_term(content, *index, replacement),
-        SlotStep::TermDescription(index) if rest.is_empty() => {
-            replace_term_description(content, *index, replacement)
-        }
-        SlotStep::FigureBody if rest.is_empty() => replace_realized_child(&content, 0, replacement),
-        SlotStep::FigureCaption if rest.is_empty() => {
-            replace_realized_child(&content, 1, replacement)
-        }
-        SlotStep::FootnoteBody if rest.is_empty() => {
-            replace_realized_child(&content, 0, replacement)
-        }
-        SlotStep::QuoteBody if rest.is_empty() => replace_realized_child(&content, 0, replacement),
-        SlotStep::WrapperBody if rest.is_empty() => {
-            replace_realized_child(&content, 0, replacement)
-        }
-        SlotStep::TableCell(index) if rest.is_empty() => {
-            replace_realized_child(&content, *index, replacement)
-        }
-        SlotStep::GridCell(index) if rest.is_empty() => {
-            replace_realized_child(&content, *index, replacement)
-        }
-        SlotStep::StackChild(index) if rest.is_empty() => {
-            replace_realized_child(&content, *index, replacement)
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn rebuild_realized_grid_with_cells(
-    container: &Content,
-    cell_bodies: Vec<Content>,
-) -> Option<Content> {
-    let mut content = container.clone();
-    rebuild_grid_in_realized(&mut content, &cell_bodies)?;
-    Some(content)
-}
-
 fn map_slot_parts(
     pre_container: &Content,
     realized: &Content,
@@ -962,46 +889,6 @@ fn prepend_path_index(index: usize, mut paths: Vec<Vec<usize>>) -> Vec<Vec<usize
         path.insert(0, index);
     }
     paths
-}
-
-fn replace_item_body(mut content: Content, replacement: Content) -> Option<Content> {
-    if let Some(item) = content.to_packed_mut::<ListItem>() {
-        item.body = replacement;
-        return Some(content);
-    }
-    if let Some(item) = content.to_packed_mut::<EnumItem>() {
-        item.body = replacement;
-        return Some(content);
-    }
-    None
-}
-
-fn replace_term(mut content: Content, index: usize, replacement: Content) -> Option<Content> {
-    if index == 0
-        && let Some(item) = content.to_packed_mut::<TermItem>()
-    {
-        item.term = replacement;
-        return Some(content);
-    }
-    let terms = content.to_packed_mut::<TermsElem>()?;
-    terms.children.get_mut(index)?.term = replacement;
-    Some(content)
-}
-
-fn replace_term_description(
-    mut content: Content,
-    index: usize,
-    replacement: Content,
-) -> Option<Content> {
-    if index == 0
-        && let Some(item) = content.to_packed_mut::<TermItem>()
-    {
-        item.description = replacement;
-        return Some(content);
-    }
-    let terms = content.to_packed_mut::<TermsElem>()?;
-    terms.children.get_mut(index)?.description = replacement;
-    Some(content)
 }
 
 fn replace_wrapper_body(mut content: Content, replacement: Content) -> Option<Content> {
@@ -1297,54 +1184,4 @@ fn ordinary_grid_insert_index(
         }
     }
     None
-}
-
-fn rebuild_grid_in_realized(content: &mut Content, cell_bodies: &[Content]) -> Option<()> {
-    if content.to_packed::<GridElem>().is_some() {
-        return rebuild_grid_body_cells(content, cell_bodies);
-    }
-    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        return rebuild_grid_in_realized(&mut styled.child, cell_bodies);
-    }
-    if let Some(block) = content.to_packed_mut::<BlockElem>() {
-        let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) else {
-            return None;
-        };
-        let mut body = body;
-        rebuild_grid_in_realized(&mut body, cell_bodies)?;
-        block.body.set(Some(BlockBody::Content(body)));
-        return Some(());
-    }
-    None
-}
-
-fn rebuild_grid_body_cells(content: &mut Content, cell_bodies: &[Content]) -> Option<()> {
-    let grid = content.to_packed_mut::<GridElem>()?;
-    let mut new_children: Vec<GridChild> = Vec::with_capacity(grid.children.len());
-    let mut idx = 0usize;
-
-    for child in &grid.children {
-        match child {
-            GridChild::Item(GridItem::Cell(cell)) => {
-                if idx < cell_bodies.len() {
-                    let mut new_cell = (**cell).clone();
-                    new_cell.body = cell_bodies[idx].clone();
-                    new_children.push(GridChild::Item(GridItem::Cell(Packed::new(new_cell))));
-                    idx += 1;
-                } else {
-                    new_children.push(child.clone());
-                }
-            }
-            other => new_children.push(other.clone()),
-        }
-    }
-
-    while idx < cell_bodies.len() {
-        let cell = GridCell::new(cell_bodies[idx].clone());
-        new_children.push(GridChild::Item(GridItem::Cell(Packed::new(cell))));
-        idx += 1;
-    }
-
-    grid.children = new_children;
-    Some(())
 }

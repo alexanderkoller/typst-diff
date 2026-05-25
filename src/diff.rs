@@ -15,12 +15,9 @@
 //!    `Delete + Insert` zones and pairs each delete with its most-similar insert
 //!    (similarity ≥ 0.3). Paired blocks become [`BlockOp::Replace`].
 //!
-//! 4. **Word-level diff** — `diff_content` drives all of the above, then for each
-//!    `Replace` pair either:
-//!    - diffs the slot contents (lists, tables, …) with [`diff_words`], or
-//!    - extracts tokens with [`extract_words`] and diffs them with [`diff_words`].
-//!    Only pairs that contain a real textual change become [`DiffResultOp::Modified`];
-//!    style-only changes collapse back to `Equal`.
+//! 4. **Realized-tree edits** — [`diff_annotated`] drives all of the above, then
+//!    recurses through semantic slots when a structured container can be matched.
+//!    Leaf replacements fall back to [`diff_words`].
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -34,8 +31,7 @@ use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
-use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot};
-use crate::content_slots::SlotStep;
+use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep};
 
 /// A block-level unit of content together with the page styles active at its position.
 ///
@@ -941,123 +937,6 @@ fn coalesce(ops: &mut Vec<WordOp>, next: WordOp) {
     }
 }
 
-/// Final per-block diff classification, passed to `annotate::build_annotated_content`.
-///
-/// All variants carry the *new* block (or the only block for `Equal`/`Deleted`).
-/// `Modified` and `ModifiedSlots` also carry the word-level or slot-level diffs.
-#[derive(Clone)]
-pub enum DiffResultOp {
-    Equal(DiffBlock),
-    Deleted(DiffBlock),
-    Inserted(DiffBlock),
-    /// A block whose text changed; contains word-level ops for inline annotation.
-    Modified(DiffBlock, Vec<WordOp>),
-    /// A structured container (list, table, …) where only named slots changed.
-    ModifiedSlots(DiffBlock, Vec<SlotDiff>),
-}
-
-/// The complete diff of two documents: a sequence of per-block operations and the
-/// root page styles from the new document (used to wrap the final annotated content).
-pub struct DiffResultFlat {
-    pub block_ops: Vec<DiffResultOp>,
-    pub root_styles: Styles,
-}
-
-/// A recursive sub-document diff for one named slot inside a structured container.
-///
-/// `path` identifies the slot within its parent element (e.g. `[ListItem(1)]`);
-/// `ops` is the block-level diff of that slot's content, produced by recursively calling
-/// `diff_content` on the old and new slot bodies. For a plain-text slot this will contain a
-/// single `Modified` op; for a slot whose body has nested structure (e.g. a list item that
-/// itself contains a sub-list) it will contain multiple ops that preserve that structure.
-#[derive(Clone)]
-pub struct SlotDiff {
-    pub path: Vec<SlotStep>,
-    pub ops: Vec<DiffResultOp>,
-}
-
-impl DiffResultFlat {
-    pub fn modification_log(&self) -> String {
-        let mut log = String::new();
-        log_ops(&mut log, &[], &self.block_ops);
-        log
-    }
-}
-
-fn log_ops(log: &mut String, slot_path_prefix: &[SlotStep], ops: &[DiffResultOp]) {
-    for (index, op) in ops.iter().enumerate() {
-        match op {
-            DiffResultOp::Equal(_) => {}
-            DiffResultOp::Deleted(content) => {
-                let kind = if slot_path_prefix.is_empty() {
-                    "delete".to_string()
-                } else {
-                    format!("delete in slot {:?}", slot_path_prefix)
-                };
-                push_log_entry(
-                    log,
-                    index,
-                    &kind,
-                    &[("text", content.content.plain_text().to_string())],
-                );
-            }
-            DiffResultOp::Inserted(content) => {
-                let kind = if slot_path_prefix.is_empty() {
-                    "insert".to_string()
-                } else {
-                    format!("insert in slot {:?}", slot_path_prefix)
-                };
-                push_log_entry(
-                    log,
-                    index,
-                    &kind,
-                    &[("text", content.content.plain_text().to_string())],
-                );
-            }
-            DiffResultOp::Modified(new_block, word_ops) => {
-                let deletes = collect_word_op_text(word_ops, |op| match op {
-                    WordOp::Delete(tokens) => Some(tokens),
-                    _ => None,
-                });
-                let inserts = collect_word_op_text(word_ops, |op| match op {
-                    WordOp::Insert(tokens) => Some(tokens),
-                    _ => None,
-                });
-                if slot_path_prefix.is_empty() {
-                    push_log_entry(
-                        log,
-                        index,
-                        "modify",
-                        &[
-                            ("block", new_block.content.plain_text().to_string()),
-                            ("deleted", deletes),
-                            ("inserted", inserts),
-                        ],
-                    );
-                } else {
-                    push_log_entry(
-                        log,
-                        index,
-                        "modify slot",
-                        &[
-                            ("slot", format!("{slot_path_prefix:?}")),
-                            ("deleted", deletes),
-                            ("inserted", inserts),
-                        ],
-                    );
-                }
-            }
-            DiffResultOp::ModifiedSlots(_, slot_diffs) => {
-                for slot_diff in slot_diffs {
-                    let mut sub_prefix = slot_path_prefix.to_vec();
-                    sub_prefix.extend_from_slice(&slot_diff.path);
-                    log_ops(log, &sub_prefix, &slot_diff.ops);
-                }
-            }
-        }
-    }
-}
-
 fn push_log_entry(log: &mut String, index: usize, kind: &str, fields: &[(&str, String)]) {
     log.push_str(&format!("## {index}: {kind}\n"));
     for (name, value) in fields {
@@ -1102,37 +981,6 @@ fn single_line(text: &str) -> String {
         }
     }
     result.trim().to_string()
-}
-
-pub fn diff_content(old: &Content, new: &Content) -> DiffResultFlat {
-    let old_blocks = extract_block_units(old);
-    let new_blocks = extract_block_units(new);
-    let raw = diff_block_units_raw(&old_blocks, &new_blocks);
-    let matched = match_edit_zones(raw);
-
-    let block_ops = matched
-        .into_iter()
-        .map(|op| match op {
-            BlockOp::Equal(_, new_block) => DiffResultOp::Equal(new_block),
-            BlockOp::Delete(old_block) => DiffResultOp::Deleted(old_block),
-            BlockOp::Insert(new_block) => DiffResultOp::Inserted(new_block),
-            BlockOp::Replace(old_block, new_block) => {
-                let old_tokens = extract_words(&old_block.content);
-                let new_tokens = extract_words(&new_block.content);
-                let word_ops = diff_words(&old_tokens, &new_tokens);
-                if has_textual_word_change(&word_ops) {
-                    DiffResultOp::Modified(new_block, word_ops)
-                } else {
-                    DiffResultOp::Equal(new_block)
-                }
-            }
-        })
-        .collect();
-
-    DiffResultFlat {
-        block_ops,
-        root_styles: root_page_styles(new),
-    }
 }
 
 fn root_page_styles(content: &Content) -> Styles {
@@ -1797,6 +1645,21 @@ mod tests {
         Content::sequence(items)
     }
 
+    fn annotated(content: &Content) -> AnnotatedContent {
+        crate::annotated::annotate_realized(content, content)
+    }
+
+    fn whole_block_modified_ops(result: &DiffResult) -> Option<&[WordOp]> {
+        for block in &result.blocks {
+            for edit in &block.edits {
+                if let RealizedEdit::WholeBlock(EditContent::Modified { word_ops, .. }) = edit {
+                    return Some(word_ops);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn diff_unchanged_document_produces_all_unchanged_nodes() {
         use crate::annotated::{AnnotatedContent, Annotation};
@@ -1855,8 +1718,8 @@ mod tests {
 
     #[test]
     fn can_recurse_via_slots_true_for_matching_list_kinds() {
+        use crate::annotated::SlotStep;
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
 
         let make = |kind: SemanticKind| AnnotatedContent {
             realized: TextElem::packed("x"),
@@ -1881,8 +1744,8 @@ mod tests {
 
     #[test]
     fn can_recurse_via_slots_false_for_equation() {
+        use crate::annotated::SlotStep;
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
 
         let eq = AnnotatedContent {
             realized: TextElem::packed("x"),
@@ -1901,8 +1764,8 @@ mod tests {
 
     #[test]
     fn diff_slot_edits_same_shape_marks_changed_item_modified() {
+        use crate::annotated::SlotStep;
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
 
         let make_child = |text: &str| AnnotatedContent {
             realized: TextElem::packed(text),
@@ -1941,8 +1804,8 @@ mod tests {
 
     #[test]
     fn diff_slot_edits_same_shape_all_unchanged_when_equal() {
+        use crate::annotated::SlotStep;
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
 
         let make_list = |texts: &[&str]| AnnotatedContent {
             realized: TextElem::packed("list"),
@@ -1975,8 +1838,8 @@ mod tests {
 
     #[test]
     fn identical_non_leaf_subtree_emits_no_edits() {
+        use crate::annotated::SlotStep;
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
 
         let inner_list = AnnotatedContent {
             realized: TextElem::packed(""),
@@ -2018,8 +1881,8 @@ mod tests {
 
     #[test]
     fn diff_slot_edits_same_shape_recurses_into_nested_descendant() {
+        use crate::annotated::SlotStep;
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
 
         let make_inner_list = |item_text: &str| AnnotatedContent {
             realized: TextElem::packed(item_text),
@@ -2195,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_content_on_paragraph_with_inline_styling_produces_single_modified_op() {
+    fn diff_annotated_on_paragraph_with_inline_styling_produces_single_modified_edit() {
         use typst::visualize::Color;
 
         let emph_style = TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into());
@@ -2210,49 +2073,38 @@ mod tests {
             TextElem::packed(" in modern taxonomy."),
         ]);
 
-        let result = diff_content(&old, &new);
+        let result = diff_annotated(&annotated(&old), &annotated(&new));
 
-        // All edits should be captured in a single top-level Modified op, not
-        // fragmented into multiple ops or nested ModifiedSlots at different depths.
         assert_eq!(
-            result.block_ops.len(),
+            result.blocks.len(),
             1,
-            "expected 1 block op, got {}",
-            result.block_ops.len()
+            "expected 1 block edit, got {}",
+            result.blocks.len()
         );
-        match &result.block_ops[0] {
-            DiffResultOp::Modified(_, word_ops) => {
-                let mut deletes: Vec<&str> = Vec::new();
-                let mut inserts: Vec<&str> = Vec::new();
-                for op in word_ops {
-                    match op {
-                        WordOp::Delete(tokens) => {
-                            for t in tokens {
-                                deletes.push(t.text.as_str());
-                            }
-                        }
-                        WordOp::Insert(tokens) => {
-                            for t in tokens {
-                                inserts.push(t.text.as_str());
-                            }
-                        }
-                        _ => {}
+        let word_ops = whole_block_modified_ops(&result).expect("expected modified edit");
+        let mut deletes: Vec<&str> = Vec::new();
+        let mut inserts: Vec<&str> = Vec::new();
+        for op in word_ops {
+            match op {
+                WordOp::Delete(tokens) => {
+                    for t in tokens {
+                        deletes.push(t.text.as_str());
                     }
                 }
-                let joined_del = deletes.join(" ");
-                let joined_ins = inserts.join(" ");
-                assert!(joined_del.contains("domesticus"), "deletes: {joined_del:?}");
-                assert!(joined_del.contains("older"), "deletes: {joined_del:?}");
-                assert!(joined_ins.contains("catus"), "inserts: {joined_ins:?}");
-                assert!(joined_ins.contains("modern"), "inserts: {joined_ins:?}");
-            }
-            DiffResultOp::Equal(_) => panic!("expected Modified, got Equal"),
-            DiffResultOp::Deleted(_) => panic!("expected Modified, got Deleted"),
-            DiffResultOp::Inserted(_) => panic!("expected Modified, got Inserted"),
-            DiffResultOp::ModifiedSlots(_, _) => {
-                panic!("expected Modified, got ModifiedSlots — fragmentation bug regression")
+                WordOp::Insert(tokens) => {
+                    for t in tokens {
+                        inserts.push(t.text.as_str());
+                    }
+                }
+                _ => {}
             }
         }
+        let joined_del = deletes.join(" ");
+        let joined_ins = inserts.join(" ");
+        assert!(joined_del.contains("domesticus"), "deletes: {joined_del:?}");
+        assert!(joined_del.contains("older"), "deletes: {joined_del:?}");
+        assert!(joined_ins.contains("catus"), "inserts: {joined_ins:?}");
+        assert!(joined_ins.contains("modern"), "inserts: {joined_ins:?}");
     }
 
     #[test]
@@ -2528,18 +2380,17 @@ mod tests {
         assert_eq!(n_ins, 1);
     }
 
-    // --- diff_content tests ---
+    // --- diff_annotated tests ---
 
     #[test]
-    fn diff_content_detects_word_change() {
+    fn diff_annotated_detects_word_change() {
         let old = seq([TextElem::packed("The fox jumps.")]);
         let new = seq([TextElem::packed("The fox leaps.")]);
-        let result = diff_content(&old, &new);
-        let has_word_change = result.block_ops.iter().any(|op| match op {
-            DiffResultOp::Modified(_, word_ops) => word_ops
+        let result = diff_annotated(&annotated(&old), &annotated(&new));
+        let has_word_change = whole_block_modified_ops(&result).is_some_and(|word_ops| {
+            word_ops
                 .iter()
-                .any(|w| matches!(w, WordOp::Delete(_)) || matches!(w, WordOp::Insert(_))),
-            _ => false,
+                .any(|w| matches!(w, WordOp::Delete(_)) || matches!(w, WordOp::Insert(_)))
         });
         assert!(has_word_change);
     }
@@ -2597,7 +2448,7 @@ mod tests {
         let old = seq([TextElem::packed("Old\nvalue")]);
         let new = seq([TextElem::packed("New\nvalue")]);
 
-        let log = diff_content(&old, &new).modification_log();
+        let log = diff_annotated(&annotated(&old), &annotated(&new)).modification_log();
 
         assert!(log.contains("block: New value"), "{log}");
         assert!(log.contains("deleted: Old"), "{log}");

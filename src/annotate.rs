@@ -1,4 +1,4 @@
-//! Convert a [`DiffResultFlat`] into an annotated Typst [`Content`] tree ready for rendering.
+//! Convert a tree-shaped diff into annotated Typst [`Content`] ready for rendering.
 //!
 //! # Colour conventions
 //!
@@ -26,10 +26,7 @@ use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
 use crate::container_ops;
-use crate::content_slots::replace_slot;
-use crate::diff::{
-    DiffBlock, DiffBlockEdit, DiffResultFlat, DiffResultOp, EditContent, RealizedEdit, WordOp,
-};
+use crate::diff::{DiffBlock, DiffBlockEdit, EditContent, RealizedEdit, WordOp};
 
 fn green() -> Color {
     Color::from_u8(0, 180, 0, 255)
@@ -39,84 +36,6 @@ fn red() -> Color {
 }
 fn blue() -> Color {
     Color::from_u8(0, 100, 220, 255)
-}
-
-/// Build the annotated document from a [`DiffResultFlat`].
-///
-/// `compact_substitutions`: when `true`, substitution pairs (adjacent delete+insert)
-/// are shown as blue insertions only — the red strikethrough is suppressed. Useful
-/// for authors who want to see "what it says now" without visual noise from deleted text.
-pub fn build_annotated_content(result: &DiffResultFlat, compact_substitutions: bool) -> Content {
-    let mut groups: Vec<Content> = Vec::new();
-    let mut current_blocks: Vec<Content> = Vec::new();
-    let mut current_page_styles = None;
-
-    for block in build_annotated_blocks(&result.block_ops, compact_substitutions) {
-        if current_page_styles
-            .as_ref()
-            .is_some_and(|styles| styles != &block.page_styles)
-        {
-            flush_group(&mut groups, &mut current_blocks, current_page_styles.take());
-        }
-        current_page_styles.get_or_insert_with(|| block.page_styles.clone());
-        current_blocks.push(block.content);
-    }
-
-    flush_group(&mut groups, &mut current_blocks, current_page_styles);
-    Content::sequence(groups).styled_with_map(result.root_styles.clone())
-}
-
-/// Annotate a sequence of block ops, returning one [`DiffBlock`] per input op.
-///
-/// This is the recursable kernel used both at the top level (by
-/// [`build_annotated_content`]) and when annotating slot sub-documents.
-/// Unlike the top-level function it does NOT apply page-style grouping — that
-/// only happens at the document root.
-pub(crate) fn build_annotated_blocks(
-    ops: &[DiffResultOp],
-    compact_substitutions: bool,
-) -> Vec<DiffBlock> {
-    ops.iter()
-        .map(|op| match op {
-            DiffResultOp::Equal(c) => c.clone(),
-
-            DiffResultOp::Inserted(c) => DiffBlock {
-                content: if c.content.plain_text().is_empty() {
-                    c.content.clone()
-                } else {
-                    apply_fill_inside(&c.content, green())
-                },
-                page_styles: c.page_styles.clone(),
-            },
-
-            DiffResultOp::Deleted(c) => {
-                let colored = plain_content(&c.content).styled(TextElem::fill.set(red().into()));
-                let struck = Content::new(StrikeElem::new(colored));
-                DiffBlock {
-                    content: replace_text_container(&c.content, &struck).unwrap_or(struck),
-                    page_styles: c.page_styles.clone(),
-                }
-            }
-
-            DiffResultOp::Modified(new_block, word_ops) => {
-                let inline = annotated_inline_content(word_ops, compact_substitutions);
-                DiffBlock {
-                    content: replace_text_container(&new_block.content, &inline).unwrap_or(inline),
-                    page_styles: new_block.page_styles.clone(),
-                }
-            }
-
-            DiffResultOp::ModifiedSlots(new_block, slot_diffs) => DiffBlock {
-                content: replace_modified_slots(
-                    &new_block.content,
-                    slot_diffs,
-                    compact_substitutions,
-                )
-                .unwrap_or_else(|| new_block.content.clone()),
-                page_styles: new_block.page_styles.clone(),
-            },
-        })
-        .collect()
 }
 
 fn flush_group(
@@ -670,26 +589,11 @@ fn render_surface(node: &crate::annotated::AnnotatedContent) -> &Content {
         .unwrap_or(&node.realized)
 }
 
-#[allow(dead_code)]
-fn replace_modified_slots(
-    template: &Content,
-    slot_diffs: &[crate::diff::SlotDiff],
-    compact_substitutions: bool,
-) -> Option<Content> {
-    let mut content = template.clone();
-    for slot_diff in slot_diffs {
-        let sub_blocks = build_annotated_blocks(&slot_diff.ops, compact_substitutions);
-        let replacement = Content::sequence(sub_blocks.into_iter().map(|b| b.content));
-        content = replace_slot(&content, &slot_diff.path, replacement)?;
-    }
-    Some(content)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content_slots::SlotStep;
-    use crate::diff::{DiffResultFlat, DiffResultOp, SlotDiff, Token, WordOp};
+    use crate::annotated::{AnnotatedContent, Annotation, annotate_realized};
+    use crate::diff::{DiffBlockEdit, DiffResult, EditContent, RealizedEdit, Token, WordOp};
     use typst::foundations::{NativeElement, Packed};
     use typst::model::{HeadingElem, ListElem, ListItem};
     use typst::text::TextElem;
@@ -701,11 +605,36 @@ mod tests {
         }
     }
 
-    fn block(content: Content) -> DiffBlock {
-        DiffBlock {
-            content,
-            page_styles: Default::default(),
+    fn annotated(content: Content) -> AnnotatedContent {
+        AnnotatedContent {
+            realized: content,
+            annotation: Annotation::default(),
+            children: vec![],
         }
+    }
+
+    fn render(base: Content, edits: Vec<RealizedEdit>, compact: bool) -> Content {
+        let result = DiffResult {
+            blocks: vec![DiffBlockEdit {
+                base: annotated(base),
+                edits,
+                page_styles: Default::default(),
+            }],
+            root_styles: Default::default(),
+        };
+        build_annotated_content_from_tree(&result, compact)
+    }
+
+    fn modified(base: Content, word_ops: Vec<WordOp>) -> EditContent {
+        EditContent::Modified { base, word_ops }
+    }
+
+    fn whole(content: EditContent) -> Vec<RealizedEdit> {
+        vec![RealizedEdit::WholeBlock(content)]
+    }
+
+    fn replace_at(path: Vec<usize>, content: EditContent) -> Vec<RealizedEdit> {
+        vec![RealizedEdit::ReplaceAt { path, content }]
     }
 
     fn count_elem<T: NativeElement>(content: &Content) -> usize {
@@ -721,90 +650,58 @@ mod tests {
 
     #[test]
     fn inserted_block_wrapped_green() {
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::Inserted(block(TextElem::packed(
-                "New paragraph",
-            )))],
-            root_styles: Default::default(),
-        };
-        let content = build_annotated_content(&result, false);
+        let content = render(
+            TextElem::packed("New paragraph"),
+            whole(EditContent::Inserted(TextElem::packed("New paragraph"))),
+            false,
+        );
         assert!(!content.is_empty());
     }
 
     #[test]
     fn modified_block_contains_strike_for_deletion() {
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::Modified(
-                block(TextElem::packed("The new text.")),
+        let content = render(
+            TextElem::packed("The new text."),
+            whole(modified(
+                TextElem::packed("The new text."),
                 vec![
                     WordOp::Equal(vec![word_token("The ")]),
                     WordOp::Delete(vec![word_token("old")]),
                     WordOp::Insert(vec![word_token("new")]),
                     WordOp::Equal(vec![word_token(" text.")]),
                 ],
-            )],
-            root_styles: Default::default(),
-        };
-        let content = build_annotated_content(&result, false);
-        assert!(!content.is_empty());
-        let mut found_strike = false;
-        let _ = content.traverse::<_, ()>(&mut |c| {
-            if c.is::<StrikeElem>() {
-                found_strike = true;
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-        assert!(found_strike, "expected StrikeElem for deleted word");
-    }
-
-    #[test]
-    fn deleted_heading_keeps_heading_formatting() {
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::Deleted(block(Content::new(
-                HeadingElem::new(TextElem::packed("Old heading")),
-            )))],
-            root_styles: Default::default(),
-        };
-        let content = build_annotated_content(&result, false);
-
-        let mut found_heading = false;
-        let mut found_old_text = false;
-        let _ = content.traverse::<_, ()>(&mut |c| {
-            if c.is::<HeadingElem>() {
-                found_heading = true;
-            }
-            if let Some(text) = c.to_packed::<TextElem>()
-                && text.text.as_str().contains("Old heading")
-            {
-                found_old_text = true;
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-
-        assert!(
-            found_heading,
-            "deleted heading should keep heading formatting"
+            )),
+            false,
         );
-        assert!(found_old_text, "deleted block text should remain visible");
+        assert!(!content.is_empty());
         assert_eq!(count_elem::<StrikeElem>(&content), 1);
     }
 
     #[test]
+    fn deleted_heading_keeps_heading_formatting() {
+        let heading = Content::new(HeadingElem::new(TextElem::packed("Old heading")));
+        let content = render(heading.clone(), whole(EditContent::Deleted(heading)), false);
+
+        assert_eq!(count_elem::<HeadingElem>(&content), 1);
+        assert_eq!(count_elem::<StrikeElem>(&content), 1);
+        assert!(content.plain_text().contains("Old heading"));
+    }
+
+    #[test]
     fn compact_substitutions_drop_deleted_text_and_color_inserted_text() {
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::Modified(
-                block(TextElem::packed("The new text.")),
+        let compact = render(
+            TextElem::packed("The new text."),
+            whole(modified(
+                TextElem::packed("The new text."),
                 vec![
                     WordOp::Equal(vec![word_token("The ")]),
                     WordOp::Delete(vec![word_token("old")]),
                     WordOp::Insert(vec![word_token("new")]),
                     WordOp::Equal(vec![word_token(" text.")]),
                 ],
-            )],
-            root_styles: Default::default(),
-        };
-
-        let compact = build_annotated_content(&result, true);
+            )),
+            true,
+        );
 
         assert_eq!(count_elem::<StrikeElem>(&compact), 0);
         assert!(compact.plain_text().contains("new"));
@@ -814,19 +711,18 @@ mod tests {
     #[test]
     fn modified_heading_preserves_heading_element() {
         let heading = Content::new(HeadingElem::new(TextElem::packed("New heading")));
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::Modified(
-                block(heading),
+        let annotated = render(
+            heading.clone(),
+            whole(modified(
+                heading,
                 vec![
                     WordOp::Delete(vec![word_token("Old")]),
                     WordOp::Insert(vec![word_token("New")]),
                     WordOp::Equal(vec![word_token(" heading")]),
                 ],
-            )],
-            root_styles: Default::default(),
-        };
-
-        let annotated = build_annotated_content(&result, false);
+            )),
+            false,
+        );
 
         assert_eq!(count_elem::<HeadingElem>(&annotated), 1);
         assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
@@ -834,30 +730,26 @@ mod tests {
     }
 
     #[test]
-    fn modified_list_slot_preserves_list_and_unchanged_items() {
+    fn modified_list_child_preserves_list_and_unchanged_items() {
         let list = Content::new(ListElem::new(vec![
             Packed::new(ListItem::new(TextElem::packed("Alpha"))),
             Packed::new(ListItem::new(TextElem::packed("Better"))),
             Packed::new(ListItem::new(TextElem::packed("Gamma"))),
         ]));
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::ModifiedSlots(
-                block(list),
-                vec![SlotDiff {
-                    path: vec![SlotStep::ListItem(1)],
-                    ops: vec![DiffResultOp::Modified(
-                        block(TextElem::packed("Better")),
-                        vec![
-                            WordOp::Delete(vec![word_token("Beta")]),
-                            WordOp::Insert(vec![word_token("Better")]),
-                        ],
-                    )],
-                }],
-            )],
-            root_styles: Default::default(),
-        };
-
-        let annotated = build_annotated_content(&result, false);
+        let annotated = render(
+            list,
+            replace_at(
+                vec![1],
+                modified(
+                    TextElem::packed("Better"),
+                    vec![
+                        WordOp::Delete(vec![word_token("Beta")]),
+                        WordOp::Insert(vec![word_token("Better")]),
+                    ],
+                ),
+            ),
+            false,
+        );
         let plain = annotated.plain_text();
 
         assert_eq!(count_elem::<ListElem>(&annotated), 1);
@@ -869,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_table_slot_preserves_table_structure() {
+    fn modified_table_child_preserves_table_structure() {
         use typst::model::{TableCell, TableChild, TableElem, TableItem};
 
         let table = Content::new(TableElem::new(vec![
@@ -880,25 +772,21 @@ mod tests {
                 TextElem::packed("New value"),
             )))),
         ]));
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::ModifiedSlots(
-                block(table),
-                vec![SlotDiff {
-                    path: vec![SlotStep::TableCell(1)],
-                    ops: vec![DiffResultOp::Modified(
-                        block(TextElem::packed("New value")),
-                        vec![
-                            WordOp::Delete(vec![word_token("Old")]),
-                            WordOp::Insert(vec![word_token("New")]),
-                            WordOp::Equal(vec![word_token(" value")]),
-                        ],
-                    )],
-                }],
-            )],
-            root_styles: Default::default(),
-        };
-
-        let annotated = build_annotated_content(&result, false);
+        let annotated = render(
+            table,
+            replace_at(
+                vec![1],
+                modified(
+                    TextElem::packed("New value"),
+                    vec![
+                        WordOp::Delete(vec![word_token("Old")]),
+                        WordOp::Insert(vec![word_token("New")]),
+                        WordOp::Equal(vec![word_token(" value")]),
+                    ],
+                ),
+            ),
+            false,
+        );
 
         assert_eq!(count_elem::<TableElem>(&annotated), 1);
         assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
@@ -908,39 +796,29 @@ mod tests {
     }
 
     #[test]
-    fn nested_list_slot_preserves_both_list_levels_and_annotates_leaf() {
-        // Two-level list: outer item 0 contains an inner list with "Beta" → "Better".
+    fn nested_list_child_preserves_both_list_levels_and_annotates_leaf() {
         let inner = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
             TextElem::packed("Better"),
         ))]));
         let outer_list = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(inner.clone())),
+            Packed::new(ListItem::new(inner)),
             Packed::new(ListItem::new(TextElem::packed("Stable"))),
         ]));
-        let result = DiffResultFlat {
-            block_ops: vec![DiffResultOp::ModifiedSlots(
-                block(outer_list),
-                vec![SlotDiff {
-                    path: vec![SlotStep::ListItem(0)],
-                    ops: vec![DiffResultOp::ModifiedSlots(
-                        block(inner),
-                        vec![SlotDiff {
-                            path: vec![SlotStep::ListItem(0)],
-                            ops: vec![DiffResultOp::Modified(
-                                block(TextElem::packed("Better")),
-                                vec![
-                                    WordOp::Delete(vec![word_token("Beta")]),
-                                    WordOp::Insert(vec![word_token("Better")]),
-                                ],
-                            )],
-                        }],
-                    )],
-                }],
-            )],
-            root_styles: Default::default(),
-        };
 
-        let annotated = build_annotated_content(&result, false);
+        let annotated = render(
+            outer_list,
+            replace_at(
+                vec![0, 0],
+                modified(
+                    TextElem::packed("Better"),
+                    vec![
+                        WordOp::Delete(vec![word_token("Beta")]),
+                        WordOp::Insert(vec![word_token("Better")]),
+                    ],
+                ),
+            ),
+            false,
+        );
         let plain = annotated.plain_text();
 
         assert_eq!(
@@ -956,9 +834,7 @@ mod tests {
 
     #[test]
     fn mixed_body_inline_change_detected_and_nested_structure_preserved() {
-        // Item body: inline paragraph "old title" followed by a nested list.
-        // Only the inline paragraph changes; nested list stays the same.
-        use crate::diff::diff_content;
+        use crate::diff::diff_annotated;
         use typst::model::ParbreakElem;
 
         let inner = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
@@ -977,19 +853,19 @@ mod tests {
         let old = Content::new(ListElem::new(vec![Packed::new(ListItem::new(body_old))]));
         let new = Content::new(ListElem::new(vec![Packed::new(ListItem::new(body_new))]));
 
-        let result = diff_content(&old, &new);
-        let annotated = build_annotated_content(&result, false);
+        let result = diff_annotated(
+            &annotate_realized(&old, &old),
+            &annotate_realized(&new, &new),
+        );
+        let annotated = build_annotated_content_from_tree(&result, false);
         let plain = annotated.plain_text();
 
-        // The nested ListElem must survive in the output.
         assert!(
             count_elem::<ListElem>(&annotated) >= 1,
             "nested list preserved"
         );
-        // The inline change must appear.
         assert!(plain.contains("old"), "{plain}");
         assert!(plain.contains("new"), "{plain}");
-        // The unchanged leaf must still be present.
         assert!(plain.contains("Leaf"), "{plain}");
     }
 
@@ -1009,9 +885,6 @@ mod tests {
 
     #[test]
     fn inserted_parbreak_is_not_wrapped_in_styled_elem() {
-        // ParbreakElem has empty plain_text; wrapping it in StyledElem(green) would
-        // make Typst treat it as a generic styled block and insert paragraph-level
-        // vertical space instead of tight inter-bullet spacing (corpus #19 bug).
         use typst::model::ParbreakElem;
 
         let parbreak = Content::new(ParbreakElem::new());
@@ -1020,51 +893,36 @@ mod tests {
             "sanity: ParbreakElem has no text"
         );
 
-        let blocks = build_annotated_blocks(&[DiffResultOp::Inserted(block(parbreak))], false);
-        assert_eq!(blocks.len(), 1);
+        let content = render(
+            parbreak.clone(),
+            whole(EditContent::Inserted(parbreak)),
+            false,
+        );
         assert!(
-            blocks[0].content.is::<ParbreakElem>(),
-            "inserted ParbreakElem must remain bare, not wrapped in StyledElem, got: {:?}",
-            blocks[0].content.func().name()
+            content.is::<ParbreakElem>(),
+            "inserted ParbreakElem must remain bare, got: {:?}",
+            content.func().name()
         );
     }
 
     #[test]
     fn annotate_applies_whole_block_insert_edit() {
-        use crate::annotated::{AnnotatedContent, Annotation};
-        use crate::diff::{DiffBlockEdit, DiffResult, EditContent, RealizedEdit};
-
-        let block = DiffBlockEdit {
-            base: AnnotatedContent {
-                realized: TextElem::packed("new text"),
-                annotation: Annotation::default(),
-                children: vec![],
-            },
-            edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
-                TextElem::packed("new text"),
-            ))],
-            page_styles: Default::default(),
-        };
-        let result = DiffResult {
-            blocks: vec![block],
-            root_styles: Default::default(),
-        };
-        let content = build_annotated_content_from_tree(&result, false);
+        let content = render(
+            TextElem::packed("new text"),
+            whole(EditContent::Inserted(TextElem::packed("new text"))),
+            false,
+        );
         assert!(!content.is_empty());
     }
 
     #[test]
     fn inserted_visible_block_still_gets_green_fill() {
-        // Verify the empty-text guard doesn't suppress coloring on visible content.
         let text = TextElem::packed("Visible text");
         assert!(!text.plain_text().is_empty(), "sanity: TextElem has text");
 
-        let blocks = build_annotated_blocks(&[DiffResultOp::Inserted(block(text))], false);
-        assert_eq!(blocks.len(), 1);
-        // The block must NOT be a bare TextElem — it must have been processed by
-        // apply_fill_inside (which wraps in StyledElem with green fill).
+        let content = render(text.clone(), whole(EditContent::Inserted(text)), false);
         assert!(
-            !blocks[0].content.is::<typst::text::TextElem>(),
+            !content.is::<typst::text::TextElem>(),
             "inserted visible block should be styled/colored, not a bare TextElem"
         );
     }

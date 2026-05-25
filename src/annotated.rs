@@ -6,7 +6,6 @@
 //! never mutated.
 
 use crate::container_ops::{self, ContainerKind};
-use crate::content_slots::SlotStep;
 use typst::foundations::{Content, SequenceElem, StyledElem};
 use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem};
@@ -111,6 +110,23 @@ pub enum WrapperKind {
     Rect,
     Circle,
     Ellipse,
+}
+
+/// One semantic slot label inside a structured container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SlotStep {
+    ListItem(usize),
+    EnumItem(usize),
+    Term(usize),
+    TermDescription(usize),
+    FigureBody,
+    FigureCaption,
+    FootnoteBody,
+    QuoteBody,
+    WrapperBody,
+    TableCell(usize),
+    GridCell(usize),
+    StackChild(usize),
 }
 
 /// A named semantic position within an [`AnnotatedContent`] node.
@@ -664,8 +680,8 @@ mod tests {
 
     #[test]
     fn annotate_figure_maps_body_and_caption_separately() {
-        use crate::content_slots::normalize_list_item_runs;
         use crate::eval::eval_to_content;
+        use crate::normalize::normalize_list_item_runs;
         use crate::world::SystemWorld;
         use std::fs;
         use tempfile::TempDir;

@@ -24,8 +24,8 @@ use typst::layout::{PageElem, PagebreakElem};
 use typst::model::{DocumentInfo, FootnoteElem};
 use typst::routines::{Arenas, RealizationKind};
 
-use crate::content_slots::normalize_list_item_runs;
 use crate::diag::format_diagnostics;
+use crate::normalize::normalize_list_item_runs;
 
 /// Evaluate the entry file and return the raw, unrealized [`Content`] tree.
 ///
@@ -300,17 +300,6 @@ mod tests {
         let content = eval_to_content(&world).unwrap();
         let plain = content.plain_text();
         assert!(plain.contains("Included text."));
-    }
-
-    fn count_elem<T: NativeElement>(content: &Content) -> usize {
-        let mut count = 0;
-        let _ = content.traverse::<_, ()>(&mut |c| {
-            if c.is::<T>() {
-                count += 1;
-            }
-            std::ops::ControlFlow::Continue(())
-        });
-        count
     }
 
     #[test]

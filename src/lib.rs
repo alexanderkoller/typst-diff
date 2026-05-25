@@ -19,14 +19,13 @@
 pub mod annotate;
 pub mod annotated;
 mod container_ops;
-pub mod content_slots;
 pub mod diag;
 pub mod diff;
 pub mod eval;
+mod normalize;
 pub mod render;
 pub mod world;
 
-pub use annotate::build_annotated_content;
 pub use annotated::AnnotatedContent;
 pub use eval::{eval_to_content, eval_to_realized_content};
 pub use render::render_to_pdf;

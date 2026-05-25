@@ -117,16 +117,7 @@ fn max_style_count_for_text(content: &Content, needle: &str) -> usize {
 }
 
 fn annotated_corpus(name: &str) -> Content {
-    let old_world = corpus_world(&format!("{name}/old.typ"));
-    let new_world = corpus_world(&format!("{name}/new.typ"));
-    let old = typst_diff::eval_to_realized_content(&old_world)
-        .unwrap()
-        .realized;
-    let new = typst_diff::eval_to_realized_content(&new_world)
-        .unwrap()
-        .realized;
-    let result = typst_diff::diff::diff_content(&old, &new);
-    typst_diff::build_annotated_content(&result, false)
+    annotated_tree_corpus(name)
 }
 
 fn diff_annotated_corpus(name: &str) -> typst_diff::diff::DiffResult {
@@ -444,14 +435,10 @@ fn assert_edit_contract_matches_render(corpus_name: &str) {
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
     let new_world = world_for("simple_new.typ");
-    let old = typst_diff::eval_to_realized_content(&old_world)
-        .unwrap()
-        .realized;
-    let new = typst_diff::eval_to_realized_content(&new_world)
-        .unwrap()
-        .realized;
-    let result = typst_diff::diff::diff_content(&old, &new);
-    let annotated = typst_diff::build_annotated_content(&result, false);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
 }
@@ -936,10 +923,10 @@ fn table_row_inserted_middle_includes_inserted_cells() {
 fn multifile_diff_produces_valid_pdf() {
     let old_world = world_for("multifile_old/main.typ");
     let new_world = world_for("multifile_new/main.typ");
-    let old = typst_diff::eval_to_content(&old_world).unwrap();
-    let new = typst_diff::eval_to_content(&new_world).unwrap();
-    let result = typst_diff::diff::diff_content(&old, &new);
-    let annotated = typst_diff::build_annotated_content(&result, false);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
 }
@@ -948,12 +935,8 @@ fn multifile_diff_produces_valid_pdf() {
 fn repeated_function_expansions_with_same_span_keep_their_own_content() {
     let old_world = corpus_world("39-fn-content-args-changed/old.typ");
     let new_world = corpus_world("39-fn-content-args-changed/new.typ");
-    let old = typst_diff::eval_to_realized_content(&old_world)
-        .unwrap()
-        .realized;
-    let new = typst_diff::eval_to_realized_content(&new_world)
-        .unwrap()
-        .realized;
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
 
     let new_plain = new.plain_text();
     assert!(new_plain.contains("Definition 1"), "{new_plain}");
@@ -961,7 +944,7 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
     assert!(new_plain.contains("Theorem"), "{new_plain}");
     assert_eq!(new_plain.matches("Theorem").count(), 1, "{new_plain}");
 
-    let result = typst_diff::diff::diff_content(&old, &new);
+    let result = typst_diff::diff::diff_annotated(&old, &new);
     let log = result.modification_log();
     assert!(log.contains("vertices"), "{log}");
     assert!(log.contains("nodes"), "{log}");
@@ -969,7 +952,7 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
     assert!(log.contains("forest"), "{log}");
     assert!(!log.contains("spanning tree as a subgraph"), "{log}");
 
-    let annotated = typst_diff::build_annotated_content(&result, false);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let annotated_plain = annotated.plain_text();
     assert!(
         annotated_plain.contains("Definition 1"),
