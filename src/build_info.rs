@@ -14,7 +14,7 @@ pub fn build_report_line() -> String {
 
 pub fn pdf_timestamp() -> Option<Timestamp> {
     let (date, time) = BUILD_UTC.strip_suffix('Z')?.split_once('T')?;
-    let mut date_parts = date.split('-');
+    let mut date_parts = date.split('-');u
     let year = date_parts.next()?.parse().ok()?;
     let month = date_parts.next()?.parse().ok()?;
     let day = date_parts.next()?.parse().ok()?;

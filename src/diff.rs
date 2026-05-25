@@ -23,10 +23,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
+use typst::World;
 use typst::foundations::{
     Content, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem, Styles,
 };
-use typst::layout::{BlockBody, BlockElem, PageElem, Rel};
+use typst::introspection::Tag;
+use typst::layout::{BlockBody, BlockElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel};
 use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
@@ -1165,6 +1167,7 @@ pub struct DiffResult {
     pub blocks: Vec<DiffBlockEdit>,
     pub root_styles: Styles,
     pub regions: Vec<DiffRegionEdit>,
+    pub rendered_regions: Vec<RenderedRegionEdit>,
 }
 
 pub struct DiffBlockEdit {
@@ -1180,6 +1183,35 @@ pub struct DiffRegionEdit {
     pub path: RegionPath,
     pub base: AnnotatedContent,
     pub edits: Vec<RealizedEdit>,
+}
+
+pub struct RenderedRegionEdit {
+    pub kind: PageRegionKind,
+    pub wrapper: RenderedRegionWrapper,
+    pub pages: Vec<RenderedRegionPageEdit>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RenderedRegionWrapper {
+    #[default]
+    None,
+    Align(RenderedRegionAlignment),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderedRegionAlignment {
+    Left,
+    Center,
+    Right,
+    Start,
+    End,
+}
+
+pub struct RenderedRegionPageEdit {
+    pub page: usize,
+    pub base: Content,
+    pub word_ops: Vec<WordOp>,
+    pub changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1239,7 +1271,27 @@ impl DiffResult {
         for region in &self.regions {
             log_region_edit(&mut log, region);
         }
+        for region in &self.rendered_regions {
+            log_rendered_region_edit(&mut log, region);
+        }
         log
+    }
+}
+
+fn log_rendered_region_edit(log: &mut String, region: &RenderedRegionEdit) {
+    let index = region_log_index(RegionPath::RootPage(region.kind));
+    for page in &region.pages {
+        if !page.changed {
+            continue;
+        }
+        log_edit_content(
+            log,
+            &EditContent::Modified {
+                base: page.base.clone(),
+                word_ops: page.word_ops.clone(),
+            },
+            index,
+        );
     }
 }
 
@@ -1465,7 +1517,35 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
         blocks,
         root_styles,
         regions,
+        rendered_regions: vec![],
     }
+}
+
+pub fn diff_annotated_with_rendered_regions(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    old_world: &dyn World,
+    new_world: &dyn World,
+) -> anyhow::Result<DiffResult> {
+    let mut result = diff_annotated(old, new);
+    let old_source = crate::eval::eval_to_content(old_world)?;
+    let new_source = crate::eval::eval_to_content(new_world)?;
+    let old_doc = crate::eval::layout_document(old_world, &old_source)?;
+    let new_doc = crate::eval::layout_document(new_world, &new_source)?;
+    let old_styles = document_page_styles_raw(&old.realized, &extract_block_units(&old.realized));
+    let new_styles = document_page_styles_raw(&new.realized, &extract_block_units(&new.realized));
+    let new_source_styles =
+        document_page_styles_raw(&new_source, &extract_block_units(&new_source));
+    result.rendered_regions = diff_rendered_root_page_regions(
+        &old_styles,
+        &new_styles,
+        &new_source_styles,
+        &old_doc,
+        &new_doc,
+        new_world,
+        &result.regions,
+    );
+    Ok(result)
 }
 
 fn diff_root_page_regions(old_styles: &Styles, new_styles: &Styles) -> Vec<DiffRegionEdit> {
@@ -1568,6 +1648,214 @@ fn diff_region_edits(old: &AnnotatedContent, new: &AnnotatedContent) -> Vec<Real
         })]
     } else {
         vec![]
+    }
+}
+
+fn diff_rendered_root_page_regions(
+    old_styles: &Styles,
+    new_styles: &Styles,
+    new_source_styles: &Styles,
+    old_doc: &PagedDocument,
+    new_doc: &PagedDocument,
+    new_world: &dyn World,
+    semantic_regions: &[DiffRegionEdit],
+) -> Vec<RenderedRegionEdit> {
+    [
+        PageRegionKind::Header,
+        PageRegionKind::Footer,
+        PageRegionKind::Background,
+        PageRegionKind::Foreground,
+    ]
+    .into_iter()
+    .filter(|kind| {
+        !semantic_regions
+            .iter()
+            .any(|region| region.path == RegionPath::RootPage(*kind))
+    })
+    .filter_map(|kind| {
+        let old_content = page_region_content(old_styles, kind);
+        let new_content = page_region_content(new_styles, kind);
+        if old_content != new_content {
+            return None;
+        }
+        let wrapper = new_content
+            .as_ref()
+            .and_then(|_| page_region_content(new_source_styles, kind))
+            .as_ref()
+            .map(|content| rendered_region_wrapper(new_world, content))
+            .unwrap_or_default();
+        let old_pages = rendered_region_texts(old_styles, old_doc, kind);
+        let new_pages = rendered_region_texts(new_styles, new_doc, kind);
+        diff_rendered_region_texts(kind, wrapper, &old_pages, &new_pages)
+    })
+    .collect()
+}
+
+fn diff_rendered_region_texts(
+    kind: PageRegionKind,
+    wrapper: RenderedRegionWrapper,
+    old_pages: &[String],
+    new_pages: &[String],
+) -> Option<RenderedRegionEdit> {
+    let mut has_change = false;
+    let pages = new_pages
+        .iter()
+        .enumerate()
+        .map(|(index, new_text)| {
+            let old_text = old_pages.get(index).map(String::as_str).unwrap_or("");
+            let old_content = TextElem::packed(old_text);
+            let new_content = TextElem::packed(new_text.as_str());
+            let old_tokens = extract_words(&old_content);
+            let new_tokens = extract_words(&new_content);
+            let word_ops = diff_words(&old_tokens, &new_tokens);
+            let changed = old_pages.get(index).is_some() && has_textual_word_change(&word_ops);
+            has_change |= changed;
+            RenderedRegionPageEdit {
+                page: index + 1,
+                base: new_content,
+                word_ops,
+                changed,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    has_change.then_some(RenderedRegionEdit {
+        kind,
+        wrapper,
+        pages,
+    })
+}
+
+fn rendered_region_wrapper(world: &dyn World, content: &Content) -> RenderedRegionWrapper {
+    let span = content.span();
+    let Some(id) = span.id() else {
+        return RenderedRegionWrapper::None;
+    };
+    let Ok(source) = world.source(id) else {
+        return RenderedRegionWrapper::None;
+    };
+    let Some(range) = source.range(span) else {
+        return RenderedRegionWrapper::None;
+    };
+    let Some(snippet) = source.text().get(range) else {
+        return RenderedRegionWrapper::None;
+    };
+    authored_align_wrapper(snippet).unwrap_or_default()
+}
+
+fn authored_align_wrapper(source: &str) -> Option<RenderedRegionWrapper> {
+    let mut found = None;
+    let mut rest = source;
+    while let Some(index) = rest.find("align") {
+        let after = &rest[index + "align".len()..];
+        if !after.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            rest = after;
+            continue;
+        }
+        if let Some(alignment) = parse_align_call_alignment(after) {
+            if found
+                .replace(RenderedRegionWrapper::Align(alignment))
+                .is_some()
+            {
+                return None;
+            }
+        }
+        rest = after;
+    }
+    found
+}
+
+fn parse_align_call_alignment(after_align: &str) -> Option<RenderedRegionAlignment> {
+    let mut chars = after_align.trim_start().chars();
+    if chars.next()? != '(' {
+        return None;
+    }
+    let args = chars.as_str();
+    let close = args.find(')')?;
+    let first_arg = args[..close].split(',').next()?.trim();
+    let first_arg = first_arg.strip_prefix("alignment.").unwrap_or(first_arg);
+    match first_arg {
+        "left" => Some(RenderedRegionAlignment::Left),
+        "center" => Some(RenderedRegionAlignment::Center),
+        "right" => Some(RenderedRegionAlignment::Right),
+        "start" => Some(RenderedRegionAlignment::Start),
+        "end" => Some(RenderedRegionAlignment::End),
+        _ => None,
+    }
+}
+
+fn rendered_region_texts(
+    styles: &Styles,
+    document: &PagedDocument,
+    kind: PageRegionKind,
+) -> Vec<String> {
+    if page_region_content(styles, kind).is_none() {
+        return vec![];
+    }
+    document
+        .pages
+        .iter()
+        .map(|page| rendered_region_text(&page.frame, kind))
+        .collect()
+}
+
+fn rendered_region_text(page_frame: &Frame, kind: PageRegionKind) -> String {
+    let mut text = String::new();
+    collect_positioned_region_text(
+        page_frame,
+        Point::zero(),
+        page_frame.height().to_pt(),
+        kind,
+        0,
+        &mut text,
+    );
+    text
+}
+
+fn collect_positioned_region_text(
+    frame: &Frame,
+    origin: Point,
+    page_height_pt: f64,
+    kind: PageRegionKind,
+    mut artifact_depth: usize,
+    out: &mut String,
+) {
+    for (pos, item) in frame.items() {
+        let absolute = origin + *pos;
+        match item {
+            FrameItem::Tag(Tag::Start(content, _)) if content.elem().name() == "artifact" => {
+                artifact_depth += 1;
+            }
+            FrameItem::Tag(Tag::End(_, _, _)) if artifact_depth > 0 => {
+                artifact_depth -= 1;
+            }
+            FrameItem::Text(text) => {
+                if artifact_depth > 0 && point_belongs_to_region(absolute, page_height_pt, kind) {
+                    out.push_str(text.text.as_str());
+                }
+            }
+            FrameItem::Group(group) => collect_positioned_region_text(
+                &group.frame,
+                absolute,
+                page_height_pt,
+                kind,
+                artifact_depth,
+                out,
+            ),
+            FrameItem::Shape(_, _)
+            | FrameItem::Image(_, _, _)
+            | FrameItem::Link(_, _)
+            | FrameItem::Tag(_) => {}
+        }
+    }
+}
+
+fn point_belongs_to_region(point: Point, page_height_pt: f64, kind: PageRegionKind) -> bool {
+    let y = point.y.to_pt();
+    match kind {
+        PageRegionKind::Header => y < page_height_pt * 0.2,
+        PageRegionKind::Footer => y > page_height_pt * 0.8,
+        PageRegionKind::Background | PageRegionKind::Foreground => true,
     }
 }
 

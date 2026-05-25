@@ -55,7 +55,12 @@ fn main() -> Result<()> {
         eval_to_realized_content(&new_world).context("failed to evaluate new document")?;
 
     eprintln!("Diffing...");
-    let diff_result = diff::diff_annotated(&old_content, &new_content);
+    let diff_result = diff::diff_annotated_with_rendered_regions(
+        &old_content,
+        &new_content,
+        &old_world,
+        &new_world,
+    )?;
     if let Some(path) = &args.log_modifications {
         std::fs::write(path, diff_result.modification_log())
             .with_context(|| format!("failed to write modification log {:?}", path))?;

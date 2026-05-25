@@ -28,7 +28,7 @@ use typst::visualize::{Color, Stroke};
 use crate::container_ops;
 use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
-    RegionPath, WordOp,
+    RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, WordOp,
 };
 
 fn green() -> Color {
@@ -336,6 +336,11 @@ pub fn build_annotated_content_from_tree(
             &result.regions,
             compact_substitutions,
         );
+        apply_rendered_region_edits_to_page_styles(
+            &mut annotated_block.page_styles,
+            &result.rendered_regions,
+            compact_substitutions,
+        );
         if current_page_styles
             .as_ref()
             .is_some_and(|s| s != &annotated_block.page_styles)
@@ -348,6 +353,11 @@ pub fn build_annotated_content_from_tree(
     flush_group(&mut groups, &mut current_blocks, current_page_styles);
     let mut root_styles = result.root_styles.clone();
     apply_region_edits_to_root_styles(&mut root_styles, &result.regions, compact_substitutions);
+    apply_rendered_region_edits_to_root_styles(
+        &mut root_styles,
+        &result.rendered_regions,
+        compact_substitutions,
+    );
     Content::sequence(groups).styled_with_map(root_styles)
 }
 
@@ -438,6 +448,143 @@ fn set_root_page_region(root_styles: &mut Styles, kind: PageRegionKind, content:
         PageRegionKind::Background => root_styles.push(PageElem::background.set(Some(content))),
         PageRegionKind::Foreground => root_styles.push(PageElem::foreground.set(Some(content))),
     }
+}
+
+fn apply_rendered_region_edits_to_root_styles(
+    root_styles: &mut Styles,
+    regions: &[RenderedRegionEdit],
+    compact: bool,
+) {
+    for region in regions {
+        let content = rendered_region_context_content(region, compact);
+        set_root_page_region(root_styles, region.kind, content);
+    }
+}
+
+fn apply_rendered_region_edits_to_page_styles(
+    page_styles: &mut Styles,
+    regions: &[RenderedRegionEdit],
+    compact: bool,
+) {
+    if page_styles.is_empty() {
+        return;
+    }
+    for region in regions {
+        if !page_styles_has_region(page_styles, region.kind) {
+            continue;
+        }
+        let content = rendered_region_context_content(region, compact);
+        set_root_page_region(page_styles, region.kind, content);
+    }
+}
+
+fn rendered_region_context_content(region: &RenderedRegionEdit, compact: bool) -> Content {
+    let mut source = String::from("#context {\n  let p = counter(page).get().first()\n");
+    for page in &region.pages {
+        source.push_str(&format!(
+            "  {} p == {} {{ ",
+            if page.page == 1 { "if" } else { "else if" },
+            page.page
+        ));
+        push_rendered_region_wrapper_start(&mut source, region.wrapper);
+        source.push_str(&word_ops_typst_markup(&page.word_ops, compact));
+        push_rendered_region_wrapper_end(&mut source, region.wrapper);
+        source.push_str(" }\n");
+    }
+    if let Some(last) = region.pages.last() {
+        source.push_str("  else { ");
+        push_rendered_region_wrapper_start(&mut source, region.wrapper);
+        source.push_str(&typst_escape_content(last.base.plain_text().as_str()));
+        push_rendered_region_wrapper_end(&mut source, region.wrapper);
+        source.push_str(" }\n");
+    }
+    source.push_str("}\n");
+    crate::eval::eval_snippet_to_content(&source).expect("generated rendered region Typst is valid")
+}
+
+fn push_rendered_region_wrapper_start(source: &mut String, wrapper: RenderedRegionWrapper) {
+    match wrapper {
+        RenderedRegionWrapper::None => source.push('['),
+        RenderedRegionWrapper::Align(alignment) => {
+            source.push_str("align(");
+            source.push_str(rendered_region_alignment_name(alignment));
+            source.push_str(")[");
+        }
+    }
+}
+
+fn push_rendered_region_wrapper_end(source: &mut String, _wrapper: RenderedRegionWrapper) {
+    source.push(']');
+}
+
+fn rendered_region_alignment_name(alignment: RenderedRegionAlignment) -> &'static str {
+    match alignment {
+        RenderedRegionAlignment::Left => "left",
+        RenderedRegionAlignment::Center => "center",
+        RenderedRegionAlignment::Right => "right",
+        RenderedRegionAlignment::Start => "start",
+        RenderedRegionAlignment::End => "end",
+    }
+}
+
+fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
+    let mut out = String::new();
+    for (i, op) in word_ops.iter().enumerate() {
+        match op {
+            WordOp::Equal(tokens) => {
+                for token in tokens {
+                    out.push_str(&typst_escape_content(token.content.plain_text().as_str()));
+                }
+            }
+            WordOp::Insert(tokens) => {
+                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
+                let next = word_ops.get(i + 1);
+                let adjacent_delete = prev.is_some_and(|op| matches!(op, WordOp::Delete(_)))
+                    || next.is_some_and(|op| matches!(op, WordOp::Delete(_)));
+                let color = if compact && adjacent_delete {
+                    "#0064dc"
+                } else {
+                    "#00b400"
+                };
+                out.push_str(&format!(
+                    "#text(fill: rgb(\"{}\"))[{}]",
+                    color,
+                    typst_escape_content(&tokens_plain_text(tokens))
+                ));
+            }
+            WordOp::Delete(tokens) => {
+                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
+                let next = word_ops.get(i + 1);
+                let is_substitution = compact
+                    && (prev.is_some_and(|op| matches!(op, WordOp::Insert(_)))
+                        || next.is_some_and(|op| matches!(op, WordOp::Insert(_))));
+                if !is_substitution {
+                    out.push_str(&format!(
+                        "#strike[#text(fill: rgb(\"#dc0000\"))[{}]]",
+                        typst_escape_content(&tokens_plain_text(tokens))
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn tokens_plain_text(tokens: &[crate::diff::Token]) -> String {
+    let mut text = String::new();
+    for token in tokens {
+        text.push_str(token.content.plain_text().as_str());
+    }
+    text
+}
+
+fn typst_escape_content(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| match c {
+            '\\' | '[' | ']' | '#' => ['\\', c].into_iter().collect::<Vec<_>>(),
+            _ => [c].into_iter().collect(),
+        })
+        .collect()
 }
 
 fn marginal_content(content: Content) -> Content {
@@ -752,6 +899,7 @@ mod tests {
             }],
             root_styles: Default::default(),
             regions: vec![],
+            rendered_regions: vec![],
         };
         build_annotated_content_from_tree(&result, compact)
     }

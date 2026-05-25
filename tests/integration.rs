@@ -44,6 +44,43 @@ fn assert_valid_pdf(pdf: &[u8]) {
     assert!(pdf.len() > 1000, "PDF suspiciously small");
 }
 
+#[derive(Clone)]
+struct TextRun {
+    text: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    fill: typst::visualize::Paint,
+}
+
+fn rendered_text_runs(frame: &typst::layout::Frame) -> Vec<TextRun> {
+    fn collect(frame: &typst::layout::Frame, origin: typst::layout::Point, out: &mut Vec<TextRun>) {
+        for (pos, item) in frame.items() {
+            let absolute = origin + *pos;
+            match item {
+                typst::layout::FrameItem::Text(text) => out.push(TextRun {
+                    text: text.text.to_string(),
+                    x: absolute.x.to_pt(),
+                    y: absolute.y.to_pt(),
+                    width: text.width().to_pt(),
+                    fill: text.fill.clone(),
+                }),
+                typst::layout::FrameItem::Group(group) => {
+                    collect(&group.frame, absolute, out);
+                }
+                typst::layout::FrameItem::Shape(_, _)
+                | typst::layout::FrameItem::Image(_, _, _)
+                | typst::layout::FrameItem::Link(_, _)
+                | typst::layout::FrameItem::Tag(_) => {}
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(frame, typst::layout::Point::zero(), &mut out);
+    out
+}
+
 fn count_nodes<T: typst::foundations::NativeElement>(content: &Content) -> usize {
     let mut count = 0;
     let _ = content.traverse::<_, ()>(&mut |c| {
@@ -1064,6 +1101,114 @@ fn corpus_32_header_change_is_page_region_edit() {
     assert!(log.contains("New"), "{log}");
 
     let new_world = corpus_world("32-headers-and-footers/new.typ");
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
+    use typst_diff::diff::PageRegionKind;
+
+    let old_world = corpus_world("42-page-x-of-y/old.typ");
+    let new_world = corpus_world("42-page-x-of-y/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+
+    let footer = result
+        .rendered_regions
+        .iter()
+        .find(|region| region.kind == PageRegionKind::Footer)
+        .expect("expected contextual footer rendered region edit");
+    assert_eq!(
+        footer.pages.len(),
+        3,
+        "expected every new footer instance to be renderable"
+    );
+
+    let log = result.modification_log();
+    assert!(log.contains("Page 1 of 3"), "{log}");
+    assert!(log.contains("Page 2 of 3"), "{log}");
+    assert!(log.contains("deleted: 2"), "{log}");
+    assert!(log.contains("inserted: 3"), "{log}");
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let first_page = &document.pages[0].frame;
+    let page_height = first_page.height().to_pt();
+    let page_width = first_page.width().to_pt();
+    let footer_runs = rendered_text_runs(first_page)
+        .into_iter()
+        .filter(|run| run.y > page_height * 0.8)
+        .collect::<Vec<_>>();
+    let footer_text = footer_runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    assert!(footer_text.contains("Page 1 of 23"), "{footer_text}");
+    assert!(
+        footer_runs.iter().any(|run| {
+            run.text == "2" && run.fill == typst::visualize::Color::from_u8(220, 0, 0, 255).into()
+        }),
+        "expected deleted page total to render red in footer"
+    );
+    assert!(
+        footer_runs.iter().any(|run| {
+            run.text == "3" && run.fill == typst::visualize::Color::from_u8(0, 180, 0, 255).into()
+        }),
+        "expected inserted page total to render green in footer"
+    );
+    let min_x = footer_runs
+        .iter()
+        .map(|run| run.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = footer_runs
+        .iter()
+        .map(|run| run.x + run.width)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let footer_center = (min_x + max_x) / 2.0;
+    assert!(
+        (footer_center - page_width / 2.0).abs() < 10.0,
+        "footer should stay centered: footer_center={footer_center}, page_width={page_width}"
+    );
+
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn corpus_43_contextual_alternating_headers_are_rendered_region_edits() {
+    use typst_diff::diff::PageRegionKind;
+
+    let old_world = corpus_world("43-alternating-headers/old.typ");
+    let new_world = corpus_world("43-alternating-headers/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+
+    assert!(
+        result
+            .rendered_regions
+            .iter()
+            .any(|region| region.kind == PageRegionKind::Header),
+        "expected contextual header rendered region edit"
+    );
+
+    let log = result.modification_log();
+    assert!(log.contains("Old"), "{log}");
+    assert!(log.contains("New"), "{log}");
+    assert!(log.contains("Draft"), "{log}");
+    assert!(log.contains("Final"), "{log}");
+    assert!(
+        !log.contains("Lorem ipsum"),
+        "rendered header extraction should not absorb body text:\n{log}"
+    );
+
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);

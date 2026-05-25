@@ -17,12 +17,20 @@ use anyhow::Result;
 use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
+use typst::diag::{FileError, FileResult};
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{Content, NativeElement, Style, StyleChain, Styles, Target, TargetElem};
+use typst::foundations::{
+    Bytes, Content, Datetime, NativeElement, Style, StyleChain, Styles, Target, TargetElem,
+};
 use typst::introspection::{Introspector, Locator};
-use typst::layout::{PageElem, PagebreakElem};
+use typst::layout::{PageElem, PagebreakElem, PagedDocument};
 use typst::model::{DocumentInfo, FootnoteElem};
 use typst::routines::{Arenas, RealizationKind};
+use typst::syntax::{FileId, Source, VirtualPath};
+use typst::text::{Font, FontBook};
+use typst::utils::LazyHash;
+use typst::{Library, LibraryExt};
+use typst_kit::fonts::{FontSearcher, FontSlot};
 
 use crate::diag::format_diagnostics;
 use crate::normalize::normalize_list_item_runs;
@@ -50,6 +58,68 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
     .map_err(|errs| anyhow::anyhow!("eval failed:\n{}", format_diagnostics(world, &errs)))
 }
 
+/// Evaluate generated Typst source into content.
+pub fn eval_snippet_to_content(source: &str) -> Result<Content> {
+    let world = SnippetWorld::new(source);
+    eval_to_content(&world)
+}
+
+struct SnippetWorld {
+    main: FileId,
+    source: Source,
+    library: LazyHash<Library>,
+    book: LazyHash<FontBook>,
+    font_slots: Vec<FontSlot>,
+}
+
+impl SnippetWorld {
+    fn new(text: &str) -> Self {
+        let main = FileId::new(None, VirtualPath::new("/snippet.typ"));
+        let fonts = FontSearcher::new().search();
+        Self {
+            main,
+            source: Source::new(main, text.to_string()),
+            library: LazyHash::new(Library::default()),
+            book: LazyHash::new(fonts.book),
+            font_slots: fonts.fonts,
+        }
+    }
+}
+
+impl World for SnippetWorld {
+    fn library(&self) -> &LazyHash<Library> {
+        &self.library
+    }
+
+    fn book(&self) -> &LazyHash<FontBook> {
+        &self.book
+    }
+
+    fn main(&self) -> FileId {
+        self.main
+    }
+
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        if id == self.main {
+            Ok(self.source.clone())
+        } else {
+            Err(FileError::NotFound(id.vpath().as_rooted_path().into()))
+        }
+    }
+
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        Err(FileError::NotFound(id.vpath().as_rooted_path().into()))
+    }
+
+    fn font(&self, index: usize) -> Option<Font> {
+        self.font_slots[index].get()
+    }
+
+    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
+        None
+    }
+}
+
 /// Evaluate, layout, and realize the document into a stable [`Content`] tree.
 ///
 /// Steps:
@@ -73,6 +143,57 @@ pub fn eval_to_realized_content(world: &dyn World) -> Result<crate::annotated::A
     let mut next = 0;
     crate::annotated::annotate_footnote_markers(&mut annotated, &footnotes, &mut next);
     Ok(annotated)
+}
+
+/// Layout content to a finished paged document using Typst's normal convergence loop.
+pub fn layout_document(world: &dyn World, content: &Content) -> Result<PagedDocument> {
+    let library = world.library();
+    let base = StyleChain::new(&library.styles);
+    let target = TargetElem::target.set(Target::Paged).wrap();
+    let styles = base.chain(&target);
+
+    let traced = Traced::default();
+    let mut introspector = Introspector::default();
+    let mut final_sink = Sink::new();
+    let mut document = None;
+
+    for _ in 0..5 {
+        let constraint = typst::comemo::Constraint::new();
+        let mut sink = Sink::new();
+        let mut engine = Engine {
+            routines: &ROUTINES,
+            world: world.track(),
+            introspector: introspector.track_with(&constraint),
+            traced: traced.track(),
+            sink: sink.track_mut(),
+            route: Route::default(),
+        };
+
+        let laid_out =
+            typst_layout::layout_document(&mut engine, content, styles).map_err(|errs| {
+                anyhow::anyhow!("layout failed:\n{}", format_diagnostics(world, &errs))
+            })?;
+        let next_introspector = laid_out.introspector.clone();
+        let converged = constraint.validate(&next_introspector);
+
+        document = Some(laid_out);
+        final_sink = sink;
+        introspector = next_introspector;
+
+        if converged {
+            break;
+        }
+    }
+
+    let delayed = final_sink.delayed();
+    if !delayed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "layout errors:\n{}",
+            format_diagnostics(world, &delayed)
+        ));
+    }
+
+    document.ok_or_else(|| anyhow::anyhow!("layout loop did not run"))
 }
 
 /// Run layout up to 5 times until the [`Introspector`] converges.
