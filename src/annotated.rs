@@ -112,6 +112,20 @@ pub struct FootnoteInfo {
 /// The realized field of every node in the returned tree is always identical to
 /// a subtree of `realized` — this is the read-only invariant.
 pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent {
+    // Root-level mismatch: pre is a bare SequenceElem but realized has been
+    // wrapped with root page styles (StyledElem → SequenceElem). Peel the
+    // wrapper and recurse with the same pre so the inner SequenceElem matches.
+    if pre.to_packed::<SequenceElem>().is_some() {
+        if let Some(styled) = realized.to_packed::<StyledElem>() {
+            let inner = annotate_realized(pre, &styled.child);
+            return AnnotatedContent {
+                realized: realized.clone(),
+                annotation: Annotation { span: pre.span(), ..Annotation::default() },
+                children: inner.children,
+            };
+        }
+    }
+
     // --- Structural elements: semantic_kind + slot map ---
     if pre.is::<ListElem>() {
         return annotate_with_kind(pre, realized, SemanticKind::List, map_list_to_children);
@@ -223,6 +237,23 @@ fn leaf_annotated(realized: &Content, annotation: Annotation) -> AnnotatedConten
     AnnotatedContent { realized: realized.clone(), annotation, children: vec![] }
 }
 
+/// Return the effective span of a realized content node.
+///
+/// Realization wraps nodes with `StyledElem` for non-page styles. The outer
+/// `StyledElem` inherits the file root span (`Span(1)`) rather than the
+/// original node's span. Look through StyledElem wrappers to find the first
+/// non-file-root span so that `pair_sequence_by_span` can match pre children
+/// against their realized counterparts.
+fn effective_span(c: &Content) -> typst::syntax::Span {
+    if let Some(styled) = c.to_packed::<StyledElem>() {
+        let inner = effective_span(&styled.child);
+        if !inner.is_detached() && inner != c.span() {
+            return inner;
+        }
+    }
+    c.span()
+}
+
 /// Pair pre and realized sequence children by span, in document order.
 ///
 /// Used when a `SequenceElem`'s pre and realized children counts diverge.
@@ -230,6 +261,10 @@ fn leaf_annotated(realized: &Content, annotation: Annotation) -> AnnotatedConten
 /// cursor through realized children seeking a span match. Skipped realized
 /// children become anonymous leaves. Pre children with no realized partner
 /// are dropped. Trailing realized children become anonymous leaves.
+///
+/// Realized children that are `StyledElem` wrappers (added by realization)
+/// are matched by looking through the wrapper to the inner content's span via
+/// `effective_span`, because the outer wrapper inherits the file root span.
 fn pair_sequence_by_span(
     pre_children: &[Content],
     real_children: &[Content],
@@ -239,7 +274,7 @@ fn pair_sequence_by_span(
     for pre_child in pre_children {
         let target = pre_child.span();
         // Walk forward past non-matching realized children, recording them as anonymous.
-        while cursor < real_children.len() && real_children[cursor].span() != target {
+        while cursor < real_children.len() && effective_span(&real_children[cursor]) != target {
             out.push(leaf_annotated(&real_children[cursor], Annotation::default()));
             cursor += 1;
         }

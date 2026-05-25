@@ -334,6 +334,27 @@ mod tests {
     }
 
     #[test]
+    fn annotate_realized_root_has_semantic_children() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "- Item A\n- Item B").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+        let annotated = eval_to_realized_content(&world).unwrap();
+
+        assert!(
+            !annotated.children.is_empty(),
+            "root annotated node must have children; got none"
+        );
+        let has_list = annotated.children.iter().any(|c| {
+            matches!(c.annotation.semantic_kind, Some(crate::annotated::SemanticKind::List))
+        });
+        assert!(
+            has_list,
+            "expected a child with SemanticKind::List, children had kinds: {:?}",
+            annotated.children.iter().map(|c| &c.annotation.semantic_kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn style_partitioning_separates_page_and_non_page_styles() {
         let mut styles = Styles::new();
         styles.push(PageElem::flipped.set(true));
