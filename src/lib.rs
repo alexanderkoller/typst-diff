@@ -18,6 +18,7 @@
 
 pub mod annotate;
 pub mod annotated;
+mod container_ops;
 pub mod content_slots;
 pub mod diag;
 pub mod diff;

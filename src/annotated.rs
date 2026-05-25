@@ -5,21 +5,13 @@
 //! preserved exactly as Typst produced it; annotations are built once and
 //! never mutated.
 
+use crate::container_ops::{self, ContainerKind};
+use crate::content_slots::SlotStep;
 use typst::foundations::{Content, SequenceElem, StyledElem};
-use typst::foundations::StyleChain;
-use typst::layout::{
-    AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridChild, GridElem, GridItem, PadElem,
-    PlaceElem, StackElem,
-};
 use typst::math::EquationElem;
-use typst::model::{
-    EnumElem, FigureElem, FootnoteElem, HeadingElem, ListElem, ParElem, QuoteElem, TableElem,
-    TermsElem,
-};
+use typst::model::{HeadingElem, ParElem};
 use typst::syntax::Span;
 use typst::text::RawElem;
-use typst::visualize::{CircleElem, EllipseElem, RectElem};
-use crate::content_slots::SlotStep;
 
 /// A realized Content node together with its semantic identity.
 #[derive(Clone)]
@@ -43,6 +35,24 @@ impl AnnotatedContent {
     pub fn is_empty(&self) -> bool {
         self.realized.is_empty()
     }
+
+    /// Resolve a descendant path through [`AnnotatedContent::children`].
+    pub fn get_path(&self, path: &[usize]) -> Option<&AnnotatedContent> {
+        let mut node = self;
+        for index in path {
+            node = node.children.get(*index)?;
+        }
+        Some(node)
+    }
+
+    /// Resolve a mutable descendant path through [`AnnotatedContent::children`].
+    pub fn get_path_mut(&mut self, path: &[usize]) -> Option<&mut AnnotatedContent> {
+        let mut node = self;
+        for index in path {
+            node = node.children.get_mut(*index)?;
+        }
+        Some(node)
+    }
 }
 
 #[derive(Clone)]
@@ -54,6 +64,8 @@ pub struct Annotation {
     pub slots: Vec<SemanticSlot>,
     /// Footnote body if this realized node is a footnote marker site.
     pub footnote: Option<FootnoteInfo>,
+    /// Structured content to use as the local edit surface when realization is opaque.
+    pub patch_surface: Option<Content>,
     /// Source span for diagnostics (not used as a lookup key).
     pub span: Span,
 }
@@ -64,6 +76,7 @@ impl Default for Annotation {
             semantic_kind: None,
             slots: vec![],
             footnote: None,
+            patch_surface: None,
             span: Span::detached(),
         }
     }
@@ -89,17 +102,25 @@ pub enum SemanticKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WrapperKind {
-    Align, Pad, Place, Columns, Box, Block, Rect, Circle, Ellipse,
+    Align,
+    Pad,
+    Place,
+    Columns,
+    Box,
+    Block,
+    Rect,
+    Circle,
+    Ellipse,
 }
 
 /// A named semantic position within an [`AnnotatedContent`] node.
 ///
-/// `child_index` points into the parent's `children` vec.
+/// `path` points through the annotated realized tree's `children` vec.
 /// `label` identifies the slot's role (e.g. `ListItem(0)`).
 #[derive(Clone, Debug)]
 pub struct SemanticSlot {
     pub label: SlotStep,
-    pub child_index: usize,
+    pub path: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -120,63 +141,48 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             let inner = annotate_realized(pre, &styled.child);
             return AnnotatedContent {
                 realized: realized.clone(),
-                annotation: Annotation { span: pre.span(), ..Annotation::default() },
+                annotation: Annotation {
+                    span: pre.span(),
+                    ..Annotation::default()
+                },
                 children: inner.children,
             };
         }
     }
 
     // --- Structural elements: semantic_kind + slot map ---
-    if pre.is::<ListElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::List, map_list_to_children);
-    }
-    if pre.is::<EnumElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Enum, map_enum_to_children);
-    }
-    if pre.is::<TermsElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Terms, map_terms_to_children);
-    }
-    if pre.is::<TableElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Table, map_table_to_children);
-    }
-    if pre.is::<GridElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Grid, map_grid_to_children);
-    }
-    if pre.is::<StackElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Stack, map_stack_to_children);
-    }
-    if pre.is::<FigureElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Figure, map_figure_to_children);
-    }
-    if pre.is::<FootnoteElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Footnote, map_footnote_to_children);
-    }
-    if pre.is::<QuoteElem>() {
-        return annotate_with_kind(pre, realized, SemanticKind::Quote, map_quote_to_children);
-    }
-    if let Some(wrapper_kind) = wrapper_kind_of(pre) {
-        return annotate_with_kind(pre, realized, SemanticKind::Wrapper(wrapper_kind), map_wrapper_to_children);
+    if let Some(kind) = ContainerKind::of(pre) {
+        return annotate_container(pre, realized, kind);
     }
     if pre.is::<EquationElem>() {
-        return leaf_annotated(realized, Annotation {
-            semantic_kind: Some(SemanticKind::Equation),
-            span: pre.span(),
-            ..Annotation::default()
-        });
+        return leaf_annotated(
+            realized,
+            Annotation {
+                semantic_kind: Some(SemanticKind::Equation),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+        );
     }
     if pre.is::<HeadingElem>() {
-        return leaf_annotated(realized, Annotation {
-            semantic_kind: Some(SemanticKind::Heading),
-            span: pre.span(),
-            ..Annotation::default()
-        });
+        return leaf_annotated(
+            realized,
+            Annotation {
+                semantic_kind: Some(SemanticKind::Heading),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+        );
     }
     if pre.is::<RawElem>() {
-        return leaf_annotated(realized, Annotation {
-            semantic_kind: Some(SemanticKind::RawBlock),
-            span: pre.span(),
-            ..Annotation::default()
-        });
+        return leaf_annotated(
+            realized,
+            Annotation {
+                semantic_kind: Some(SemanticKind::RawBlock),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+        );
     }
 
     // --- Transparent wrappers: pairwise descent ---
@@ -185,7 +191,9 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         realized.to_packed::<SequenceElem>(),
     ) {
         let children = if pre_seq.children.len() == real_seq.children.len() {
-            pre_seq.children.iter()
+            pre_seq
+                .children
+                .iter()
                 .zip(real_seq.children.iter())
                 .map(|(p, r)| annotate_realized(p, r))
                 .collect()
@@ -194,7 +202,10 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         };
         return AnnotatedContent {
             realized: realized.clone(),
-            annotation: Annotation { span: pre.span(), ..Annotation::default() },
+            annotation: Annotation {
+                span: pre.span(),
+                ..Annotation::default()
+            },
             children,
         };
     }
@@ -220,14 +231,16 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         let child = annotate_realized(&pre_s.child, &real_s.child);
         return AnnotatedContent {
             realized: realized.clone(),
-            annotation: Annotation { span: pre.span(), ..Annotation::default() },
+            annotation: Annotation {
+                span: pre.span(),
+                ..Annotation::default()
+            },
             children: vec![child],
         };
     }
-    if let (Some(pre_p), Some(real_p)) = (
-        pre.to_packed::<ParElem>(),
-        realized.to_packed::<ParElem>(),
-    ) {
+    if let (Some(pre_p), Some(real_p)) =
+        (pre.to_packed::<ParElem>(), realized.to_packed::<ParElem>())
+    {
         let child = annotate_realized(&pre_p.body, &real_p.body);
         return AnnotatedContent {
             realized: realized.clone(),
@@ -241,15 +254,22 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     }
 
     // --- Leaf fallback ---
-    leaf_annotated(realized, Annotation {
-        semantic_kind: semantic_kind_of(pre),
-        span: pre.span(),
-        ..Annotation::default()
-    })
+    leaf_annotated(
+        realized,
+        Annotation {
+            semantic_kind: semantic_kind_of(pre),
+            span: pre.span(),
+            ..Annotation::default()
+        },
+    )
 }
 
 fn leaf_annotated(realized: &Content, annotation: Annotation) -> AnnotatedContent {
-    AnnotatedContent { realized: realized.clone(), annotation, children: vec![] }
+    AnnotatedContent {
+        realized: realized.clone(),
+        annotation,
+        children: vec![],
+    }
 }
 
 /// Return the effective span of a realized content node.
@@ -298,7 +318,10 @@ fn pair_sequence_by_span(
 
         if let Some(idx) = match_idx {
             while cursor < idx {
-                out.push(leaf_annotated(&real_children[cursor], Annotation::default()));
+                out.push(leaf_annotated(
+                    &real_children[cursor],
+                    Annotation::default(),
+                ));
                 cursor += 1;
             }
             out.push(annotate_realized(pre_child, &real_children[idx]));
@@ -316,350 +339,51 @@ fn pair_sequence_by_span(
     }
     // Any trailing unmatched realized children become anonymous leaves.
     while cursor < real_children.len() {
-        out.push(leaf_annotated(&real_children[cursor], Annotation::default()));
+        out.push(leaf_annotated(
+            &real_children[cursor],
+            Annotation::default(),
+        ));
         cursor += 1;
     }
     out
 }
 
 fn semantic_kind_of(pre: &Content) -> Option<SemanticKind> {
-    if pre.is::<HeadingElem>() { return Some(SemanticKind::Heading); }
-    if pre.is::<EquationElem>() { return Some(SemanticKind::Equation); }
-    if pre.is::<RawElem>() { return Some(SemanticKind::RawBlock); }
-    if pre.is::<ListElem>() { return Some(SemanticKind::List); }
-    if pre.is::<EnumElem>() { return Some(SemanticKind::Enum); }
-    if pre.is::<TermsElem>() { return Some(SemanticKind::Terms); }
-    if pre.is::<TableElem>() { return Some(SemanticKind::Table); }
-    if pre.is::<GridElem>() { return Some(SemanticKind::Grid); }
-    if pre.is::<StackElem>() { return Some(SemanticKind::Stack); }
-    if pre.is::<FigureElem>() { return Some(SemanticKind::Figure); }
-    if pre.is::<FootnoteElem>() { return Some(SemanticKind::Footnote); }
-    if pre.is::<QuoteElem>() { return Some(SemanticKind::Quote); }
-    if let Some(wk) = wrapper_kind_of(pre) { return Some(SemanticKind::Wrapper(wk)); }
-    if pre.is::<ParElem>() { return Some(SemanticKind::Paragraph); }
+    if pre.is::<HeadingElem>() {
+        return Some(SemanticKind::Heading);
+    }
+    if pre.is::<EquationElem>() {
+        return Some(SemanticKind::Equation);
+    }
+    if pre.is::<RawElem>() {
+        return Some(SemanticKind::RawBlock);
+    }
+    if let Some(kind) = ContainerKind::of(pre) {
+        return Some(kind.semantic_kind());
+    }
+    if pre.is::<ParElem>() {
+        return Some(SemanticKind::Paragraph);
+    }
     None
 }
 
-fn wrapper_kind_of(pre: &Content) -> Option<WrapperKind> {
-    if pre.is::<AlignElem>() { return Some(WrapperKind::Align); }
-    if pre.is::<PadElem>() { return Some(WrapperKind::Pad); }
-    if pre.is::<PlaceElem>() { return Some(WrapperKind::Place); }
-    if pre.is::<ColumnsElem>() { return Some(WrapperKind::Columns); }
-    if pre.is::<BoxElem>() { return Some(WrapperKind::Box); }
-    if pre.is::<BlockElem>() { return Some(WrapperKind::Block); }
-    if pre.is::<RectElem>() { return Some(WrapperKind::Rect); }
-    if pre.is::<CircleElem>() { return Some(WrapperKind::Circle); }
-    if pre.is::<EllipseElem>() { return Some(WrapperKind::Ellipse); }
-    None
-}
-
-/// Build an AnnotatedContent for a structural element using a per-type mapper.
-fn annotate_with_kind(
-    pre: &Content,
-    realized: &Content,
-    kind: SemanticKind,
-    mapper: fn(&Content, &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>),
-) -> AnnotatedContent {
-    let (children, slots) = mapper(pre, realized);
+/// Build an AnnotatedContent for a structural element through shared container ops.
+fn annotate_container(pre: &Content, realized: &Content, kind: ContainerKind) -> AnnotatedContent {
+    let semantic_kind = kind.semantic_kind();
+    let mapping = container_ops::map_container(pre, realized, kind);
+    let patch_surface = mapping.patch_surface;
+    let patch_surface = (patch_surface != *realized).then_some(patch_surface);
     AnnotatedContent {
         realized: realized.clone(),
         annotation: Annotation {
-            semantic_kind: Some(kind),
-            slots,
+            semantic_kind: Some(semantic_kind),
+            slots: mapping.slots,
+            patch_surface,
             span: pre.span(),
             footnote: None,
         },
-        children,
+        children: mapping.children,
     }
-}
-
-/// Collect the "leaf block" children of a realized tree by descending through
-/// BlockElem / GridElem / StyledElem wrappers.
-pub fn collect_leaf_block_children(content: &Content) -> Vec<Content> {
-    // Descend into BlockElem body
-    if let Some(block) = content.to_packed::<BlockElem>() {
-        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
-            return collect_leaf_block_children(&body);
-        }
-    }
-    // Collect GridElem cells (skip non-cell items like gutters)
-    if let Some(grid) = content.to_packed::<GridElem>() {
-        let mut cells = Vec::new();
-        for child in &grid.children {
-            match child {
-                GridChild::Item(GridItem::Cell(cell)) => cells.push(cell.body.clone()),
-                GridChild::Header(h) => {
-                    for item in &h.children {
-                        if let GridItem::Cell(cell) = item { cells.push(cell.body.clone()); }
-                    }
-                }
-                GridChild::Footer(f) => {
-                    for item in &f.children {
-                        if let GridItem::Cell(cell) = item { cells.push(cell.body.clone()); }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !cells.is_empty() { return cells; }
-    }
-    // Descend into StyledElem
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        let inner = collect_leaf_block_children(&styled.child);
-        if !inner.is_empty() { return inner; }
-    }
-    if let Some(list) = content.to_packed::<ListElem>() {
-        return list
-            .children
-            .iter()
-            .map(|item| item.body.clone())
-            .collect();
-    }
-    if let Some(enm) = content.to_packed::<EnumElem>() {
-        return enm
-            .children
-            .iter()
-            .map(|item| item.body.clone())
-            .collect();
-    }
-    // SequenceElem: return children directly
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq
-            .children
-            .iter()
-            .flat_map(collect_leaf_block_children)
-            .collect();
-    }
-    // Fallback: treat the node itself as a single child
-    vec![content.clone()]
-}
-
-fn map_list_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let Some(list) = pre.to_packed::<ListElem>() else { return (vec![], vec![]); };
-    let realized_children = collect_leaf_block_children(realized);
-    let children: Vec<AnnotatedContent> = list.children.iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let fallback = item.body.clone();
-            let real = realized_child_or_fallback(&realized_children, idx, &fallback);
-            annotate_realized(&item.body, &real)
-        })
-        .collect();
-    let slots: Vec<SemanticSlot> = (0..list.children.len())
-        .map(|i| SemanticSlot { label: SlotStep::ListItem(i), child_index: i })
-        .collect();
-    (children, slots)
-}
-
-fn map_enum_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let Some(enm) = pre.to_packed::<EnumElem>() else { return (vec![], vec![]); };
-    let realized_children = collect_leaf_block_children(realized);
-    let children: Vec<AnnotatedContent> = enm.children.iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let fallback = item.body.clone();
-            let real = realized_child_or_fallback(&realized_children, idx, &fallback);
-            annotate_realized(&item.body, &real)
-        })
-        .collect();
-    let slots: Vec<SemanticSlot> = (0..enm.children.len())
-        .map(|i| SemanticSlot { label: SlotStep::EnumItem(i), child_index: i })
-        .collect();
-    (children, slots)
-}
-
-fn realized_child_or_fallback(
-    realized_children: &[Content],
-    idx: usize,
-    fallback: &Content,
-) -> Content {
-    let Some(realized) = realized_children.get(idx) else {
-        return fallback.clone();
-    };
-    if realized.plain_text().is_empty() && !fallback.plain_text().is_empty() {
-        return fallback.clone();
-    }
-    realized.clone()
-}
-
-fn map_terms_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let Some(terms) = pre.to_packed::<TermsElem>() else { return (vec![], vec![]); };
-    // Each term item contributes 2 slots: term + description.
-    // Expected realized children count = 2 * items.len()
-    let realized_children = collect_leaf_block_children(realized);
-    // Note: this assumes the realized form exposes 2*N leaf children (one term + one
-    // description per item) via collect_leaf_block_children. If Typst realizes
-    // TermsElem differently (e.g. as a StackElem), the count will mismatch and slots
-    // will be empty, falling back to flat word-diff. Verify against actual realized
-    // form when wiring in Stage 5.
-    let mut children = Vec::new();
-    let mut slots = Vec::new();
-    for (i, item) in terms.children.iter().enumerate() {
-        let term_fallback = item.term.clone();
-        let desc_fallback = item.description.clone();
-        let term_real = realized_children.get(i * 2).unwrap_or(&term_fallback);
-        let desc_real = realized_children.get(i * 2 + 1).unwrap_or(&desc_fallback);
-        slots.push(SemanticSlot { label: SlotStep::Term(i), child_index: children.len() });
-        children.push(annotate_realized(&item.term, term_real));
-        slots.push(SemanticSlot { label: SlotStep::TermDescription(i), child_index: children.len() });
-        children.push(annotate_realized(&item.description, desc_real));
-    }
-    (children, slots)
-}
-
-fn map_table_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    use typst::model::{TableChild, TableItem};
-    let Some(table) = pre.to_packed::<TableElem>() else { return (vec![], vec![]); };
-    // Collect pre cell bodies in document order
-    let mut pre_cells: Vec<Content> = Vec::new();
-    for child in &table.children {
-        match child {
-            TableChild::Header(h) => {
-                for item in &h.children {
-                    if let TableItem::Cell(c) = item { pre_cells.push(c.body.clone()); }
-                }
-            }
-            TableChild::Footer(f) => {
-                for item in &f.children {
-                    if let TableItem::Cell(c) = item { pre_cells.push(c.body.clone()); }
-                }
-            }
-            TableChild::Item(TableItem::Cell(c)) => pre_cells.push(c.body.clone()),
-            _ => {}
-        }
-    }
-    let realized_children = collect_leaf_block_children(realized);
-    let children: Vec<AnnotatedContent> = pre_cells.iter()
-        .enumerate()
-        .map(|(idx, pre_cell)| {
-            let fallback = pre_cell.clone();
-            let real = realized_children.get(idx).unwrap_or(&fallback);
-            annotate_realized(pre_cell, real)
-        })
-        .collect();
-    let slots: Vec<SemanticSlot> = (0..pre_cells.len())
-        .map(|i| SemanticSlot { label: SlotStep::TableCell(i), child_index: i })
-        .collect();
-    (children, slots)
-}
-
-fn map_grid_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let Some(grid) = pre.to_packed::<GridElem>() else { return (vec![], vec![]); };
-    let mut pre_cells: Vec<Content> = Vec::new();
-    for child in &grid.children {
-        match child {
-            GridChild::Header(h) => {
-                for item in &h.children {
-                    if let GridItem::Cell(c) = item { pre_cells.push(c.body.clone()); }
-                }
-            }
-            GridChild::Footer(f) => {
-                for item in &f.children {
-                    if let GridItem::Cell(c) = item { pre_cells.push(c.body.clone()); }
-                }
-            }
-            GridChild::Item(GridItem::Cell(c)) => pre_cells.push(c.body.clone()),
-            _ => {}
-        }
-    }
-    let realized_children = collect_leaf_block_children(realized);
-    let children: Vec<AnnotatedContent> = pre_cells.iter()
-        .enumerate()
-        .map(|(idx, pre_cell)| {
-            let fallback = pre_cell.clone();
-            let real = realized_children.get(idx).unwrap_or(&fallback);
-            annotate_realized(pre_cell, real)
-        })
-        .collect();
-    let slots: Vec<SemanticSlot> = (0..pre_cells.len())
-        .map(|i| SemanticSlot { label: SlotStep::GridCell(i), child_index: i })
-        .collect();
-    (children, slots)
-}
-
-fn map_stack_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    use typst::layout::StackChild;
-    let Some(stack) = pre.to_packed::<StackElem>() else { return (vec![], vec![]); };
-    let pre_blocks: Vec<(usize, Content)> = stack.children.iter().enumerate()
-        .filter_map(|(i, child)| {
-            if let StackChild::Block(body) = child { Some((i, body.clone())) } else { None }
-        })
-        .collect();
-    let realized_children = collect_leaf_block_children(realized);
-    let mut children = Vec::new();
-    let mut slots = Vec::new();
-    for (idx, (orig_idx, pre_body)) in pre_blocks.into_iter().enumerate() {
-        let fallback = pre_body.clone();
-        let real = realized_children.get(idx).unwrap_or(&fallback);
-        slots.push(SemanticSlot { label: SlotStep::StackChild(orig_idx), child_index: children.len() });
-        children.push(annotate_realized(&pre_body, real));
-    }
-    (children, slots)
-}
-
-fn map_figure_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let Some(figure) = pre.to_packed::<FigureElem>() else { return (vec![], vec![]); };
-    let realized_children = collect_leaf_block_children(realized);
-    let mut pre_parts: Vec<(SlotStep, Content)> = vec![(SlotStep::FigureBody, figure.body.clone())];
-    if let Some(cap) = figure.caption.get_cloned(StyleChain::default()) {
-        pre_parts.push((SlotStep::FigureCaption, cap.body.clone()));
-    }
-    if realized_children.len() != pre_parts.len() { return (vec![], vec![]); }
-    let mut children = Vec::new();
-    let mut slots = Vec::new();
-    for ((label, pre_body), real) in pre_parts.into_iter().zip(realized_children.iter()) {
-        slots.push(SemanticSlot { label, child_index: children.len() });
-        children.push(annotate_realized(&pre_body, real));
-    }
-    (children, slots)
-}
-
-fn map_footnote_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    use typst::model::FootnoteBody;
-    let Some(footnote) = pre.to_packed::<FootnoteElem>() else { return (vec![], vec![]); };
-    let FootnoteBody::Content(body) = &footnote.body else { return (vec![], vec![]); };
-    let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != 1 { return (vec![], vec![]); }
-    let child = annotate_realized(body, &realized_children[0]);
-    let slot = SemanticSlot { label: SlotStep::FootnoteBody, child_index: 0 };
-    (vec![child], vec![slot])
-}
-
-fn map_quote_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let Some(quote) = pre.to_packed::<QuoteElem>() else { return (vec![], vec![]); };
-    let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != 1 { return (vec![], vec![]); }
-    let child = annotate_realized(&quote.body, &realized_children[0]);
-    let slot = SemanticSlot { label: SlotStep::QuoteBody, child_index: 0 };
-    (vec![child], vec![slot])
-}
-
-fn map_wrapper_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
-    let pre_body = wrapper_body_of(pre);
-    let Some(pre_body) = pre_body else { return (vec![], vec![]); };
-    let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != 1 { return (vec![], vec![]); }
-    let child = annotate_realized(&pre_body, &realized_children[0]);
-    let slot = SemanticSlot { label: SlotStep::WrapperBody, child_index: 0 };
-    (vec![child], vec![slot])
-}
-
-fn wrapper_body_of(content: &Content) -> Option<Content> {
-    if let Some(e) = content.to_packed::<AlignElem>() { return Some(e.body.clone()); }
-    if let Some(e) = content.to_packed::<PadElem>() { return Some(e.body.clone()); }
-    if let Some(e) = content.to_packed::<PlaceElem>() { return Some(e.body.clone()); }
-    if let Some(e) = content.to_packed::<ColumnsElem>() { return Some(e.body.clone()); }
-    if let Some(e) = content.to_packed::<BoxElem>() { return e.body.get_cloned(StyleChain::default()); }
-    if let Some(e) = content.to_packed::<BlockElem>() {
-        return match e.body.get_cloned(StyleChain::default()) {
-            Some(BlockBody::Content(b)) => Some(b),
-            _ => None,
-        };
-    }
-    if let Some(e) = content.to_packed::<RectElem>() { return e.body.get_cloned(StyleChain::default()); }
-    if let Some(e) = content.to_packed::<CircleElem>() { return e.body.get_cloned(StyleChain::default()); }
-    if let Some(e) = content.to_packed::<EllipseElem>() { return e.body.get_cloned(StyleChain::default()); }
-    None
 }
 
 /// Walk `node` in document order and attach [`FootnoteInfo`] to any node whose realized
@@ -674,19 +398,27 @@ pub fn annotate_footnote_markers(
     footnotes: &[Content],
     next: &mut usize,
 ) {
-    if footnotes.is_empty() { return; }
-    if *next >= footnotes.len() { return; }
+    if footnotes.is_empty() {
+        return;
+    }
+    if *next >= footnotes.len() {
+        return;
+    }
 
     // Check if this realized node is a footnote marker number
     if is_footnote_marker_text(&node.realized, *next + 1) {
-        node.annotation.footnote = Some(FootnoteInfo { body: footnotes[*next].clone() });
+        node.annotation.footnote = Some(FootnoteInfo {
+            body: footnotes[*next].clone(),
+        });
         *next += 1;
         return;
     }
 
     for child in &mut node.children {
         annotate_footnote_markers(child, footnotes, next);
-        if *next >= footnotes.len() { return; }
+        if *next >= footnotes.len() {
+            return;
+        }
     }
 }
 
@@ -699,7 +431,10 @@ fn is_footnote_marker_text(content: &Content, number: usize) -> bool {
         return is_footnote_marker_text(&styled.child, number);
     }
     if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq.children.iter().any(|c| is_footnote_marker_text(c, number));
+        return seq
+            .children
+            .iter()
+            .any(|c| is_footnote_marker_text(c, number));
     }
     false
 }
@@ -709,7 +444,9 @@ mod tests {
     use super::*;
     use typst::text::TextElem;
 
-    fn text(s: &str) -> Content { TextElem::packed(s) }
+    fn text(s: &str) -> Content {
+        TextElem::packed(s)
+    }
 
     fn seq(items: impl IntoIterator<Item = Content>) -> Content {
         Content::sequence(items)
@@ -769,9 +506,8 @@ mod tests {
         // The realized field must be byte-identical to what was passed in.
         use typst::visualize::Color;
         let pre = text("before");
-        let realized = text("after").styled(TextElem::fill.set(
-            Color::from_u8(1, 2, 3, 255).into()
-        ));
+        let realized =
+            text("after").styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
         let realized_clone = realized.clone();
         let node = annotate_realized(&pre, &realized);
         assert_eq!(node.realized, realized_clone);
@@ -793,9 +529,15 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
         assert_eq!(node.annotation.slots.len(), 3);
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::ListItem(0)));
-        assert_eq!(node.annotation.slots[0].child_index, 0);
-        assert!(matches!(node.annotation.slots[2].label, SlotStep::ListItem(2)));
+        assert!(matches!(
+            node.annotation.slots[0].label,
+            SlotStep::ListItem(0)
+        ));
+        assert_eq!(node.annotation.slots[0].path, vec![0]);
+        assert!(matches!(
+            node.annotation.slots[2].label,
+            SlotStep::ListItem(2)
+        ));
         assert_eq!(node.children[0].realized.plain_text(), "Alpha");
         assert_eq!(node.children[2].realized.plain_text(), "Gamma");
     }
@@ -826,15 +568,16 @@ mod tests {
         use typst::foundations::Packed;
         use typst::model::{ListElem, ListItem};
 
-        let pre = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(text("Alpha"))),
-        ]));
+        let pre = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
+            "Alpha",
+        )))]));
         let realized = seq([text("Alpha"), text("extra")]); // 2 realized children, 1 pre item
         let node = annotate_realized(&pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
         assert_eq!(node.annotation.slots.len(), 1);
-        assert_eq!(node.children.len(), 1);
+        assert_eq!(node.children.len(), 2);
+        assert_eq!(node.annotation.slots[0].path, vec![0]);
         assert_eq!(node.children[0].realized.plain_text(), "Alpha");
     }
 
@@ -852,30 +595,46 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Enum));
         assert_eq!(node.annotation.slots.len(), 2);
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::EnumItem(0)));
-        assert!(matches!(node.annotation.slots[1].label, SlotStep::EnumItem(1)));
+        assert!(matches!(
+            node.annotation.slots[0].label,
+            SlotStep::EnumItem(0)
+        ));
+        assert!(matches!(
+            node.annotation.slots[1].label,
+            SlotStep::EnumItem(1)
+        ));
         assert_eq!(node.children[1].realized.plain_text(), "Two");
     }
 
     #[test]
     fn annotate_terms_maps_term_and_description_separately() {
         use typst::foundations::Packed;
-        use typst::model::{TermsElem, TermItem};
+        use typst::model::{TermItem, TermsElem};
 
-        let pre = Content::new(TermsElem::new(vec![
-            Packed::new(TermItem::new(text("API"), text("Definition"))),
-        ]));
+        let pre = Content::new(TermsElem::new(vec![Packed::new(TermItem::new(
+            text("API"),
+            text("Definition"),
+        ))]));
         // Realized: 2 children for 1 term (term + description)
         let realized = seq([text("API"), text("Definition")]);
         let node = annotate_realized(&pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Terms));
         assert_eq!(node.annotation.slots.len(), 2);
-        let labels: Vec<String> = node.annotation.slots.iter()
+        let labels: Vec<String> = node
+            .annotation
+            .slots
+            .iter()
             .map(|s| format!("{:?}", s.label))
             .collect();
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::Term(0)), "{labels:?}");
-        assert!(matches!(node.annotation.slots[1].label, SlotStep::TermDescription(0)), "{labels:?}");
+        assert!(
+            matches!(node.annotation.slots[0].label, SlotStep::Term(0)),
+            "{labels:?}"
+        );
+        assert!(
+            matches!(node.annotation.slots[1].label, SlotStep::TermDescription(0)),
+            "{labels:?}"
+        );
         assert_eq!(node.children[0].realized.plain_text(), "API");
         assert_eq!(node.children[1].realized.plain_text(), "Definition");
     }
@@ -896,31 +655,41 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Table));
         assert_eq!(node.annotation.slots.len(), 4);
-        assert!(matches!(node.annotation.slots[2].label, SlotStep::TableCell(2)));
+        assert!(matches!(
+            node.annotation.slots[2].label,
+            SlotStep::TableCell(2)
+        ));
         assert_eq!(node.children[3].realized.plain_text(), "D");
     }
 
     #[test]
     fn annotate_figure_maps_body_and_caption_separately() {
+        use crate::content_slots::normalize_list_item_runs;
+        use crate::eval::eval_to_content;
+        use crate::world::SystemWorld;
         use std::fs;
         use tempfile::TempDir;
-        use crate::world::SystemWorld;
-        use crate::eval::eval_to_content;
-        use crate::content_slots::normalize_list_item_runs;
+        use typst::model::FigureElem;
 
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("main.typ"),
-            "#figure(rect(width: 10pt, height: 4pt), caption: [Old cap])"
-        ).unwrap();
+        fs::write(
+            dir.path().join("main.typ"),
+            "#figure(rect(width: 10pt, height: 4pt), caption: [Old cap])",
+        )
+        .unwrap();
         let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
         let pre = normalize_list_item_runs(eval_to_content(&world).unwrap());
 
         // Find the FigureElem in the pre tree
         fn find_figure_pre(content: &Content) -> Option<Content> {
-            if content.is::<FigureElem>() { return Some(content.clone()); }
+            if content.is::<FigureElem>() {
+                return Some(content.clone());
+            }
             if let Some(seq) = content.to_packed::<SequenceElem>() {
                 for child in &seq.children {
-                    if let Some(f) = find_figure_pre(child) { return Some(f); }
+                    if let Some(f) = find_figure_pre(child) {
+                        return Some(f);
+                    }
                 }
             }
             if let Some(styled) = content.to_packed::<StyledElem>() {
@@ -935,8 +704,18 @@ mod tests {
         let node = annotate_realized(&figure_pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Figure));
-        assert!(node.annotation.slots.iter().any(|s| matches!(s.label, SlotStep::FigureBody)));
-        assert!(node.annotation.slots.iter().any(|s| matches!(s.label, SlotStep::FigureCaption)));
+        assert!(
+            node.annotation
+                .slots
+                .iter()
+                .any(|s| matches!(s.label, SlotStep::FigureBody))
+        );
+        assert!(
+            node.annotation
+                .slots
+                .iter()
+                .any(|s| matches!(s.label, SlotStep::FigureCaption))
+        );
     }
 
     #[test]
@@ -946,12 +725,18 @@ mod tests {
 
         let align_pre = Content::new(AlignElem::new(text("body")));
         let node = annotate_realized(&align_pre, &align_pre);
-        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Wrapper(WrapperKind::Align)));
+        assert_eq!(
+            node.annotation.semantic_kind,
+            Some(SemanticKind::Wrapper(WrapperKind::Align))
+        );
 
-        let block_pre = Content::new(BlockElem::new()
-            .with_body(Some(BlockBody::Content(text("body")))));
+        let block_pre =
+            Content::new(BlockElem::new().with_body(Some(BlockBody::Content(text("body")))));
         let node = annotate_realized(&block_pre, &block_pre);
-        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Wrapper(WrapperKind::Block)));
+        assert_eq!(
+            node.annotation.semantic_kind,
+            Some(SemanticKind::Wrapper(WrapperKind::Block))
+        );
     }
 
     #[test]
@@ -990,14 +775,30 @@ mod tests {
             GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("Alpha"))))),
             GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("Beta"))))),
         ];
-        let realized = Content::new(BlockElem::new()
-            .with_body(Some(BlockBody::Content(Content::new(GridElem::new(cells))))));
+        let realized = Content::new(
+            BlockElem::new()
+                .with_body(Some(BlockBody::Content(Content::new(GridElem::new(cells))))),
+        );
         let node = annotate_realized(&pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
         assert_eq!(node.annotation.slots.len(), 2);
-        assert_eq!(node.children[0].realized.plain_text(), "Alpha");
-        assert_eq!(node.children[1].realized.plain_text(), "Beta");
+        assert_eq!(node.annotation.slots[0].path, vec![0, 0]);
+        assert_eq!(node.annotation.slots[1].path, vec![0, 1]);
+        assert_eq!(
+            node.get_path(&node.annotation.slots[0].path)
+                .unwrap()
+                .realized
+                .plain_text(),
+            "Alpha"
+        );
+        assert_eq!(
+            node.get_path(&node.annotation.slots[1].path)
+                .unwrap()
+                .realized
+                .plain_text(),
+            "Beta"
+        );
     }
 
     #[test]
@@ -1009,8 +810,10 @@ mod tests {
         let node = annotate_realized(&pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Heading));
-        assert!(node.children.is_empty(),
-            "heading is a leaf in the annotated tree");
+        assert!(
+            node.children.is_empty(),
+            "heading is a leaf in the annotated tree"
+        );
         assert!(node.realized.plain_text().contains('1'));
         assert!(node.realized.plain_text().contains("Intro"));
     }
@@ -1029,8 +832,14 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Grid));
         assert_eq!(node.annotation.slots.len(), 2);
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::GridCell(0)));
-        assert!(matches!(node.annotation.slots[1].label, SlotStep::GridCell(1)));
+        assert!(matches!(
+            node.annotation.slots[0].label,
+            SlotStep::GridCell(0)
+        ));
+        assert!(matches!(
+            node.annotation.slots[1].label,
+            SlotStep::GridCell(1)
+        ));
         assert_eq!(node.children[0].realized.plain_text(), "X");
         assert_eq!(node.children[1].realized.plain_text(), "Y");
     }
@@ -1048,8 +857,14 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Stack));
         assert_eq!(node.annotation.slots.len(), 2);
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::StackChild(0)));
-        assert!(matches!(node.annotation.slots[1].label, SlotStep::StackChild(1)));
+        assert!(matches!(
+            node.annotation.slots[0].label,
+            SlotStep::StackChild(0)
+        ));
+        assert!(matches!(
+            node.annotation.slots[1].label,
+            SlotStep::StackChild(1)
+        ));
         assert_eq!(node.children[0].realized.plain_text(), "Block0");
         assert_eq!(node.children[1].realized.plain_text(), "Block1");
     }
@@ -1065,7 +880,10 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Footnote));
         assert_eq!(node.annotation.slots.len(), 1);
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::FootnoteBody));
+        assert!(matches!(
+            node.annotation.slots[0].label,
+            SlotStep::FootnoteBody
+        ));
         assert_eq!(node.children[0].realized.plain_text(), "Footnote text");
     }
 
@@ -1079,8 +897,11 @@ mod tests {
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Quote));
         assert_eq!(node.annotation.slots.len(), 1);
-        assert!(matches!(node.annotation.slots[0].label, SlotStep::QuoteBody));
-        assert_eq!(node.annotation.slots[0].child_index, 0);
+        assert!(matches!(
+            node.annotation.slots[0].label,
+            SlotStep::QuoteBody
+        ));
+        assert_eq!(node.annotation.slots[0].path, vec![0]);
         assert_eq!(node.children[0].realized.plain_text(), "Quote body");
     }
 
@@ -1103,16 +924,17 @@ mod tests {
     fn annotate_footnote_marker_detects_styled_marker() {
         // Styled footnote markers (e.g. superscript) wrap TextElem in StyledElem.
         // annotate_footnote_markers must look through the wrapper.
-        use typst::model::FootnoteElem;
         use typst::model::FootnoteBody;
+        use typst::model::FootnoteElem;
 
         let footnote_body = text("Note body");
-        let footnotes = vec![Content::new(FootnoteElem::new(FootnoteBody::Content(footnote_body)))];
+        let footnotes = vec![Content::new(FootnoteElem::new(FootnoteBody::Content(
+            footnote_body,
+        )))];
 
         // Simulate a realized tree where the marker is a styled "1" (e.g. superscript)
-        let marker = text("1").styled(TextElem::fill.set(
-            typst::visualize::Color::from_u8(0, 0, 0, 255).into()
-        ));
+        let marker = text("1")
+            .styled(TextElem::fill.set(typst::visualize::Color::from_u8(0, 0, 0, 255).into()));
         let mut node = AnnotatedContent {
             realized: marker,
             annotation: Annotation::default(),
@@ -1122,6 +944,9 @@ mod tests {
         annotate_footnote_markers(&mut node, &footnotes, &mut next);
 
         assert_eq!(next, 1, "footnote should have been matched");
-        assert!(node.annotation.footnote.is_some(), "footnote info should be attached");
+        assert!(
+            node.annotation.footnote.is_some(),
+            "footnote info should be attached"
+        );
     }
 }

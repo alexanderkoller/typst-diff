@@ -34,7 +34,7 @@ use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
-use crate::annotated::{AnnotatedContent, Annotation, SemanticKind};
+use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot};
 use crate::content_slots::SlotStep;
 
 /// A block-level unit of content together with the page styles active at its position.
@@ -1220,81 +1220,121 @@ fn is_page_style(style: &Style) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Tree-shaped diff types
+// Realized edit diff types
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Tree-shaped diff result.
+/// Diff result for the annotated realized-tree pipeline.
 pub struct DiffResult {
-    pub blocks: Vec<DiffNode>,
+    pub blocks: Vec<DiffBlockEdit>,
     pub root_styles: Styles,
 }
 
-pub struct DiffNode {
-    pub node: AnnotatedContent,
-    pub status: NodeStatus,
-    /// Per-slot children, populated when status is `HasChangedDescendants`.
-    pub children: Vec<DiffNode>,
+pub struct DiffBlockEdit {
+    /// New-side realized block for normal edits; old-side block for pure deletes.
+    pub base: AnnotatedContent,
+    /// Edits to apply to `base.realized`.
+    pub edits: Vec<RealizedEdit>,
     /// Page styles active at this block's position (for output grouping).
     pub page_styles: Styles,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum NodeStatus {
-    Unchanged,
-    HasChangedDescendants,
-    Deleted,
-    Inserted,
-    Modified(Vec<WordOp>),
+pub enum RealizedEdit {
+    ReplaceAt {
+        path: Vec<usize>,
+        content: EditContent,
+    },
+    InsertBefore {
+        anchor: Vec<usize>,
+        content: EditContent,
+    },
+    InsertAfter {
+        anchor: Vec<usize>,
+        content: EditContent,
+    },
+    Append {
+        content: EditContent,
+    },
+    WholeBlock(EditContent),
+}
+
+pub enum EditContent {
+    Inserted(Content),
+    Deleted(Content),
+    Modified {
+        base: Content,
+        word_ops: Vec<WordOp>,
+    },
+    Nested {
+        base: AnnotatedContent,
+        edits: Vec<RealizedEdit>,
+    },
 }
 
 impl DiffResult {
     pub fn modification_log(&self) -> String {
         let mut log = String::new();
-        for (index, node) in self.blocks.iter().enumerate() {
-            log_diff_node(&mut log, node, index);
+        for (index, block) in self.blocks.iter().enumerate() {
+            log_block_edit(&mut log, block, index);
         }
         log
     }
 }
 
-fn log_diff_node(log: &mut String, node: &DiffNode, index: usize) {
-    match &node.status {
-        NodeStatus::Unchanged => {}
-        NodeStatus::Deleted => push_log_entry(
-            log,
-            index,
-            "delete",
-            &[("text", node.node.realized.plain_text().to_string())],
-        ),
-        NodeStatus::Inserted => push_log_entry(
+fn log_block_edit(log: &mut String, block: &DiffBlockEdit, index: usize) {
+    for edit in &block.edits {
+        log_realized_edit(log, edit, index);
+    }
+}
+
+fn log_realized_edit(log: &mut String, edit: &RealizedEdit, index: usize) {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content) => log_edit_content(log, content, index),
+    }
+}
+
+fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
+    match content {
+        EditContent::Inserted(content) => push_log_entry(
             log,
             index,
             "insert",
-            &[("text", node.node.realized.plain_text().to_string())],
+            &[("text", content.plain_text().to_string())],
         ),
-        NodeStatus::Modified(word_ops) => {
-            let deletes = collect_word_op_text(word_ops, |op| match op {
-                WordOp::Delete(t) => Some(t),
-                _ => None,
-            });
-            let inserts = collect_word_op_text(word_ops, |op| match op {
-                WordOp::Insert(t) => Some(t),
-                _ => None,
-            });
-            push_log_entry(
-                log,
-                index,
-                "modify",
-                &[
-                    ("block", node.node.realized.plain_text().to_string()),
-                    ("deleted", deletes),
-                    ("inserted", inserts),
-                ],
-            );
+        EditContent::Deleted(content) => push_log_entry(
+            log,
+            index,
+            "delete",
+            &[("text", content.plain_text().to_string())],
+        ),
+        EditContent::Modified { base, word_ops } => {
+            if has_textual_word_change(word_ops) {
+                let deletes = collect_word_op_text(word_ops, |op| match op {
+                    WordOp::Delete(t) => Some(t),
+                    _ => None,
+                });
+                let inserts = collect_word_op_text(word_ops, |op| match op {
+                    WordOp::Insert(t) => Some(t),
+                    _ => None,
+                });
+                push_log_entry(
+                    log,
+                    index,
+                    "modify",
+                    &[
+                        ("block", base.plain_text().to_string()),
+                        ("deleted", deletes),
+                        ("inserted", inserts),
+                    ],
+                );
+            }
         }
-        NodeStatus::HasChangedDescendants => {
-            for (ci, child) in node.children.iter().enumerate() {
-                log_diff_node(log, child, ci);
+        EditContent::Nested { edits, .. } => {
+            for edit in edits {
+                log_realized_edit(log, edit, index);
             }
         }
     }
@@ -1318,51 +1358,39 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
                     if annotated_subtree_equal(old_ann, new_ann) {
-                        return DiffNode {
-                            node: find_or_wrap_annotated(&new_block.content, new),
-                            status: NodeStatus::Unchanged,
-                            children: vec![],
+                        return DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, None),
+                            edits: vec![],
                             page_styles,
                         };
                     }
-                    let slot_children = diff_slot_children(old_ann, new_ann, &page_styles);
-                    let any_changed = slot_children
-                        .iter()
-                        .any(|c| !matches!(c.status, NodeStatus::Unchanged));
-                    if any_changed {
-                        return DiffNode {
-                            node: AnnotatedContent {
-                                realized: new_block.content.clone(),
-                                annotation: new_ann.annotation.clone(),
-                                children: new_ann.children.clone(),
-                            },
-                            status: NodeStatus::HasChangedDescendants,
-                            children: slot_children,
+                    let edits = diff_slot_edits(old_ann, new_ann);
+                    if !edits.is_empty() {
+                        return DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            edits,
                             page_styles,
                         };
                     }
                 }
-                DiffNode {
-                    node: find_or_wrap_annotated(&new_block.content, new),
-                    status: NodeStatus::Unchanged,
-                    children: vec![],
+                DiffBlockEdit {
+                    base: annotated_block_from(&new_block.content, None),
+                    edits: vec![],
                     page_styles: new_block.page_styles,
                 }
             }
-            BlockOp::Delete(old_block) => DiffNode {
-                node: AnnotatedContent {
-                    realized: old_block.content.clone(),
-                    annotation: Annotation::default(),
-                    children: vec![],
-                },
-                status: NodeStatus::Deleted,
-                children: vec![],
+            BlockOp::Delete(old_block) => DiffBlockEdit {
+                base: annotated_block_from(&old_block.content, None),
+                edits: vec![RealizedEdit::WholeBlock(EditContent::Deleted(
+                    old_block.content.clone(),
+                ))],
                 page_styles: old_block.page_styles,
             },
-            BlockOp::Insert(new_block) => DiffNode {
-                node: find_or_wrap_annotated(&new_block.content, new),
-                status: NodeStatus::Inserted,
-                children: vec![],
+            BlockOp::Insert(new_block) => DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, None),
+                edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
+                    new_block.content.clone(),
+                ))],
                 page_styles: new_block.page_styles,
             },
             BlockOp::Replace(old_block, new_block) => {
@@ -1374,33 +1402,23 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
                     if annotated_subtree_equal(old_ann, new_ann) {
-                        return DiffNode {
-                            node: find_or_wrap_annotated(&new_block.content, new),
-                            status: NodeStatus::Unchanged,
-                            children: vec![],
+                        return DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, None),
+                            edits: vec![],
                             page_styles,
                         };
                     }
-                    let slot_children = diff_slot_children(old_ann, new_ann, &page_styles);
-                    let any_changed = slot_children
-                        .iter()
-                        .any(|c| !matches!(c.status, NodeStatus::Unchanged));
-                    if any_changed {
-                        return DiffNode {
-                            node: AnnotatedContent {
-                                realized: new_block.content.clone(),
-                                annotation: new_ann.annotation.clone(),
-                                children: new_ann.children.clone(),
-                            },
-                            status: NodeStatus::HasChangedDescendants,
-                            children: slot_children,
+                    let edits = diff_slot_edits(old_ann, new_ann);
+                    if !edits.is_empty() {
+                        return DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            edits,
                             page_styles,
                         };
                     }
-                    return DiffNode {
-                        node: find_or_wrap_annotated(&new_block.content, new),
-                        status: NodeStatus::Unchanged,
-                        children: vec![],
+                    return DiffBlockEdit {
+                        base: annotated_block_from(&new_block.content, None),
+                        edits: vec![],
                         page_styles,
                     };
                 }
@@ -1408,69 +1426,97 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 let old_tokens = extract_words(&old_block.content);
                 let new_tokens = extract_words(&new_block.content);
                 let word_ops = diff_words(&old_tokens, &new_tokens);
-                let status = if has_textual_word_change(&word_ops) {
-                    NodeStatus::Modified(word_ops)
+                let edits = if has_textual_word_change(&word_ops) {
+                    vec![RealizedEdit::WholeBlock(EditContent::Modified {
+                        base: new_block.content.clone(),
+                        word_ops,
+                    })]
                 } else {
-                    NodeStatus::Unchanged
+                    vec![]
                 };
-                DiffNode {
-                    node: find_or_wrap_annotated(&new_block.content, new),
-                    status,
-                    children: vec![],
+                DiffBlockEdit {
+                    base: annotated_block_from(&new_block.content, None),
+                    edits,
                     page_styles,
                 }
             }
         })
         .collect();
 
-    DiffResult { blocks, root_styles }
+    DiffResult {
+        blocks,
+        root_styles,
+    }
 }
 
-/// Wrap a block-level `content` (from `extract_block_units`) as an `AnnotatedContent`
-/// for the new tree-shaped diff result.
-///
-/// In an earlier draft this function also searched the annotated tree for a node
-/// whose `realized` matched `content` and returned a clone of that node (so that
-/// the resulting `DiffNode` could carry `semantic_kind` / `slots` from the
-/// annotated tree). That path is currently disabled: the realized content stored
-/// in the annotated tree carries introspector state (locators, tag references)
-/// from the original realize pass, and feeding it back into `layout_document`
-/// causes the layout engine to hang. The block content produced by
-/// `extract_block_units` goes through `apply_block_styles` which rebuilds the
-/// wrapping styles into a fresh `StyledElem`, breaking those references — so we
-/// always wrap the block content directly.
-///
-/// The Phase A statuses (`Unchanged`, `Inserted`, `Modified`) only read
-/// `node.realized`, so dropping the annotation here costs nothing in the current
-/// pipeline. When `HasChangedDescendants` is wired up in Phase B, the matched-node
-/// path will need to be re-introduced — but it will need to surface the
-/// annotation without re-using the stored realized content.
-fn find_or_wrap_annotated(content: &Content, _root: &AnnotatedContent) -> AnnotatedContent {
+fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) -> AnnotatedContent {
+    if let Some(source) = source {
+        return source.clone();
+    }
     AnnotatedContent {
         realized: content.clone(),
-        annotation: Annotation::default(),
+        annotation: Default::default(),
         children: vec![],
     }
 }
 
-/// Find the direct child of `root` whose realized content matches `target`.
-fn find_annotated_child<'a>(root: &'a AnnotatedContent, target: &Content) -> Option<&'a AnnotatedContent> {
-    root.children
-        .iter()
-        .find(|child| child.realized == *target)
-        .or_else(|| {
-            let target_text = target.plain_text();
-            if target_text.is_empty() {
-                root.children
-                    .iter()
-                    .filter(|child| child.realized.plain_text().is_empty())
-                    .max_by_key(|child| child.annotation.slots.len())
-            } else {
-                root.children
-                    .iter()
-                    .find(|child| child.realized.plain_text() == target_text)
-            }
-        })
+/// Find the annotated descendant whose realized content matches `target`.
+fn find_annotated_child<'a>(
+    root: &'a AnnotatedContent,
+    target: &Content,
+) -> Option<&'a AnnotatedContent> {
+    let mut exact = Vec::new();
+    collect_annotated_matches(root, target, MatchKind::Exact, &mut exact);
+    if let Some(best) = exact
+        .into_iter()
+        .max_by_key(|node| node.annotation.slots.len())
+    {
+        return Some(best);
+    }
+
+    let target_text = target.plain_text();
+    let mut text_matches = Vec::new();
+    collect_annotated_matches(
+        root,
+        target,
+        MatchKind::PlainText(target_text.as_str()),
+        &mut text_matches,
+    );
+    text_matches
+        .into_iter()
+        .max_by_key(|node| node.annotation.slots.len())
+}
+
+#[derive(Clone, Copy)]
+enum MatchKind<'a> {
+    Exact,
+    PlainText(&'a str),
+}
+
+fn collect_annotated_matches<'a>(
+    node: &'a AnnotatedContent,
+    target: &Content,
+    kind: MatchKind<'_>,
+    out: &mut Vec<&'a AnnotatedContent>,
+) {
+    let matches = match kind {
+        MatchKind::Exact => node.realized == *target,
+        MatchKind::PlainText(text) => node.realized.plain_text().as_str() == text,
+    };
+    if matches {
+        out.push(node);
+    }
+    for child in &node.children {
+        collect_annotated_matches(
+            child,
+            target,
+            match kind {
+                MatchKind::Exact => MatchKind::Exact,
+                MatchKind::PlainText(text) => MatchKind::PlainText(text),
+            },
+            out,
+        );
+    }
 }
 
 /// True when both nodes have the same slot-bearing semantic kind.
@@ -1490,46 +1536,14 @@ fn can_recurse_via_slots(old: &AnnotatedContent, new: &AnnotatedContent) -> bool
     !old.annotation.slots.is_empty()
 }
 
-fn collect_slot_bearing_descendants<'a>(
-    node: &'a AnnotatedContent,
-) -> Vec<&'a AnnotatedContent> {
-    let mut out = Vec::new();
-    collect_slot_bearing_descendants_into(node, &mut out);
-    out
-}
-
-fn collect_slot_bearing_descendants_into<'a>(
-    node: &'a AnnotatedContent,
-    out: &mut Vec<&'a AnnotatedContent>,
-) {
-    for child in &node.children {
-        if !child.annotation.slots.is_empty() {
-            out.push(child);
-        } else {
-            collect_slot_bearing_descendants_into(child, out);
-        }
-    }
-}
-
-/// Find a unique nested slot-bearing pair when direct slot recursion is unavailable.
-fn find_slot_bearing_descendant_pair<'a>(
-    old: &'a AnnotatedContent,
-    new: &'a AnnotatedContent,
-) -> Option<(&'a AnnotatedContent, &'a AnnotatedContent)> {
-    let old_candidates = collect_slot_bearing_descendants(old);
-    let new_candidates = collect_slot_bearing_descendants(new);
-
-    if old_candidates.len() != 1 || new_candidates.len() != 1 {
-        return None;
-    }
-    let old_candidate = old_candidates[0];
-    let new_candidate = new_candidates[0];
-    can_recurse_via_slots(old_candidate, new_candidate).then_some((old_candidate, new_candidate))
-}
-
 fn effective_content(node: &AnnotatedContent) -> Content {
-    if !node.realized.plain_text().is_empty() || node.children.is_empty() {
-        return node.realized.clone();
+    let surface = node
+        .annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized);
+    if !surface.plain_text().is_empty() || node.children.is_empty() {
+        return surface.clone();
     }
     Content::sequence(node.children.iter().map(effective_content))
 }
@@ -1539,6 +1553,14 @@ fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
         .slots
         .iter()
         .map(|slot| &slot.label)
+        .collect()
+}
+
+fn resolved_slots<'a>(node: &'a AnnotatedContent) -> Vec<(&'a SemanticSlot, &'a AnnotatedContent)> {
+    node.annotation
+        .slots
+        .iter()
+        .filter_map(|slot| node.get_path(&slot.path).map(|child| (slot, child)))
         .collect()
 }
 
@@ -1554,119 +1576,91 @@ fn annotated_subtree_equal(old: &AnnotatedContent, new: &AnnotatedContent) -> bo
             .all(|(old_child, new_child)| annotated_subtree_equal(old_child, new_child))
 }
 
-fn diff_slot_children_same_shape(
+fn diff_slot_edits_same_shape(
     old_ann: &AnnotatedContent,
     new_ann: &AnnotatedContent,
-    page_styles: &Styles,
-) -> Vec<DiffNode> {
-    old_ann
-        .children
-        .iter()
-        .zip(new_ann.children.iter())
-        .map(|(old_child, new_child)| {
-            if annotated_subtree_equal(old_child, new_child) {
-                return DiffNode {
-                    node: new_child.clone(),
-                    status: NodeStatus::Unchanged,
-                    children: vec![],
-                    page_styles: page_styles.clone(),
-                };
-            }
+) -> Vec<RealizedEdit> {
+    let old_slots = resolved_slots(old_ann);
+    let new_slots = resolved_slots(new_ann);
+    let mut edits = Vec::new();
 
-            if can_recurse_via_slots(old_child, new_child) {
-                let grandchildren = diff_slot_children(old_child, new_child, page_styles);
-                let any_changed = grandchildren
-                    .iter()
-                    .any(|n| !matches!(n.status, NodeStatus::Unchanged));
-                if any_changed {
-                    return DiffNode {
-                        node: new_child.clone(),
-                        status: NodeStatus::HasChangedDescendants,
-                        children: grandchildren,
-                        page_styles: page_styles.clone(),
-                    };
-                }
-                return DiffNode {
-                    node: new_child.clone(),
-                    status: NodeStatus::Unchanged,
-                    children: vec![],
-                    page_styles: page_styles.clone(),
-                };
-            }
+    for ((_old_slot, old_child), (new_slot, new_child)) in old_slots.into_iter().zip(new_slots) {
+        if annotated_subtree_equal(old_child, new_child) {
+            continue;
+        }
 
-            if let Some((old_inner, new_inner)) =
-                find_slot_bearing_descendant_pair(old_child, new_child)
-            {
-                let inner_grandchildren = diff_slot_children(old_inner, new_inner, page_styles);
-                let any_changed = inner_grandchildren
-                    .iter()
-                    .any(|n| !matches!(n.status, NodeStatus::Unchanged));
-                if any_changed {
-                    let inner_diff = DiffNode {
-                        node: new_inner.clone(),
-                        status: NodeStatus::HasChangedDescendants,
-                        children: inner_grandchildren,
-                        page_styles: page_styles.clone(),
-                    };
-                    return DiffNode {
-                        node: new_child.clone(),
-                        status: NodeStatus::HasChangedDescendants,
-                        children: vec![inner_diff],
-                        page_styles: page_styles.clone(),
-                    };
-                }
+        if can_recurse_via_slots(old_child, new_child) {
+            let nested_edits = diff_slot_edits(old_child, new_child);
+            if !nested_edits.is_empty() {
+                edits.push(RealizedEdit::ReplaceAt {
+                    path: new_slot.path.clone(),
+                    content: EditContent::Nested {
+                        base: new_child.clone(),
+                        edits: nested_edits,
+                    },
+                });
             }
+        } else {
+            push_modified_slot_edit(&mut edits, old_child, new_child, &new_slot.path);
+        }
+    }
 
-            let old_effective = effective_content(old_child);
-            let new_effective = effective_content(new_child);
-            let old_tokens = extract_words(&old_effective);
-            let new_tokens = extract_words(&new_effective);
-            let word_ops = diff_words(&old_tokens, &new_tokens);
-            let status = if has_textual_word_change(&word_ops) {
-                NodeStatus::Modified(word_ops)
-            } else {
-                NodeStatus::Unchanged
-            };
-            DiffNode {
-                node: new_child.clone(),
-                status,
-                children: vec![],
-                page_styles: page_styles.clone(),
-            }
-        })
-        .collect()
+    edits
 }
 
-fn diff_slot_children(
-    old_ann: &AnnotatedContent,
-    new_ann: &AnnotatedContent,
-    page_styles: &Styles,
-) -> Vec<DiffNode> {
-    if old_ann.children.len() == new_ann.children.len() {
-        diff_slot_children_same_shape(old_ann, new_ann, page_styles)
-    } else {
-        diff_slot_children_lcs(old_ann, new_ann, page_styles)
+fn push_modified_slot_edit(
+    edits: &mut Vec<RealizedEdit>,
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+    path: &[usize],
+) {
+    let old_effective = effective_content(old_child);
+    let new_effective = effective_content(new_child);
+    let old_tokens = extract_words(&old_effective);
+    let new_tokens = extract_words(&new_effective);
+    let word_ops = diff_words(&old_tokens, &new_tokens);
+    if has_textual_word_change(&word_ops) {
+        edits.push(RealizedEdit::ReplaceAt {
+            path: path.to_vec(),
+            content: EditContent::Modified {
+                base: new_effective,
+                word_ops,
+            },
+        });
     }
 }
 
-fn diff_slot_children_lcs(
+fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {
+    if slot_labels(old_ann) == slot_labels(new_ann) {
+        diff_slot_edits_same_shape(old_ann, new_ann)
+    } else {
+        diff_slot_edits_lcs(old_ann, new_ann)
+    }
+}
+
+fn diff_slot_edits_lcs(
     old_ann: &AnnotatedContent,
     new_ann: &AnnotatedContent,
-    page_styles: &Styles,
-) -> Vec<DiffNode> {
-    let old_h: Vec<HashableContent> = old_ann
-        .children
+) -> Vec<RealizedEdit> {
+    let old_slots = resolved_slots(old_ann);
+    let new_slots = resolved_slots(new_ann);
+    let old_h: Vec<String> = old_ann
+        .annotation
+        .slots
         .iter()
-        .map(|child| HashableContent(effective_content(child)))
+        .filter_map(|slot| old_ann.get_path(&slot.path))
+        .map(|child| effective_content(child).plain_text().to_string())
         .collect();
-    let new_h: Vec<HashableContent> = new_ann
-        .children
+    let new_h: Vec<String> = new_ann
+        .annotation
+        .slots
         .iter()
-        .map(|child| HashableContent(effective_content(child)))
+        .filter_map(|slot| new_ann.get_path(&slot.path))
+        .map(|child| effective_content(child).plain_text().to_string())
         .collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_h, &new_h);
 
-    let mut out = Vec::new();
+    let mut edits = Vec::new();
     for op in ops {
         match op {
             DiffOp::Equal {
@@ -1675,43 +1669,44 @@ fn diff_slot_children_lcs(
                 len,
             } => {
                 for i in 0..len {
-                    let old_child = &old_ann.children[old_index + i];
-                    let new_child = &new_ann.children[new_index + i];
-                    let (status, children) = if annotated_subtree_equal(old_child, new_child) {
-                        (NodeStatus::Unchanged, vec![])
-                    } else {
-                        let children = diff_slot_children(old_child, new_child, page_styles);
-                        (NodeStatus::HasChangedDescendants, children)
-                    };
-                    out.push(DiffNode {
-                        node: new_child.clone(),
-                        status,
-                        children,
-                        page_styles: page_styles.clone(),
-                    });
+                    let old_child = old_slots[old_index + i].1;
+                    let new_child = new_slots[new_index + i].1;
+                    if !annotated_subtree_equal(old_child, new_child) {
+                        let nested_edits = diff_slot_edits(old_child, new_child);
+                        if !nested_edits.is_empty() {
+                            edits.push(RealizedEdit::ReplaceAt {
+                                path: new_slots[new_index + i].0.path.clone(),
+                                content: EditContent::Nested {
+                                    base: new_child.clone(),
+                                    edits: nested_edits,
+                                },
+                            });
+                        }
+                    }
                 }
             }
             DiffOp::Delete {
-                old_index, old_len, ..
+                old_index,
+                old_len,
+                new_index,
             } => {
                 for i in 0..old_len {
-                    out.push(DiffNode {
-                        node: old_ann.children[old_index + i].clone(),
-                        status: NodeStatus::Deleted,
-                        children: vec![],
-                        page_styles: page_styles.clone(),
-                    });
+                    push_deleted_slot_edit(
+                        &mut edits,
+                        old_slots[old_index + i].1,
+                        &new_slots,
+                        new_index,
+                    );
                 }
             }
             DiffOp::Insert {
                 new_index, new_len, ..
             } => {
                 for i in 0..new_len {
-                    out.push(DiffNode {
-                        node: new_ann.children[new_index + i].clone(),
-                        status: NodeStatus::Inserted,
-                        children: vec![],
-                        page_styles: page_styles.clone(),
+                    let (slot, child) = new_slots[new_index + i];
+                    edits.push(RealizedEdit::ReplaceAt {
+                        path: slot.path.clone(),
+                        content: EditContent::Inserted(effective_content(child)),
                     });
                 }
             }
@@ -1723,62 +1718,73 @@ fn diff_slot_children_lcs(
             } => {
                 let paired = old_len.min(new_len);
                 for i in 0..paired {
-                    let old_child = &old_ann.children[old_index + i];
-                    let new_child = &new_ann.children[new_index + i];
+                    let old_child = old_slots[old_index + i].1;
+                    let new_child = new_slots[new_index + i].1;
                     if can_recurse_via_slots(old_child, new_child) {
-                        let grandchildren = diff_slot_children(old_child, new_child, page_styles);
-                        let any_changed = grandchildren
-                            .iter()
-                            .any(|n| !matches!(n.status, NodeStatus::Unchanged));
-                        out.push(DiffNode {
-                            node: new_child.clone(),
-                            status: if any_changed {
-                                NodeStatus::HasChangedDescendants
-                            } else {
-                                NodeStatus::Unchanged
-                            },
-                            children: if any_changed { grandchildren } else { vec![] },
-                            page_styles: page_styles.clone(),
-                        });
+                        let nested_edits = diff_slot_edits(old_child, new_child);
+                        if !nested_edits.is_empty() {
+                            edits.push(RealizedEdit::ReplaceAt {
+                                path: new_slots[new_index + i].0.path.clone(),
+                                content: EditContent::Nested {
+                                    base: new_child.clone(),
+                                    edits: nested_edits,
+                                },
+                            });
+                        }
                     } else {
-                        let old_effective = effective_content(old_child);
-                        let new_effective = effective_content(new_child);
-                        let old_tokens = extract_words(&old_effective);
-                        let new_tokens = extract_words(&new_effective);
-                        let word_ops = diff_words(&old_tokens, &new_tokens);
-                        let status = if has_textual_word_change(&word_ops) {
-                            NodeStatus::Modified(word_ops)
-                        } else {
-                            NodeStatus::Unchanged
-                        };
-                        out.push(DiffNode {
-                            node: new_child.clone(),
-                            status,
-                            children: vec![],
-                            page_styles: page_styles.clone(),
-                        });
+                        push_modified_slot_edit(
+                            &mut edits,
+                            old_child,
+                            new_child,
+                            &new_slots[new_index + i].0.path,
+                        );
                     }
                 }
                 for i in paired..old_len {
-                    out.push(DiffNode {
-                        node: old_ann.children[old_index + i].clone(),
-                        status: NodeStatus::Deleted,
-                        children: vec![],
-                        page_styles: page_styles.clone(),
-                    });
+                    push_deleted_slot_edit(
+                        &mut edits,
+                        old_slots[old_index + i].1,
+                        &new_slots,
+                        new_index + paired,
+                    );
                 }
                 for i in paired..new_len {
-                    out.push(DiffNode {
-                        node: new_ann.children[new_index + i].clone(),
-                        status: NodeStatus::Inserted,
-                        children: vec![],
-                        page_styles: page_styles.clone(),
+                    let (slot, child) = new_slots[new_index + i];
+                    edits.push(RealizedEdit::ReplaceAt {
+                        path: slot.path.clone(),
+                        content: EditContent::Inserted(effective_content(child)),
                     });
                 }
             }
         }
     }
-    out
+    edits
+}
+
+fn push_deleted_slot_edit(
+    edits: &mut Vec<RealizedEdit>,
+    old_child: &AnnotatedContent,
+    new_slots: &[(&SemanticSlot, &AnnotatedContent)],
+    new_index: usize,
+) {
+    let content = EditContent::Deleted(effective_content(old_child));
+    if let Some((slot, _)) = new_slots.get(new_index) {
+        edits.push(RealizedEdit::InsertBefore {
+            anchor: slot.path.clone(),
+            content,
+        });
+    } else if new_index > 0 {
+        if let Some((slot, _)) = new_slots.get(new_index - 1) {
+            edits.push(RealizedEdit::InsertAfter {
+                anchor: slot.path.clone(),
+                content,
+            });
+        } else {
+            edits.push(RealizedEdit::Append { content });
+        }
+    } else {
+        edits.push(RealizedEdit::Append { content });
+    }
 }
 
 #[cfg(test)]
@@ -1801,7 +1807,7 @@ mod tests {
             children: vec![],
         };
         let result = diff_annotated(&node_a, &node_a);
-        assert!(result.blocks.iter().all(|n| matches!(n.status, NodeStatus::Unchanged)));
+        assert!(result.blocks.iter().all(|block| block.edits.is_empty()));
     }
 
     #[test]
@@ -1858,7 +1864,7 @@ mod tests {
                 semantic_kind: Some(kind),
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
-                    child_index: 0,
+                    path: vec![0],
                 }],
                 ..Annotation::default()
             },
@@ -1884,7 +1890,7 @@ mod tests {
                 semantic_kind: Some(SemanticKind::Equation),
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
-                    child_index: 0,
+                    path: vec![0],
                 }],
                 ..Annotation::default()
             },
@@ -1894,97 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn find_slot_bearing_descendant_pair_finds_nested_list() {
-        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
-
-        let make_inner_list = || AnnotatedContent {
-            realized: TextElem::packed("inner-list"),
-            annotation: Annotation {
-                semantic_kind: Some(SemanticKind::List),
-                slots: vec![SemanticSlot {
-                    label: SlotStep::ListItem(0),
-                    child_index: 0,
-                }],
-                ..Annotation::default()
-            },
-            children: vec![AnnotatedContent {
-                realized: TextElem::packed("inner-item"),
-                annotation: Annotation::default(),
-                children: vec![],
-            }],
-        };
-
-        let make_outer = || AnnotatedContent {
-            realized: TextElem::packed("outer-body"),
-            annotation: Annotation::default(),
-            children: vec![
-                AnnotatedContent {
-                    realized: TextElem::packed("Plan release"),
-                    annotation: Annotation::default(),
-                    children: vec![],
-                },
-                make_inner_list(),
-            ],
-        };
-
-        let old = make_outer();
-        let new = make_outer();
-        let pair = find_slot_bearing_descendant_pair(&old, &new);
-        assert!(pair.is_some(), "expected to find inner list pair");
-        let (oi, ni) = pair.unwrap();
-        assert_eq!(oi.annotation.semantic_kind, Some(SemanticKind::List));
-        assert_eq!(ni.annotation.semantic_kind, Some(SemanticKind::List));
-    }
-
-    #[test]
-    fn find_slot_bearing_descendant_pair_returns_none_when_no_descendant() {
-        use crate::annotated::{AnnotatedContent, Annotation};
-
-        let leaf = AnnotatedContent {
-            realized: TextElem::packed("just text"),
-            annotation: Annotation::default(),
-            children: vec![AnnotatedContent {
-                realized: TextElem::packed("inner"),
-                annotation: Annotation::default(),
-                children: vec![],
-            }],
-        };
-        assert!(find_slot_bearing_descendant_pair(&leaf, &leaf).is_none());
-    }
-
-    #[test]
-    fn find_slot_bearing_descendant_pair_returns_none_with_multiple_candidates() {
-        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
-        use crate::content_slots::SlotStep;
-
-        let make_list = || AnnotatedContent {
-            realized: TextElem::packed("list"),
-            annotation: Annotation {
-                semantic_kind: Some(SemanticKind::List),
-                slots: vec![SemanticSlot {
-                    label: SlotStep::ListItem(0),
-                    child_index: 0,
-                }],
-                ..Annotation::default()
-            },
-            children: vec![AnnotatedContent {
-                realized: TextElem::packed("item"),
-                annotation: Annotation::default(),
-                children: vec![],
-            }],
-        };
-
-        let node = AnnotatedContent {
-            realized: TextElem::packed("body"),
-            annotation: Annotation::default(),
-            children: vec![make_list(), make_list()],
-        };
-        assert!(find_slot_bearing_descendant_pair(&node, &node).is_none());
-    }
-
-    #[test]
-    fn diff_slot_children_same_shape_marks_changed_item_modified() {
+    fn diff_slot_edits_same_shape_marks_changed_item_modified() {
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
         use crate::content_slots::SlotStep;
 
@@ -2002,7 +1918,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, _)| SemanticSlot {
                         label: SlotStep::ListItem(i),
-                        child_index: i,
+                        path: vec![i],
                     })
                     .collect(),
                 ..Annotation::default()
@@ -2012,17 +1928,19 @@ mod tests {
 
         let old = make_list(&["Item A", "Old item", "Item C"]);
         let new = make_list(&["Item A", "New item", "Item C"]);
-        let styles = Styles::new();
-
-        let result = diff_slot_children_same_shape(&old, &new, &styles);
-        assert_eq!(result.len(), 3);
-        assert!(matches!(result[0].status, NodeStatus::Unchanged));
-        assert!(matches!(result[1].status, NodeStatus::Modified(_)));
-        assert!(matches!(result[2].status, NodeStatus::Unchanged));
+        let result = diff_slot_edits_same_shape(&old, &new);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            RealizedEdit::ReplaceAt {
+                path: ref p,
+                content: EditContent::Modified { .. }
+            } if p == &vec![1]
+        ));
     }
 
     #[test]
-    fn diff_slot_children_same_shape_all_unchanged_when_equal() {
+    fn diff_slot_edits_same_shape_all_unchanged_when_equal() {
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
         use crate::content_slots::SlotStep;
 
@@ -2035,7 +1953,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, _)| SemanticSlot {
                         label: SlotStep::ListItem(i),
-                        child_index: i,
+                        path: vec![i],
                     })
                     .collect(),
                 ..Annotation::default()
@@ -2051,15 +1969,12 @@ mod tests {
         };
 
         let list = make_list(&["A", "B", "C"]);
-        let result = diff_slot_children_same_shape(&list, &list, &Styles::new());
-        assert_eq!(result.len(), 3);
-        for child in &result {
-            assert!(matches!(child.status, NodeStatus::Unchanged));
-        }
+        let result = diff_slot_edits_same_shape(&list, &list);
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn identical_non_leaf_subtree_collapses_to_unchanged_without_children() {
+    fn identical_non_leaf_subtree_emits_no_edits() {
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
         use crate::content_slots::SlotStep;
 
@@ -2069,7 +1984,7 @@ mod tests {
                 semantic_kind: Some(SemanticKind::List),
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
-                    child_index: 0,
+                    path: vec![0],
                 }],
                 ..Annotation::default()
             },
@@ -2090,24 +2005,19 @@ mod tests {
                 semantic_kind: Some(SemanticKind::List),
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
-                    child_index: 0,
+                    path: vec![0],
                 }],
                 ..Annotation::default()
             },
             children: vec![parent],
         };
 
-        let result = diff_slot_children_same_shape(&container, &container, &Styles::new());
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0].status, NodeStatus::Unchanged));
-        assert!(
-            result[0].children.is_empty(),
-            "unchanged non-leaf subtree should not be expanded"
-        );
+        let result = diff_slot_edits_same_shape(&container, &container);
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn diff_slot_children_same_shape_recurses_into_nested_descendant() {
+    fn diff_slot_edits_same_shape_recurses_into_nested_descendant() {
         use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
         use crate::content_slots::SlotStep;
 
@@ -2117,7 +2027,7 @@ mod tests {
                 semantic_kind: Some(SemanticKind::List),
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
-                    child_index: 0,
+                    path: vec![0],
                 }],
                 ..Annotation::default()
             },
@@ -2148,11 +2058,11 @@ mod tests {
                 slots: vec![
                     SemanticSlot {
                         label: SlotStep::ListItem(0),
-                        child_index: 0,
+                        path: vec![0],
                     },
                     SemanticSlot {
                         label: SlotStep::ListItem(1),
-                        child_index: 1,
+                        path: vec![1],
                     },
                 ],
                 ..Annotation::default()
@@ -2179,18 +2089,15 @@ mod tests {
             ],
         };
 
-        let result = diff_slot_children_same_shape(&outer_old, &outer_new, &Styles::new());
-        assert_eq!(result.len(), 2);
+        let result = diff_slot_edits_same_shape(&outer_old, &outer_new);
+        assert_eq!(result.len(), 1);
         assert!(matches!(
-            result[0].status,
-            NodeStatus::HasChangedDescendants
+            result[0],
+            RealizedEdit::ReplaceAt {
+                path: ref p,
+                content: EditContent::Modified { .. }
+            } if p == &vec![0]
         ));
-        assert_eq!(result[0].children.len(), 1);
-        assert!(matches!(
-            result[0].children[0].status,
-            NodeStatus::HasChangedDescendants
-        ));
-        assert!(matches!(result[1].status, NodeStatus::Unchanged));
     }
 
     // --- extract_blocks tests ---
@@ -2307,7 +2214,12 @@ mod tests {
 
         // All edits should be captured in a single top-level Modified op, not
         // fragmented into multiple ops or nested ModifiedSlots at different depths.
-        assert_eq!(result.block_ops.len(), 1, "expected 1 block op, got {}", result.block_ops.len());
+        assert_eq!(
+            result.block_ops.len(),
+            1,
+            "expected 1 block op, got {}",
+            result.block_ops.len()
+        );
         match &result.block_ops[0] {
             DiffResultOp::Modified(_, word_ops) => {
                 let mut deletes: Vec<&str> = Vec::new();

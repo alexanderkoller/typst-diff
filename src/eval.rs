@@ -18,9 +18,7 @@ use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{
-    Content, NativeElement, Style, StyleChain, Styles, Target, TargetElem,
-};
+use typst::foundations::{Content, NativeElement, Style, StyleChain, Styles, Target, TargetElem};
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PageElem, PagebreakElem};
 use typst::model::{DocumentInfo, FootnoteElem};
@@ -212,7 +210,6 @@ fn collect_footnotes(content: &Content) -> Vec<Content> {
     footnotes
 }
 
-
 /// Strip `PageElem` styles from a style map, keeping only inline/block styles.
 ///
 /// Page styles must not be re-applied at the block level; they are handled
@@ -320,17 +317,31 @@ mod tests {
     fn annotate_realized_handles_repeated_function_expansions_with_distinct_content() {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
-        fs::write(dir_a.path().join("main.typ"),
-            "#let f(body) = [#body]\n#f[a]\n#f[b]").unwrap();
-        fs::write(dir_b.path().join("main.typ"),
-            "#let f(body) = [#body]\n#f[x]\n#f[b]").unwrap();
+        fs::write(
+            dir_a.path().join("main.typ"),
+            "#let f(body) = [#body]\n#f[a]\n#f[b]",
+        )
+        .unwrap();
+        fs::write(
+            dir_b.path().join("main.typ"),
+            "#let f(body) = [#body]\n#f[x]\n#f[b]",
+        )
+        .unwrap();
         let world_old = SystemWorld::new(dir_a.path().join("main.typ")).unwrap();
         let world_new = SystemWorld::new(dir_b.path().join("main.typ")).unwrap();
 
         let _old = eval_to_realized_content(&world_old).unwrap();
         let new = eval_to_realized_content(&world_new).unwrap();
-        assert!(new.realized.plain_text().contains('x'), "{}", new.realized.plain_text());
-        assert!(new.realized.plain_text().contains('b'), "{}", new.realized.plain_text());
+        assert!(
+            new.realized.plain_text().contains('x'),
+            "{}",
+            new.realized.plain_text()
+        );
+        assert!(
+            new.realized.plain_text().contains('b'),
+            "{}",
+            new.realized.plain_text()
+        );
     }
 
     #[test]
@@ -345,12 +356,19 @@ mod tests {
             "root annotated node must have children; got none"
         );
         let has_list = annotated.children.iter().any(|c| {
-            matches!(c.annotation.semantic_kind, Some(crate::annotated::SemanticKind::List))
+            matches!(
+                c.annotation.semantic_kind,
+                Some(crate::annotated::SemanticKind::List)
+            )
         });
         assert!(
             has_list,
             "expected a child with SemanticKind::List, children had kinds: {:?}",
-            annotated.children.iter().map(|c| &c.annotation.semantic_kind).collect::<Vec<_>>()
+            annotated
+                .children
+                .iter()
+                .map(|c| &c.annotation.semantic_kind)
+                .collect::<Vec<_>>()
         );
     }
 

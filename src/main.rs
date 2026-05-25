@@ -62,7 +62,8 @@ fn main() -> Result<()> {
     }
 
     eprintln!("Annotating...");
-    let annotated = annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
+    let annotated =
+        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
 
     eprintln!("Rendering to PDF...");
     let pdf_bytes = render_to_pdf(&annotated, &new_world).context("failed to render PDF")?;

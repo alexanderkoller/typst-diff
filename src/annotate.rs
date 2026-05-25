@@ -17,17 +17,19 @@
 //! started whenever the page styles change. This preserves `#set page(…)` boundaries
 //! (margins, headers, footers) across section breaks in the diff output.
 
-use typst::foundations::{Content, Packed};
+use typst::foundations::Content;
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::{Abs, GridCell, GridChild, GridElem, GridItem};
+use typst::layout::Abs;
 use typst::math::{CancelElem, EquationElem};
-use typst::model::{EnumElem, EnumItem, HeadingElem, ListElem, ListItem, ParElem};
+use typst::model::{EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
-use crate::content_slots::{rebuild_realized_grid_with_cells, replace_subtree, replace_slot};
-use crate::annotated::SemanticKind;
-use crate::diff::{DiffBlock, DiffNode, DiffResultFlat, DiffResultOp, NodeStatus, WordOp};
+use crate::container_ops;
+use crate::content_slots::replace_slot;
+use crate::diff::{
+    DiffBlock, DiffBlockEdit, DiffResultFlat, DiffResultOp, EditContent, RealizedEdit, WordOp,
+};
 
 fn green() -> Color {
     Color::from_u8(0, 180, 0, 255)
@@ -302,9 +304,8 @@ fn is_inlineish(content: &Content) -> bool {
 
 /// Apply `fill` to the text content of `content` at the outer block level.
 ///
-/// Phase A applies the fill by wrapping the whole block in a `StyledElem`. Slot-level
-/// fill application (applying fill inside each slot individually) will be re-introduced
-/// via the new tree path once `DiffNode` carries slot information.
+/// The realized-edit pipeline uses this for inserted edit payloads so structural
+/// whitespace nodes remain bare.
 fn apply_fill_inside(content: &Content, fill: Color) -> Content {
     let mut content = content.clone();
 
@@ -358,10 +359,11 @@ pub fn build_annotated_content_from_tree(
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles: Option<typst::foundations::Styles> = None;
 
-    // The grouping loop below is structurally complete, but in Phase A every block carries
-    // default page styles (see `annotate_single_node`), so `flush_group` is never triggered
-    // and the entire document lands in a single group.
-    for annotated_block in annotate_diff_nodes(&result.blocks, compact_substitutions) {
+    for annotated_block in result
+        .blocks
+        .iter()
+        .map(|block| annotate_block_edit(block, compact_substitutions))
+    {
         if current_page_styles
             .as_ref()
             .is_some_and(|s| s != &annotated_block.page_styles)
@@ -375,131 +377,297 @@ pub fn build_annotated_content_from_tree(
     Content::sequence(groups).styled_with_map(result.root_styles.clone())
 }
 
-fn annotate_diff_nodes(nodes: &[DiffNode], compact: bool) -> Vec<DiffBlock> {
-    nodes.iter().map(|node| annotate_single_node(node, compact)).collect()
-}
-
-fn annotate_single_node(node: &DiffNode, compact: bool) -> DiffBlock {
-    let page_styles = node.page_styles.clone();
-    match &node.status {
-        NodeStatus::Unchanged => DiffBlock {
-            content: effective_render_content(&node.node),
-            page_styles,
-        },
-        NodeStatus::Inserted => DiffBlock {
-            content: if effective_render_content(&node.node).plain_text().is_empty() {
-                effective_render_content(&node.node)
-            } else {
-                apply_fill_inside(&effective_render_content(&node.node), green())
-            },
-            page_styles,
-        },
-        NodeStatus::Deleted => {
-            let content = effective_render_content(&node.node);
-            let colored = plain_content(&content)
-                .styled(TextElem::fill.set(red().into()));
-            let struck = Content::new(StrikeElem::new(colored));
-            DiffBlock {
-                content: replace_text_container(&content, &struck)
-                    .unwrap_or(struck),
-                page_styles,
-            }
-        }
-        NodeStatus::Modified(word_ops) => {
-            let inline = annotated_inline_content(word_ops, compact);
-            let content = effective_render_content(&node.node);
-            DiffBlock {
-                content: replace_text_container(&content, &inline)
-                    .unwrap_or(inline),
-                page_styles,
-            }
-        }
-        NodeStatus::HasChangedDescendants => {
-            let content = apply_changed_descendants(&node.node, &node.children, compact);
-            DiffBlock { content, page_styles }
-        }
+fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
+    DiffBlock {
+        content: apply_edits_to_base(&block.base, &block.edits, compact),
+        page_styles: block.page_styles.clone(),
     }
 }
 
-fn effective_render_content(node: &crate::annotated::AnnotatedContent) -> Content {
-    if !node.realized.plain_text().is_empty() || node.children.is_empty() {
-        return node.realized.clone();
-    }
-    Content::sequence(node.children.iter().map(effective_render_content))
-}
-
-fn apply_changed_descendants(
-    node: &crate::annotated::AnnotatedContent,
-    diff_children: &[DiffNode],
+fn apply_edits_to_base(
+    base: &crate::annotated::AnnotatedContent,
+    edits: &[RealizedEdit],
     compact: bool,
 ) -> Content {
-    let cell_bodies: Vec<Content> = diff_children
-        .iter()
-        .map(|child| annotate_single_node(child, compact).content)
-        .collect();
-
-    if let Some(rebuilt) = rebuild_realized_grid_with_cells(&node.realized, cell_bodies) {
-        return rebuilt;
-    }
-
-    if matches!(
-        node.annotation.semantic_kind.as_ref(),
-        Some(SemanticKind::List | SemanticKind::Enum)
-    ) {
-        return semantic_changed_descendants_fallback(node, diff_children, compact);
-    }
-
-    let mut result = node.realized.clone();
-    let mut patched_any = false;
-    for diff_child in diff_children {
-        if matches!(diff_child.status, NodeStatus::Unchanged) {
-            continue;
-        }
-        let new_content = annotate_single_node(diff_child, compact).content;
-        if let Some(patched) = replace_subtree(&result, &diff_child.node.realized, new_content) {
-            result = patched;
-            patched_any = true;
-        }
-    }
-    if patched_any {
-        return result;
-    }
-    semantic_changed_descendants_fallback(node, diff_children, compact)
-}
-
-fn semantic_changed_descendants_fallback(
-    node: &crate::annotated::AnnotatedContent,
-    diff_children: &[DiffNode],
-    compact: bool,
-) -> Content {
-    let rendered_children: Vec<Content> = diff_children
-        .iter()
-        .map(|child| annotate_single_node(child, compact).content)
-        .collect();
-
-    match node.annotation.semantic_kind.as_ref() {
-        Some(SemanticKind::List) => Content::new(ListElem::new(
-            rendered_children
-                .into_iter()
-                .map(|child| Packed::new(ListItem::new(child)))
-                .collect(),
-        )),
-        Some(SemanticKind::Enum) => Content::new(EnumElem::new(
-            rendered_children
-                .into_iter()
-                .map(|child| Packed::new(EnumItem::new(child)))
-                .collect(),
-        )),
-        Some(SemanticKind::Table) | Some(SemanticKind::Grid) => Content::new(GridElem::new(
-            rendered_children
-                .into_iter()
-                .map(|child| {
-                    GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(child))))
+    let mut node = base.clone();
+    let mut index = 0;
+    while index < edits.len() {
+        if let Some((before, anchor)) = insertion_anchor(&edits[index]) {
+            let mut end = index + 1;
+            while end < edits.len()
+                && insertion_anchor(&edits[end]).is_some_and(|(next_before, next_anchor)| {
+                    next_before == before && next_anchor == anchor
                 })
-                .collect(),
-        )),
-        _ => Content::sequence(rendered_children),
+            {
+                end += 1;
+            }
+            for edit in edits[index..end].iter().rev() {
+                apply_realized_edit(&mut node, edit, compact);
+            }
+            index = end;
+        } else {
+            apply_realized_edit(&mut node, &edits[index], compact);
+            index += 1;
+        }
     }
+    effective_realized_content(&node)
+}
+
+fn insertion_anchor(edit: &RealizedEdit) -> Option<(bool, &[usize])> {
+    match edit {
+        RealizedEdit::InsertBefore { anchor, .. } => Some((true, anchor)),
+        RealizedEdit::InsertAfter { anchor, .. } => Some((false, anchor)),
+        _ => None,
+    }
+}
+
+fn effective_realized_content(node: &crate::annotated::AnnotatedContent) -> Content {
+    let surface = node
+        .annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized);
+    if !surface.is_empty() || node.children.is_empty() {
+        return surface.clone();
+    }
+    Content::sequence(node.children.iter().map(effective_realized_content))
+}
+
+fn apply_realized_edit(
+    node: &mut crate::annotated::AnnotatedContent,
+    edit: &RealizedEdit,
+    compact: bool,
+) {
+    match edit {
+        RealizedEdit::ReplaceAt { path, content } => {
+            let rendered = render_edit_content(content, compact);
+            if let Some(patched) = replace_annotated_path_content(node, path, rendered.clone()) {
+                node.annotation.patch_surface = Some(if modified_is_pure_insert(content) {
+                    patched
+                } else {
+                    strip_leading_parbreak(patched)
+                });
+            }
+            if let Some(child) = node.get_path_mut(path) {
+                child.realized = rendered;
+                child.annotation.patch_surface = None;
+            }
+        }
+        RealizedEdit::InsertBefore { anchor, content } => {
+            let rendered = render_edit_content(content, compact);
+            if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, true) {
+                node.annotation.patch_surface =
+                    Some(insertion_patch_surface(node, anchor, patched));
+            }
+        }
+        RealizedEdit::InsertAfter { anchor, content } => {
+            let rendered = render_edit_content(content, compact);
+            if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, false) {
+                node.annotation.patch_surface =
+                    Some(insertion_patch_surface(node, anchor, patched));
+            }
+        }
+        RealizedEdit::Append { content } => {
+            let rendered = render_edit_content(content, compact);
+            let base = effective_realized_content(node);
+            node.annotation.patch_surface = Some(Content::sequence([base, rendered]));
+        }
+        RealizedEdit::WholeBlock(content) => {
+            node.realized = render_edit_content(content, compact);
+            node.annotation.patch_surface = None;
+            node.children.clear();
+        }
+    }
+}
+
+fn modified_is_pure_insert(content: &EditContent) -> bool {
+    matches!(content, EditContent::Modified { word_ops, .. } if word_ops.iter().all(|op| !matches!(op, WordOp::Delete(_))) && word_ops.iter().any(|op| matches!(op, WordOp::Insert(_))))
+}
+
+fn strip_leading_parbreak(content: Content) -> Content {
+    let mut content = content;
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        if seq
+            .children
+            .first()
+            .is_some_and(|child| child.is::<ParbreakElem>())
+        {
+            seq.children.remove(0);
+        }
+        seq.children = seq
+            .children
+            .iter()
+            .cloned()
+            .map(strip_leading_parbreak)
+            .collect();
+        return content;
+    }
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        styled.child = strip_leading_parbreak(styled.child.clone());
+    }
+    content
+}
+
+fn insertion_patch_surface(
+    node: &crate::annotated::AnnotatedContent,
+    anchor: &[usize],
+    patched: Content,
+) -> Content {
+    let nested_list_insert = anchor.len() > 1
+        && !has_table_container(&patched)
+        && (matches!(
+            node.annotation.semantic_kind,
+            Some(crate::annotated::SemanticKind::List) | Some(crate::annotated::SemanticKind::Enum)
+        ) || has_any_list_container(&patched)
+            || node.annotation.semantic_kind.is_none());
+    if nested_list_insert || has_nested_list_container(&patched) {
+        Content::sequence([Content::new(ParbreakElem::new()), patched])
+    } else {
+        patched
+    }
+}
+
+fn has_any_list_container(content: &Content) -> bool {
+    let mut found = content.is::<ListElem>() || content.is::<EnumElem>();
+    let _ = content.traverse::<_, ()>(&mut |child| {
+        if child.is::<ListElem>() || child.is::<EnumElem>() {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+fn has_table_container(content: &Content) -> bool {
+    use typst::layout::GridElem;
+    use typst::model::TableElem;
+
+    let mut found = content.is::<TableElem>() || content.is::<GridElem>();
+    let _ = content.traverse::<_, ()>(&mut |child| {
+        if child.is::<TableElem>() || child.is::<GridElem>() {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+fn has_nested_list_container(content: &Content) -> bool {
+    let mut seen = false;
+    let mut nested = false;
+    let _ = content.traverse::<_, ()>(&mut |child| {
+        if child.is::<ListElem>() || child.is::<EnumElem>() {
+            if seen {
+                nested = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            seen = true;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    nested
+}
+
+fn render_edit_content(content: &EditContent, compact: bool) -> Content {
+    match content {
+        EditContent::Inserted(content) => {
+            if content.plain_text().is_empty() {
+                content.clone()
+            } else {
+                apply_fill_inside(content, green())
+            }
+        }
+        EditContent::Deleted(content) => {
+            let colored = plain_content(content).styled(TextElem::fill.set(red().into()));
+            let struck = Content::new(StrikeElem::new(colored));
+            replace_text_container(content, &struck).unwrap_or(struck)
+        }
+        EditContent::Modified { base, word_ops } => {
+            let inline = annotated_inline_content(word_ops, compact);
+            replace_text_container(base, &inline).unwrap_or(inline)
+        }
+        EditContent::Nested { base, edits } => apply_edits_to_base(base, edits, compact),
+    }
+}
+
+fn replace_annotated_path_content(
+    node: &crate::annotated::AnnotatedContent,
+    path: &[usize],
+    replacement: Content,
+) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return Some(replacement);
+    };
+    let surface = render_surface(node);
+    let surface_child = container_ops::realized_child_contents(surface)
+        .get(*index)
+        .cloned()?;
+    let replaced_child = replace_content_path(&surface_child, rest, replacement)?;
+    container_ops::replace_realized_child(surface, *index, replaced_child)
+}
+
+fn replace_content_path(
+    surface: &Content,
+    path: &[usize],
+    replacement: Content,
+) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return Some(replacement);
+    };
+    let surface_child = container_ops::realized_child_contents(surface)
+        .get(*index)
+        .cloned()?;
+    let replaced_child = replace_content_path(&surface_child, rest, replacement)?;
+    container_ops::replace_realized_child(surface, *index, replaced_child)
+}
+
+fn insert_annotated_path_content(
+    node: &crate::annotated::AnnotatedContent,
+    path: &[usize],
+    insertion: Content,
+    before: bool,
+) -> Option<Content> {
+    let (index, rest) = path.split_first()?;
+    if rest.is_empty() {
+        return container_ops::insert_realized_child(
+            render_surface(node),
+            *index,
+            insertion,
+            before,
+        );
+    }
+    let surface = render_surface(node);
+    let surface_child = container_ops::realized_child_contents(surface)
+        .get(*index)
+        .cloned()?;
+    let patched_child = insert_content_path(&surface_child, rest, insertion, before)?;
+    container_ops::replace_realized_child(surface, *index, patched_child)
+}
+
+fn insert_content_path(
+    surface: &Content,
+    path: &[usize],
+    insertion: Content,
+    before: bool,
+) -> Option<Content> {
+    let (index, rest) = path.split_first()?;
+    if rest.is_empty() {
+        return container_ops::insert_realized_child(surface, *index, insertion, before);
+    }
+    let surface_child = container_ops::realized_child_contents(surface)
+        .get(*index)
+        .cloned()?;
+    let patched_child = insert_content_path(&surface_child, rest, insertion, before)?;
+    container_ops::replace_realized_child(surface, *index, patched_child)
+}
+
+fn render_surface(node: &crate::annotated::AnnotatedContent) -> &Content {
+    node.annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized)
 }
 
 #[allow(dead_code)]
@@ -742,9 +910,9 @@ mod tests {
     #[test]
     fn nested_list_slot_preserves_both_list_levels_and_annotates_leaf() {
         // Two-level list: outer item 0 contains an inner list with "Beta" → "Better".
-        let inner = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Better"))),
-        ]));
+        let inner = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
+            TextElem::packed("Better"),
+        ))]));
         let outer_list = Content::new(ListElem::new(vec![
             Packed::new(ListItem::new(inner.clone())),
             Packed::new(ListItem::new(TextElem::packed("Stable"))),
@@ -775,7 +943,11 @@ mod tests {
         let annotated = build_annotated_content(&result, false);
         let plain = annotated.plain_text();
 
-        assert_eq!(count_elem::<ListElem>(&annotated), 2, "both list levels preserved");
+        assert_eq!(
+            count_elem::<ListElem>(&annotated),
+            2,
+            "both list levels preserved"
+        );
         assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
         assert!(plain.contains("Beta"), "{plain}");
         assert!(plain.contains("Better"), "{plain}");
@@ -789,9 +961,9 @@ mod tests {
         use crate::diff::diff_content;
         use typst::model::ParbreakElem;
 
-        let inner = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Leaf"))),
-        ]));
+        let inner = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
+            TextElem::packed("Leaf"),
+        ))]));
         let body_old = Content::sequence([
             TextElem::packed("old title"),
             Content::new(ParbreakElem::new()),
@@ -810,7 +982,10 @@ mod tests {
         let plain = annotated.plain_text();
 
         // The nested ListElem must survive in the output.
-        assert!(count_elem::<ListElem>(&annotated) >= 1, "nested list preserved");
+        assert!(
+            count_elem::<ListElem>(&annotated) >= 1,
+            "nested list preserved"
+        );
         // The inline change must appear.
         assert!(plain.contains("old"), "{plain}");
         assert!(plain.contains("new"), "{plain}");
@@ -840,12 +1015,12 @@ mod tests {
         use typst::model::ParbreakElem;
 
         let parbreak = Content::new(ParbreakElem::new());
-        assert!(parbreak.plain_text().is_empty(), "sanity: ParbreakElem has no text");
-
-        let blocks = build_annotated_blocks(
-            &[DiffResultOp::Inserted(block(parbreak))],
-            false,
+        assert!(
+            parbreak.plain_text().is_empty(),
+            "sanity: ParbreakElem has no text"
         );
+
+        let blocks = build_annotated_blocks(&[DiffResultOp::Inserted(block(parbreak))], false);
         assert_eq!(blocks.len(), 1);
         assert!(
             blocks[0].content.is::<ParbreakElem>(),
@@ -855,22 +1030,23 @@ mod tests {
     }
 
     #[test]
-    fn annotate_walks_diff_node_tree_and_emits_colors_at_correct_status() {
+    fn annotate_applies_whole_block_insert_edit() {
         use crate::annotated::{AnnotatedContent, Annotation};
-        use crate::diff::{DiffNode, DiffResult, NodeStatus};
+        use crate::diff::{DiffBlockEdit, DiffResult, EditContent, RealizedEdit};
 
-        let node = DiffNode {
-            node: AnnotatedContent {
+        let block = DiffBlockEdit {
+            base: AnnotatedContent {
                 realized: TextElem::packed("new text"),
                 annotation: Annotation::default(),
                 children: vec![],
             },
-            status: NodeStatus::Inserted,
-            children: vec![],
+            edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
+                TextElem::packed("new text"),
+            ))],
             page_styles: Default::default(),
         };
         let result = DiffResult {
-            blocks: vec![node],
+            blocks: vec![block],
             root_styles: Default::default(),
         };
         let content = build_annotated_content_from_tree(&result, false);
@@ -883,10 +1059,7 @@ mod tests {
         let text = TextElem::packed("Visible text");
         assert!(!text.plain_text().is_empty(), "sanity: TextElem has text");
 
-        let blocks = build_annotated_blocks(
-            &[DiffResultOp::Inserted(block(text))],
-            false,
-        );
+        let blocks = build_annotated_blocks(&[DiffResultOp::Inserted(block(text))], false);
         assert_eq!(blocks.len(), 1);
         // The block must NOT be a bare TextElem — it must have been processed by
         // apply_fill_inside (which wraps in StyledElem with green fill).
