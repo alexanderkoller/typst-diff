@@ -133,6 +133,249 @@ fn diff_annotated_corpus(name: &str) -> typst_diff::diff::DiffResult {
     typst_diff::diff::diff_annotated(&old, &new)
 }
 
+fn annotated_tree_corpus(name: &str) -> Content {
+    let result = diff_annotated_corpus(name);
+    typst_diff::annotate::build_annotated_content_from_tree(&result, false)
+}
+
+fn text_has_any_style(content: &Content, needle: &str) -> bool {
+    let mut found = false;
+    let _ = content.traverse::<_, ()>(&mut |c| {
+        if let Some(styled) = c.to_packed::<typst::foundations::StyledElem>()
+            && styled.child.plain_text().contains(needle)
+        {
+            found = true;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found || max_style_count_for_text(content, needle) > 0
+}
+
+fn text_is_struck(content: &Content, needle: &str) -> bool {
+    let mut found = false;
+    let _ = content.traverse::<_, ()>(&mut |c| {
+        if let Some(strike) = c.to_packed::<typst::text::StrikeElem>()
+            && strike.body.plain_text().contains(needle)
+        {
+            found = true;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+fn collect_modified_word_texts(nodes: &[typst_diff::diff::DiffNode]) -> (String, String) {
+    use typst_diff::diff::{NodeStatus, WordOp};
+
+    let mut deleted = Vec::new();
+    let mut inserted = Vec::new();
+    fn walk(
+        node: &typst_diff::diff::DiffNode,
+        deleted: &mut Vec<String>,
+        inserted: &mut Vec<String>,
+    ) {
+        if let NodeStatus::Modified(word_ops) = &node.status {
+            for op in word_ops {
+                match op {
+                    WordOp::Delete(tokens) => {
+                        deleted.push(tokens.iter().map(|t| t.text.as_str()).collect())
+                    }
+                    WordOp::Insert(tokens) => {
+                        inserted.push(tokens.iter().map(|t| t.text.as_str()).collect())
+                    }
+                    WordOp::Equal(_) => {}
+                }
+            }
+        }
+        for child in &node.children {
+            walk(child, deleted, inserted);
+        }
+    }
+
+    for node in nodes {
+        walk(node, &mut deleted, &mut inserted);
+    }
+    (deleted.join(" | "), inserted.join(" | "))
+}
+
+fn count_status(
+    nodes: &[typst_diff::diff::DiffNode],
+    matches_status: fn(&typst_diff::diff::NodeStatus) -> bool,
+) -> usize {
+    fn walk(
+        node: &typst_diff::diff::DiffNode,
+        matches_status: fn(&typst_diff::diff::NodeStatus) -> bool,
+    ) -> usize {
+        let here = usize::from(matches_status(&node.status));
+        here + node
+            .children
+            .iter()
+            .map(|child| walk(child, matches_status))
+            .sum::<usize>()
+    }
+
+    nodes
+        .iter()
+        .map(|node| walk(node, matches_status))
+        .sum::<usize>()
+}
+
+fn effective_plain_text(node: &typst_diff::annotated::AnnotatedContent) -> String {
+    if !node.realized.plain_text().is_empty() || node.children.is_empty() {
+        return node.realized.plain_text().to_string();
+    }
+    node.children
+        .iter()
+        .map(effective_plain_text)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn collect_status_texts(
+    nodes: &[typst_diff::diff::DiffNode],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    use typst_diff::diff::{NodeStatus, WordOp};
+
+    fn walk(
+        node: &typst_diff::diff::DiffNode,
+        inserted: &mut Vec<String>,
+        deleted: &mut Vec<String>,
+        modified_inserted: &mut Vec<String>,
+        modified_deleted: &mut Vec<String>,
+    ) {
+        match &node.status {
+            NodeStatus::Inserted => {
+                let text = effective_plain_text(&node.node);
+                if !text.trim().is_empty() {
+                    inserted.push(text);
+                }
+            }
+            NodeStatus::Deleted => {
+                let text = effective_plain_text(&node.node);
+                if !text.trim().is_empty() {
+                    deleted.push(text);
+                }
+            }
+            NodeStatus::Modified(word_ops) => {
+                for op in word_ops {
+                    match op {
+                        WordOp::Insert(tokens) => {
+                            let text: String = tokens.iter().map(|t| t.text.as_str()).collect();
+                            if !text.trim().is_empty() {
+                                modified_inserted.push(text);
+                            }
+                        }
+                        WordOp::Delete(tokens) => {
+                            let text: String = tokens.iter().map(|t| t.text.as_str()).collect();
+                            if !text.trim().is_empty() {
+                                modified_deleted.push(text);
+                            }
+                        }
+                        WordOp::Equal(_) => {}
+                    }
+                }
+            }
+            NodeStatus::Unchanged | NodeStatus::HasChangedDescendants => {}
+        }
+        for child in &node.children {
+            walk(child, inserted, deleted, modified_inserted, modified_deleted);
+        }
+    }
+
+    let mut inserted = Vec::new();
+    let mut deleted = Vec::new();
+    let mut modified_inserted = Vec::new();
+    let mut modified_deleted = Vec::new();
+    for node in nodes {
+        walk(
+            node,
+            &mut inserted,
+            &mut deleted,
+            &mut modified_inserted,
+            &mut modified_deleted,
+        );
+    }
+    (inserted, deleted, modified_inserted, modified_deleted)
+}
+
+fn assert_status_contract_matches_render(corpus_name: &str) {
+    let result = diff_annotated_corpus(corpus_name);
+    let rendered = annotated_tree_corpus(corpus_name);
+    let (inserted, deleted, modified_inserted, modified_deleted) = collect_status_texts(&result.blocks);
+
+    for text in inserted {
+        assert!(
+            rendered.plain_text().contains(&text),
+            "Inserted status text missing from render for corpus {corpus_name}: {text:?}"
+        );
+        assert!(
+            text_has_any_style(&rendered, &text),
+            "Inserted status text present but not styled in corpus {corpus_name}: {text:?}"
+        );
+    }
+
+    for text in deleted {
+        assert!(
+            rendered.plain_text().contains(&text),
+            "Deleted status text missing from render for corpus {corpus_name}: {text:?}"
+        );
+        assert!(
+            text_is_struck(&rendered, &text),
+            "Deleted status text present but not struck in corpus {corpus_name}: {text:?}"
+        );
+    }
+
+    for text in modified_inserted {
+        let tokens: Vec<&str> = text.split_whitespace().filter(|t| t.len() >= 3).collect();
+        if tokens.is_empty() {
+            assert!(
+                rendered.plain_text().contains(&text),
+                "Modified-insert text missing from render for corpus {corpus_name}: {text:?}"
+            );
+            assert!(
+                text_has_any_style(&rendered, &text),
+                "Modified-insert text present but not styled in corpus {corpus_name}: {text:?}"
+            );
+        } else {
+            for token in tokens {
+                assert!(
+                    rendered.plain_text().contains(token),
+                    "Modified-insert token missing from render for corpus {corpus_name}: {token:?}"
+                );
+                assert!(
+                    text_has_any_style(&rendered, token),
+                    "Modified-insert token present but not styled in corpus {corpus_name}: {token:?}"
+                );
+            }
+        }
+    }
+
+    for text in modified_deleted {
+        let tokens: Vec<&str> = text.split_whitespace().filter(|t| t.len() >= 3).collect();
+        if tokens.is_empty() {
+            assert!(
+                rendered.plain_text().contains(&text),
+                "Modified-delete text missing from render for corpus {corpus_name}: {text:?}"
+            );
+            assert!(
+                text_is_struck(&rendered, &text),
+                "Modified-delete text present but not struck in corpus {corpus_name}: {text:?}"
+            );
+        } else {
+            for token in tokens {
+                assert!(
+                    rendered.plain_text().contains(token),
+                    "Modified-delete token missing from render for corpus {corpus_name}: {token:?}"
+                );
+                assert!(
+                    text_is_struck(&rendered, token),
+                    "Modified-delete token present but not struck in corpus {corpus_name}: {token:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
@@ -397,6 +640,267 @@ fn list_item_change_produces_has_changed_descendants_not_flat_modified() {
         "changed item should be Modified (word diff), got {:?}",
         changed_children[0].status
     );
+
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        deleted.contains("Old") && deleted.contains("is being replaced"),
+        "expected old changed chunks in deleted word ops, got {deleted:?}"
+    );
+    assert!(
+        inserted.contains("New") && inserted.contains("replaces") && inserted.contains("the old one"),
+        "expected new changed chunks in inserted word ops, got {inserted:?}"
+    );
+}
+
+#[test]
+fn list_item_added_produces_slot_level_insert_instead_of_flat_modified() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("19-list-item-added");
+    let list_block = result
+        .blocks
+        .iter()
+        .find(|b| !matches!(b.status, NodeStatus::Unchanged))
+        .expect("expected at least one changed block");
+
+    assert!(matches!(list_block.status, NodeStatus::HasChangedDescendants));
+    assert_eq!(
+        list_block.node.annotation.semantic_kind,
+        Some(typst_diff::annotated::SemanticKind::List)
+    );
+    assert_eq!(list_block.children.len(), 4, "expected 4 list item children");
+    let inserted = list_block
+        .children
+        .iter()
+        .filter(|c| matches!(c.status, NodeStatus::Inserted))
+        .count();
+    assert_eq!(inserted, 1, "expected exactly one inserted list item");
+    assert_eq!(
+        count_status(&result.blocks, |status| matches!(status, NodeStatus::Inserted)),
+        1,
+        "expected exactly one inserted node in the list diff tree"
+    );
+    assert!(
+        list_block
+            .children
+            .iter()
+            .any(|c| c.node.realized.plain_text().contains("Stable internet connection")),
+        "expected inserted list item text in inserted node"
+    );
+    let child_texts: Vec<String> = list_block
+        .children
+        .iter()
+        .map(|c| effective_plain_text(&c.node))
+        .collect();
+    let child_kinds: Vec<String> = list_block
+        .children
+        .iter()
+        .map(|c| c.node.realized.func().name().to_string())
+        .collect();
+    assert_eq!(
+        child_texts,
+        vec![
+            "64-bit processor",
+            "8 GB of RAM",
+            "10 GB disk space",
+            "Stable internet connection for updates",
+        ],
+        "slot children should be item bodies, not the realized list wrapper; kinds={child_kinds:?}"
+    );
+}
+
+#[test]
+fn list_item_added_tree_render_contains_inserted_text() {
+    let annotated = annotated_tree_corpus("19-list-item-added");
+    let plain = annotated.plain_text();
+
+    assert!(
+        plain.contains("Stable internet connection"),
+        "diff tree has inserted list item, but rendered annotated content omitted it: {plain:?}"
+    );
+}
+
+#[test]
+fn list_item_added_tree_render_styles_inserted_text() {
+    let annotated = annotated_tree_corpus("19-list-item-added");
+
+    assert!(
+        text_has_any_style(&annotated, "Stable internet connection"),
+        "inserted list item is present but not styled as changed"
+    );
+}
+
+#[test]
+fn list_item_change_tree_render_styles_deleted_and_inserted_text() {
+    let annotated = annotated_tree_corpus("18-list-item-changed");
+
+    assert!(
+        text_is_struck(&annotated, "Old"),
+        "deleted list item text should be struck in rendered annotated content"
+    );
+    assert!(
+        text_has_any_style(&annotated, "New"),
+        "inserted list item text should be styled in rendered annotated content"
+    );
+}
+
+#[test]
+fn nested_list_item_change_produces_nested_modified_child() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("20-nested-list-changed");
+    let list_block = result
+        .blocks
+        .iter()
+        .find(|b| !matches!(b.status, NodeStatus::Unchanged))
+        .expect("expected at least one changed block");
+
+    assert!(
+        matches!(list_block.status, NodeStatus::HasChangedDescendants),
+        "outer list block should be HasChangedDescendants, got {:?}",
+        list_block.status
+    );
+    assert!(
+        count_status(&result.blocks, |status| matches!(status, NodeStatus::Modified(_))) >= 1,
+        "expected at least one modified nested list item"
+    );
+
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        deleted.contains("old description of mammals"),
+        "expected nested old description in deleted word ops, got {deleted:?}"
+    );
+    assert!(
+        inserted.contains("updated description of warm-blooded vertebrates"),
+        "expected nested updated description in inserted word ops, got {inserted:?}"
+    );
+}
+
+#[test]
+fn nested_list_item_change_tree_render_contains_old_and_new_text() {
+    let annotated = annotated_tree_corpus("20-nested-list-changed");
+    let plain = annotated.plain_text();
+
+    assert!(
+        plain.contains("old description of mammals"),
+        "rendered annotated content omitted deleted nested list text: {plain:?}"
+    );
+    assert!(
+        plain.contains("updated description of warm-blooded vertebrates"),
+        "rendered annotated content omitted inserted nested list text: {plain:?}"
+    );
+}
+
+#[test]
+fn nested_list_item_change_tree_render_styles_old_and_new_text() {
+    let annotated = annotated_tree_corpus("20-nested-list-changed");
+
+    assert!(
+        text_is_struck(&annotated, "old description of mammals"),
+        "deleted nested list text should be struck in rendered annotated content"
+    );
+    assert!(
+        text_has_any_style(&annotated, "updated description of warm-blooded vertebrates"),
+        "inserted nested list text should be styled in rendered annotated content"
+    );
+}
+
+#[test]
+fn status_contract_guarantees_rendering_for_corpus_18() {
+    assert_status_contract_matches_render("18-list-item-changed");
+}
+
+#[test]
+fn status_contract_guarantees_rendering_for_corpus_19() {
+    assert_status_contract_matches_render("19-list-item-added");
+}
+
+#[test]
+fn status_contract_guarantees_rendering_for_corpus_20() {
+    assert_status_contract_matches_render("20-nested-list-changed");
+}
+
+#[test]
+fn table_row_deleted_middle_keeps_deleted_cells_in_tree() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("65-table-row-deleted-middle");
+    let table_block = result
+        .blocks
+        .iter()
+        .find(|b| matches!(b.status, NodeStatus::HasChangedDescendants))
+        .expect("expected changed table block");
+
+    let deleted = table_block
+        .children
+        .iter()
+        .filter(|c| matches!(c.status, NodeStatus::Deleted))
+        .count();
+    assert_eq!(deleted, 3, "expected 3 deleted cells for removed middle row");
+}
+
+#[test]
+fn nested_list_item_inserted_uses_nested_changed_descendants() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("69-nested-list-item-inserted");
+    let list_block = result
+        .blocks
+        .iter()
+        .find(|b| !matches!(b.status, NodeStatus::Unchanged))
+        .expect("expected changed outer list block");
+
+    assert!(matches!(list_block.status, NodeStatus::HasChangedDescendants));
+    let item_0 = &list_block.children[0];
+    assert!(matches!(
+        item_0.status,
+        NodeStatus::HasChangedDescendants | NodeStatus::Modified(_)
+    ));
+    assert!(matches!(list_block.children[1].status, NodeStatus::Unchanged));
+}
+
+#[test]
+fn table_changed_uses_changed_descendants_with_child_statuses() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("35-table-changed");
+    let table_block = result
+        .blocks
+        .iter()
+        .find(|b| !matches!(b.status, NodeStatus::Unchanged))
+        .expect("expected changed table block");
+
+    assert!(matches!(table_block.status, NodeStatus::HasChangedDescendants));
+    assert!(
+        table_block
+            .children
+            .iter()
+            .any(|c| !matches!(c.status, NodeStatus::Unchanged)),
+        "expected at least one changed cell"
+    );
+}
+
+#[test]
+fn table_row_inserted_middle_includes_inserted_cells() {
+    use typst_diff::diff::NodeStatus;
+
+    let result = diff_annotated_corpus("64-table-row-inserted-middle");
+    let table_block = result
+        .blocks
+        .iter()
+        .find(|b| !matches!(b.status, NodeStatus::Unchanged))
+        .expect("expected changed table block");
+
+    assert!(matches!(table_block.status, NodeStatus::HasChangedDescendants));
+    let inserted = table_block
+        .children
+        .iter()
+        .filter(|c| matches!(c.status, NodeStatus::Inserted))
+        .count();
+    assert!(
+        inserted >= 1,
+        "expected inserted cells for the inserted middle row"
+    );
 }
 
 #[test]
@@ -490,5 +994,3 @@ fn repeated_same_span_blocks_preserve_document_order() {
     );
     assert_eq!(plain.matches("Delta").count(), 1, "{plain}");
 }
-
-

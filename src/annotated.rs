@@ -198,6 +198,21 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             children,
         };
     }
+    if let Some(pre_seq) = pre.to_packed::<SequenceElem>() {
+        let children = pre_seq
+            .children
+            .iter()
+            .map(|child| annotate_realized(child, child))
+            .collect();
+        return AnnotatedContent {
+            realized: realized.clone(),
+            annotation: Annotation {
+                span: pre.span(),
+                ..Annotation::default()
+            },
+            children,
+        };
+    }
     if let (Some(pre_s), Some(real_s)) = (
         pre.to_packed::<StyledElem>(),
         realized.to_packed::<StyledElem>(),
@@ -273,16 +288,31 @@ fn pair_sequence_by_span(
     let mut cursor: usize = 0;
     for pre_child in pre_children {
         let target = pre_child.span();
-        // Walk forward past non-matching realized children, recording them as anonymous.
-        while cursor < real_children.len() && effective_span(&real_children[cursor]) != target {
-            out.push(leaf_annotated(&real_children[cursor], Annotation::default()));
-            cursor += 1;
+        let mut match_idx = None;
+        for (idx, real_child) in real_children.iter().enumerate().skip(cursor) {
+            if effective_span(real_child) == target {
+                match_idx = Some(idx);
+                break;
+            }
         }
+
+        if let Some(idx) = match_idx {
+            while cursor < idx {
+                out.push(leaf_annotated(&real_children[cursor], Annotation::default()));
+                cursor += 1;
+            }
+            out.push(annotate_realized(pre_child, &real_children[idx]));
+            cursor = idx + 1;
+            continue;
+        }
+
+        // If no span match exists, fall back to positional pairing instead of
+        // dropping the pre node. This preserves structural semantics when
+        // realization rewrites spans on wrapper-heavy sequences.
         if cursor < real_children.len() {
             out.push(annotate_realized(pre_child, &real_children[cursor]));
             cursor += 1;
         }
-        // else: pre_child has no realized partner — silently drop.
     }
     // Any trailing unmatched realized children become anonymous leaves.
     while cursor < real_children.len() {
@@ -378,9 +408,27 @@ pub fn collect_leaf_block_children(content: &Content) -> Vec<Content> {
         let inner = collect_leaf_block_children(&styled.child);
         if !inner.is_empty() { return inner; }
     }
+    if let Some(list) = content.to_packed::<ListElem>() {
+        return list
+            .children
+            .iter()
+            .map(|item| item.body.clone())
+            .collect();
+    }
+    if let Some(enm) = content.to_packed::<EnumElem>() {
+        return enm
+            .children
+            .iter()
+            .map(|item| item.body.clone())
+            .collect();
+    }
     // SequenceElem: return children directly
     if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq.children.clone();
+        return seq
+            .children
+            .iter()
+            .flat_map(collect_leaf_block_children)
+            .collect();
     }
     // Fallback: treat the node itself as a single child
     vec![content.clone()]
@@ -389,12 +437,13 @@ pub fn collect_leaf_block_children(content: &Content) -> Vec<Content> {
 fn map_list_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
     let Some(list) = pre.to_packed::<ListElem>() else { return (vec![], vec![]); };
     let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != list.children.len() {
-        return (vec![], vec![]);
-    }
     let children: Vec<AnnotatedContent> = list.children.iter()
-        .zip(realized_children.iter())
-        .map(|(item, real)| annotate_realized(&item.body, real))
+        .enumerate()
+        .map(|(idx, item)| {
+            let fallback = item.body.clone();
+            let real = realized_child_or_fallback(&realized_children, idx, &fallback);
+            annotate_realized(&item.body, &real)
+        })
         .collect();
     let slots: Vec<SemanticSlot> = (0..list.children.len())
         .map(|i| SemanticSlot { label: SlotStep::ListItem(i), child_index: i })
@@ -405,17 +454,32 @@ fn map_list_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedCont
 fn map_enum_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
     let Some(enm) = pre.to_packed::<EnumElem>() else { return (vec![], vec![]); };
     let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != enm.children.len() {
-        return (vec![], vec![]);
-    }
     let children: Vec<AnnotatedContent> = enm.children.iter()
-        .zip(realized_children.iter())
-        .map(|(item, real)| annotate_realized(&item.body, real))
+        .enumerate()
+        .map(|(idx, item)| {
+            let fallback = item.body.clone();
+            let real = realized_child_or_fallback(&realized_children, idx, &fallback);
+            annotate_realized(&item.body, &real)
+        })
         .collect();
     let slots: Vec<SemanticSlot> = (0..enm.children.len())
         .map(|i| SemanticSlot { label: SlotStep::EnumItem(i), child_index: i })
         .collect();
     (children, slots)
+}
+
+fn realized_child_or_fallback(
+    realized_children: &[Content],
+    idx: usize,
+    fallback: &Content,
+) -> Content {
+    let Some(realized) = realized_children.get(idx) else {
+        return fallback.clone();
+    };
+    if realized.plain_text().is_empty() && !fallback.plain_text().is_empty() {
+        return fallback.clone();
+    }
+    realized.clone()
 }
 
 fn map_terms_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedContent>, Vec<SemanticSlot>) {
@@ -428,15 +492,13 @@ fn map_terms_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedCon
     // TermsElem differently (e.g. as a StackElem), the count will mismatch and slots
     // will be empty, falling back to flat word-diff. Verify against actual realized
     // form when wiring in Stage 5.
-    let expected = terms.children.len() * 2;
-    if realized_children.len() != expected {
-        return (vec![], vec![]);
-    }
     let mut children = Vec::new();
     let mut slots = Vec::new();
     for (i, item) in terms.children.iter().enumerate() {
-        let term_real = &realized_children[i * 2];
-        let desc_real = &realized_children[i * 2 + 1];
+        let term_fallback = item.term.clone();
+        let desc_fallback = item.description.clone();
+        let term_real = realized_children.get(i * 2).unwrap_or(&term_fallback);
+        let desc_real = realized_children.get(i * 2 + 1).unwrap_or(&desc_fallback);
         slots.push(SemanticSlot { label: SlotStep::Term(i), child_index: children.len() });
         children.push(annotate_realized(&item.term, term_real));
         slots.push(SemanticSlot { label: SlotStep::TermDescription(i), child_index: children.len() });
@@ -467,10 +529,13 @@ fn map_table_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedCon
         }
     }
     let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != pre_cells.len() { return (vec![], vec![]); }
     let children: Vec<AnnotatedContent> = pre_cells.iter()
-        .zip(realized_children.iter())
-        .map(|(p, r)| annotate_realized(p, r))
+        .enumerate()
+        .map(|(idx, pre_cell)| {
+            let fallback = pre_cell.clone();
+            let real = realized_children.get(idx).unwrap_or(&fallback);
+            annotate_realized(pre_cell, real)
+        })
         .collect();
     let slots: Vec<SemanticSlot> = (0..pre_cells.len())
         .map(|i| SemanticSlot { label: SlotStep::TableCell(i), child_index: i })
@@ -498,10 +563,13 @@ fn map_grid_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedCont
         }
     }
     let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != pre_cells.len() { return (vec![], vec![]); }
     let children: Vec<AnnotatedContent> = pre_cells.iter()
-        .zip(realized_children.iter())
-        .map(|(p, r)| annotate_realized(p, r))
+        .enumerate()
+        .map(|(idx, pre_cell)| {
+            let fallback = pre_cell.clone();
+            let real = realized_children.get(idx).unwrap_or(&fallback);
+            annotate_realized(pre_cell, real)
+        })
         .collect();
     let slots: Vec<SemanticSlot> = (0..pre_cells.len())
         .map(|i| SemanticSlot { label: SlotStep::GridCell(i), child_index: i })
@@ -518,10 +586,11 @@ fn map_stack_to_children(pre: &Content, realized: &Content) -> (Vec<AnnotatedCon
         })
         .collect();
     let realized_children = collect_leaf_block_children(realized);
-    if realized_children.len() != pre_blocks.len() { return (vec![], vec![]); }
     let mut children = Vec::new();
     let mut slots = Vec::new();
-    for ((orig_idx, pre_body), real) in pre_blocks.into_iter().zip(realized_children.iter()) {
+    for (idx, (orig_idx, pre_body)) in pre_blocks.into_iter().enumerate() {
+        let fallback = pre_body.clone();
+        let real = realized_children.get(idx).unwrap_or(&fallback);
         slots.push(SemanticSlot { label: SlotStep::StackChild(orig_idx), child_index: children.len() });
         children.push(annotate_realized(&pre_body, real));
     }
@@ -732,7 +801,28 @@ mod tests {
     }
 
     #[test]
-    fn annotate_list_falls_back_to_no_slots_on_item_count_mismatch() {
+    fn annotate_list_descends_into_realized_list_items() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem};
+
+        let pre = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(text("Alpha"))),
+            Packed::new(ListItem::new(text("Beta"))),
+        ]));
+        let realized = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(text("Alpha"))),
+            Packed::new(ListItem::new(text("Beta"))),
+        ]));
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
+        assert_eq!(node.children.len(), 2);
+        assert_eq!(node.children[0].realized.plain_text(), "Alpha");
+        assert_eq!(node.children[1].realized.plain_text(), "Beta");
+    }
+
+    #[test]
+    fn annotate_list_keeps_slots_when_realized_child_count_mismatches() {
         use typst::foundations::Packed;
         use typst::model::{ListElem, ListItem};
 
@@ -743,7 +833,9 @@ mod tests {
         let node = annotate_realized(&pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
-        assert!(node.annotation.slots.is_empty(), "slot count mismatch must produce no slots");
+        assert_eq!(node.annotation.slots.len(), 1);
+        assert_eq!(node.children.len(), 1);
+        assert_eq!(node.children[0].realized.plain_text(), "Alpha");
     }
 
     #[test]

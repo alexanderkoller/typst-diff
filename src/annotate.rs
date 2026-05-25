@@ -17,15 +17,16 @@
 //! started whenever the page styles change. This preserves `#set page(…)` boundaries
 //! (margins, headers, footers) across section breaks in the diff output.
 
-use typst::foundations::Content;
+use typst::foundations::{Content, Packed};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::Abs;
+use typst::layout::{Abs, GridCell, GridChild, GridElem, GridItem};
 use typst::math::{CancelElem, EquationElem};
-use typst::model::{HeadingElem, ParElem};
+use typst::model::{EnumElem, EnumItem, HeadingElem, ListElem, ListItem, ParElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
-use crate::content_slots::replace_slot;
+use crate::content_slots::{rebuild_realized_grid_with_cells, replace_subtree, replace_slot};
+use crate::annotated::SemanticKind;
 use crate::diff::{DiffBlock, DiffNode, DiffResultFlat, DiffResultOp, NodeStatus, WordOp};
 
 fn green() -> Color {
@@ -305,7 +306,47 @@ fn is_inlineish(content: &Content) -> bool {
 /// fill application (applying fill inside each slot individually) will be re-introduced
 /// via the new tree path once `DiffNode` carries slot information.
 fn apply_fill_inside(content: &Content, fill: Color) -> Content {
-    content.clone().styled(TextElem::fill.set(fill.into()))
+    let mut content = content.clone();
+
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        seq.children = seq
+            .children
+            .iter()
+            .map(|child| apply_fill_inside(child, fill))
+            .collect();
+        return content;
+    }
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        styled.child = apply_fill_inside(&styled.child, fill);
+        return content;
+    }
+
+    if let Some(par) = content.to_packed_mut::<ParElem>() {
+        par.body = apply_fill_inside(&par.body, fill);
+        return content;
+    }
+
+    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
+        heading.body = apply_fill_inside(&heading.body, fill);
+        return content;
+    }
+
+    if let Some(list) = content.to_packed_mut::<ListElem>() {
+        for item in &mut list.children {
+            item.body = apply_fill_inside(&item.body, fill);
+        }
+        return content;
+    }
+
+    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
+        for item in &mut enm.children {
+            item.body = apply_fill_inside(&item.body, fill);
+        }
+        return content;
+    }
+
+    content.styled(TextElem::fill.set(fill.into()))
 }
 
 /// Build annotated content from the new tree-shaped [`crate::diff::DiffResult`].
@@ -339,37 +380,36 @@ fn annotate_diff_nodes(nodes: &[DiffNode], compact: bool) -> Vec<DiffBlock> {
 }
 
 fn annotate_single_node(node: &DiffNode, compact: bool) -> DiffBlock {
-    // Phase A: `DiffNode` does not carry per-block page styles, so every block gets the
-    // default. A later phase will plumb page styles through `DiffNode` and enable real
-    // multi-group output from `build_annotated_content_from_tree`.
-    let page_styles = Default::default();
+    let page_styles = node.page_styles.clone();
     match &node.status {
         NodeStatus::Unchanged => DiffBlock {
-            content: node.node.realized.clone(),
+            content: effective_render_content(&node.node),
             page_styles,
         },
         NodeStatus::Inserted => DiffBlock {
-            content: if node.node.realized.plain_text().is_empty() {
-                node.node.realized.clone()
+            content: if effective_render_content(&node.node).plain_text().is_empty() {
+                effective_render_content(&node.node)
             } else {
-                apply_fill_inside(&node.node.realized, green())
+                apply_fill_inside(&effective_render_content(&node.node), green())
             },
             page_styles,
         },
         NodeStatus::Deleted => {
-            let colored = plain_content(&node.node.realized)
+            let content = effective_render_content(&node.node);
+            let colored = plain_content(&content)
                 .styled(TextElem::fill.set(red().into()));
             let struck = Content::new(StrikeElem::new(colored));
             DiffBlock {
-                content: replace_text_container(&node.node.realized, &struck)
+                content: replace_text_container(&content, &struck)
                     .unwrap_or(struck),
                 page_styles,
             }
         }
         NodeStatus::Modified(word_ops) => {
             let inline = annotated_inline_content(word_ops, compact);
+            let content = effective_render_content(&node.node);
             DiffBlock {
-                content: replace_text_container(&node.node.realized, &inline)
+                content: replace_text_container(&content, &inline)
                     .unwrap_or(inline),
                 page_styles,
             }
@@ -381,27 +421,85 @@ fn annotate_single_node(node: &DiffNode, compact: bool) -> DiffBlock {
     }
 }
 
+fn effective_render_content(node: &crate::annotated::AnnotatedContent) -> Content {
+    if !node.realized.plain_text().is_empty() || node.children.is_empty() {
+        return node.realized.clone();
+    }
+    Content::sequence(node.children.iter().map(effective_render_content))
+}
+
 fn apply_changed_descendants(
     node: &crate::annotated::AnnotatedContent,
-    children: &[DiffNode],
+    diff_children: &[DiffNode],
     compact: bool,
 ) -> Content {
+    let cell_bodies: Vec<Content> = diff_children
+        .iter()
+        .map(|child| annotate_single_node(child, compact).content)
+        .collect();
+
+    if let Some(rebuilt) = rebuild_realized_grid_with_cells(&node.realized, cell_bodies) {
+        return rebuilt;
+    }
+
+    if matches!(
+        node.annotation.semantic_kind.as_ref(),
+        Some(SemanticKind::List | SemanticKind::Enum)
+    ) {
+        return semantic_changed_descendants_fallback(node, diff_children, compact);
+    }
+
     let mut result = node.realized.clone();
-    for diff_child in children {
-        let slot = node.annotation.slots.iter().find(|s| {
-            s.child_index < node.children.len()
-                && node.children[s.child_index].realized == diff_child.node.realized
-        });
-        if let Some(s) = slot {
-            let new_content = annotate_single_node(diff_child, compact).content;
-            if let Some(next) =
-                replace_slot(&result, &[s.label.clone()], new_content)
-            {
-                result = next;
-            }
+    let mut patched_any = false;
+    for diff_child in diff_children {
+        if matches!(diff_child.status, NodeStatus::Unchanged) {
+            continue;
+        }
+        let new_content = annotate_single_node(diff_child, compact).content;
+        if let Some(patched) = replace_subtree(&result, &diff_child.node.realized, new_content) {
+            result = patched;
+            patched_any = true;
         }
     }
-    result
+    if patched_any {
+        return result;
+    }
+    semantic_changed_descendants_fallback(node, diff_children, compact)
+}
+
+fn semantic_changed_descendants_fallback(
+    node: &crate::annotated::AnnotatedContent,
+    diff_children: &[DiffNode],
+    compact: bool,
+) -> Content {
+    let rendered_children: Vec<Content> = diff_children
+        .iter()
+        .map(|child| annotate_single_node(child, compact).content)
+        .collect();
+
+    match node.annotation.semantic_kind.as_ref() {
+        Some(SemanticKind::List) => Content::new(ListElem::new(
+            rendered_children
+                .into_iter()
+                .map(|child| Packed::new(ListItem::new(child)))
+                .collect(),
+        )),
+        Some(SemanticKind::Enum) => Content::new(EnumElem::new(
+            rendered_children
+                .into_iter()
+                .map(|child| Packed::new(EnumItem::new(child)))
+                .collect(),
+        )),
+        Some(SemanticKind::Table) | Some(SemanticKind::Grid) => Content::new(GridElem::new(
+            rendered_children
+                .into_iter()
+                .map(|child| {
+                    GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(child))))
+                })
+                .collect(),
+        )),
+        _ => Content::sequence(rendered_children),
+    }
 }
 
 #[allow(dead_code)]
@@ -769,6 +867,7 @@ mod tests {
             },
             status: NodeStatus::Inserted,
             children: vec![],
+            page_styles: Default::default(),
         };
         let result = DiffResult {
             blocks: vec![node],

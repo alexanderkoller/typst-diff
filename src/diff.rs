@@ -34,7 +34,7 @@ use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
-use crate::annotated::{AnnotatedContent, Annotation};
+use crate::annotated::{AnnotatedContent, Annotation, SemanticKind};
 use crate::content_slots::SlotStep;
 
 /// A block-level unit of content together with the page styles active at its position.
@@ -1234,6 +1234,8 @@ pub struct DiffNode {
     pub status: NodeStatus,
     /// Per-slot children, populated when status is `HasChangedDescendants`.
     pub children: Vec<DiffNode>,
+    /// Page styles active at this block's position (for output grouping).
+    pub page_styles: Styles,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1299,76 +1301,129 @@ fn log_diff_node(log: &mut String, node: &DiffNode, index: usize) {
 }
 
 pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
-    let flat = diff_content(&old.realized, &new.realized);
-    let blocks = flat
-        .block_ops
-        .into_iter()
-        .map(|op| diff_result_op_to_node(op, new))
-        .collect();
-    DiffResult {
-        blocks,
-        root_styles: flat.root_styles,
-    }
-}
+    let old_blocks = extract_block_units(&old.realized);
+    let new_blocks = extract_block_units(&new.realized);
+    let raw = diff_block_units_raw(&old_blocks, &new_blocks);
+    let matched = match_edit_zones(raw);
+    let root_styles = root_page_styles(&new.realized);
 
-fn diff_result_op_to_node(op: DiffResultOp, new_ac: &AnnotatedContent) -> DiffNode {
-    match op {
-        DiffResultOp::Equal(block) => DiffNode {
-            node: find_or_wrap_annotated(&block.content, new_ac),
-            status: NodeStatus::Unchanged,
-            children: vec![],
-        },
-        DiffResultOp::Deleted(block) => DiffNode {
-            node: AnnotatedContent {
-                realized: block.content.clone(),
-                annotation: Annotation::default(),
-                children: vec![],
-            },
-            status: NodeStatus::Deleted,
-            children: vec![],
-        },
-        DiffResultOp::Inserted(block) => DiffNode {
-            node: find_or_wrap_annotated(&block.content, new_ac),
-            status: NodeStatus::Inserted,
-            children: vec![],
-        },
-        DiffResultOp::Modified(block, word_ops) => DiffNode {
-            node: find_or_wrap_annotated(&block.content, new_ac),
-            status: NodeStatus::Modified(word_ops),
-            children: vec![],
-        },
-        DiffResultOp::ModifiedSlots(block, slot_diffs) => {
-            let node = find_or_wrap_annotated(&block.content, new_ac);
-            // Phase A scaffolding: each SlotDiff's `path` is discarded and child nodes are
-            // approximated from the ops. Slot identity will be wired from `annotation.slots`
-            // in Phase B.
-            let children = slot_diffs
-                .into_iter()
-                .map(|sd| DiffNode {
-                    node: AnnotatedContent {
-                        realized: sd
-                            .ops
-                            .iter()
-                            .find_map(|op| match op {
-                                DiffResultOp::Modified(b, _) => Some(b.content.clone()),
-                                DiffResultOp::Equal(b) => Some(b.content.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| TextElem::packed("")),
-                        annotation: Annotation::default(),
-                        children: vec![],
-                    },
-                    status: NodeStatus::HasChangedDescendants,
+    let blocks = matched
+        .into_iter()
+        .map(|op| match op {
+            BlockOp::Equal(old_block, new_block) => {
+                let page_styles = new_block.page_styles.clone();
+                let old_ann = find_annotated_child(old, &old_block.content);
+                let new_ann = find_annotated_child(new, &new_block.content);
+                if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
+                    && can_recurse_via_slots(old_ann, new_ann)
+                {
+                    if annotated_subtree_equal(old_ann, new_ann) {
+                        return DiffNode {
+                            node: find_or_wrap_annotated(&new_block.content, new),
+                            status: NodeStatus::Unchanged,
+                            children: vec![],
+                            page_styles,
+                        };
+                    }
+                    let slot_children = diff_slot_children(old_ann, new_ann, &page_styles);
+                    let any_changed = slot_children
+                        .iter()
+                        .any(|c| !matches!(c.status, NodeStatus::Unchanged));
+                    if any_changed {
+                        return DiffNode {
+                            node: AnnotatedContent {
+                                realized: new_block.content.clone(),
+                                annotation: new_ann.annotation.clone(),
+                                children: new_ann.children.clone(),
+                            },
+                            status: NodeStatus::HasChangedDescendants,
+                            children: slot_children,
+                            page_styles,
+                        };
+                    }
+                }
+                DiffNode {
+                    node: find_or_wrap_annotated(&new_block.content, new),
+                    status: NodeStatus::Unchanged,
                     children: vec![],
-                })
-                .collect();
-            DiffNode {
-                node,
-                status: NodeStatus::HasChangedDescendants,
-                children,
+                    page_styles: new_block.page_styles,
+                }
             }
-        }
-    }
+            BlockOp::Delete(old_block) => DiffNode {
+                node: AnnotatedContent {
+                    realized: old_block.content.clone(),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+                status: NodeStatus::Deleted,
+                children: vec![],
+                page_styles: old_block.page_styles,
+            },
+            BlockOp::Insert(new_block) => DiffNode {
+                node: find_or_wrap_annotated(&new_block.content, new),
+                status: NodeStatus::Inserted,
+                children: vec![],
+                page_styles: new_block.page_styles,
+            },
+            BlockOp::Replace(old_block, new_block) => {
+                let page_styles = new_block.page_styles.clone();
+                let old_ann = find_annotated_child(old, &old_block.content);
+                let new_ann = find_annotated_child(new, &new_block.content);
+
+                if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
+                    && can_recurse_via_slots(old_ann, new_ann)
+                {
+                    if annotated_subtree_equal(old_ann, new_ann) {
+                        return DiffNode {
+                            node: find_or_wrap_annotated(&new_block.content, new),
+                            status: NodeStatus::Unchanged,
+                            children: vec![],
+                            page_styles,
+                        };
+                    }
+                    let slot_children = diff_slot_children(old_ann, new_ann, &page_styles);
+                    let any_changed = slot_children
+                        .iter()
+                        .any(|c| !matches!(c.status, NodeStatus::Unchanged));
+                    if any_changed {
+                        return DiffNode {
+                            node: AnnotatedContent {
+                                realized: new_block.content.clone(),
+                                annotation: new_ann.annotation.clone(),
+                                children: new_ann.children.clone(),
+                            },
+                            status: NodeStatus::HasChangedDescendants,
+                            children: slot_children,
+                            page_styles,
+                        };
+                    }
+                    return DiffNode {
+                        node: find_or_wrap_annotated(&new_block.content, new),
+                        status: NodeStatus::Unchanged,
+                        children: vec![],
+                        page_styles,
+                    };
+                }
+
+                let old_tokens = extract_words(&old_block.content);
+                let new_tokens = extract_words(&new_block.content);
+                let word_ops = diff_words(&old_tokens, &new_tokens);
+                let status = if has_textual_word_change(&word_ops) {
+                    NodeStatus::Modified(word_ops)
+                } else {
+                    NodeStatus::Unchanged
+                };
+                DiffNode {
+                    node: find_or_wrap_annotated(&new_block.content, new),
+                    status,
+                    children: vec![],
+                    page_styles,
+                }
+            }
+        })
+        .collect();
+
+    DiffResult { blocks, root_styles }
 }
 
 /// Wrap a block-level `content` (from `extract_block_units`) as an `AnnotatedContent`
@@ -1398,6 +1453,334 @@ fn find_or_wrap_annotated(content: &Content, _root: &AnnotatedContent) -> Annota
     }
 }
 
+/// Find the direct child of `root` whose realized content matches `target`.
+fn find_annotated_child<'a>(root: &'a AnnotatedContent, target: &Content) -> Option<&'a AnnotatedContent> {
+    root.children
+        .iter()
+        .find(|child| child.realized == *target)
+        .or_else(|| {
+            let target_text = target.plain_text();
+            if target_text.is_empty() {
+                root.children
+                    .iter()
+                    .filter(|child| child.realized.plain_text().is_empty())
+                    .max_by_key(|child| child.annotation.slots.len())
+            } else {
+                root.children
+                    .iter()
+                    .find(|child| child.realized.plain_text() == target_text)
+            }
+        })
+}
+
+/// True when both nodes have the same slot-bearing semantic kind.
+fn can_recurse_via_slots(old: &AnnotatedContent, new: &AnnotatedContent) -> bool {
+    let Some(old_kind) = old.annotation.semantic_kind.as_ref() else {
+        return false;
+    };
+    let Some(new_kind) = new.annotation.semantic_kind.as_ref() else {
+        return false;
+    };
+    if old_kind != new_kind {
+        return false;
+    }
+    if matches!(old_kind, SemanticKind::Equation) {
+        return false;
+    }
+    !old.annotation.slots.is_empty()
+}
+
+fn collect_slot_bearing_descendants<'a>(
+    node: &'a AnnotatedContent,
+) -> Vec<&'a AnnotatedContent> {
+    let mut out = Vec::new();
+    collect_slot_bearing_descendants_into(node, &mut out);
+    out
+}
+
+fn collect_slot_bearing_descendants_into<'a>(
+    node: &'a AnnotatedContent,
+    out: &mut Vec<&'a AnnotatedContent>,
+) {
+    for child in &node.children {
+        if !child.annotation.slots.is_empty() {
+            out.push(child);
+        } else {
+            collect_slot_bearing_descendants_into(child, out);
+        }
+    }
+}
+
+/// Find a unique nested slot-bearing pair when direct slot recursion is unavailable.
+fn find_slot_bearing_descendant_pair<'a>(
+    old: &'a AnnotatedContent,
+    new: &'a AnnotatedContent,
+) -> Option<(&'a AnnotatedContent, &'a AnnotatedContent)> {
+    let old_candidates = collect_slot_bearing_descendants(old);
+    let new_candidates = collect_slot_bearing_descendants(new);
+
+    if old_candidates.len() != 1 || new_candidates.len() != 1 {
+        return None;
+    }
+    let old_candidate = old_candidates[0];
+    let new_candidate = new_candidates[0];
+    can_recurse_via_slots(old_candidate, new_candidate).then_some((old_candidate, new_candidate))
+}
+
+fn effective_content(node: &AnnotatedContent) -> Content {
+    if !node.realized.plain_text().is_empty() || node.children.is_empty() {
+        return node.realized.clone();
+    }
+    Content::sequence(node.children.iter().map(effective_content))
+}
+
+fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
+    node.annotation
+        .slots
+        .iter()
+        .map(|slot| &slot.label)
+        .collect()
+}
+
+fn annotated_subtree_equal(old: &AnnotatedContent, new: &AnnotatedContent) -> bool {
+    old.annotation.semantic_kind == new.annotation.semantic_kind
+        && slot_labels(old) == slot_labels(new)
+        && effective_content(old) == effective_content(new)
+        && old.children.len() == new.children.len()
+        && old
+            .children
+            .iter()
+            .zip(new.children.iter())
+            .all(|(old_child, new_child)| annotated_subtree_equal(old_child, new_child))
+}
+
+fn diff_slot_children_same_shape(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+    page_styles: &Styles,
+) -> Vec<DiffNode> {
+    old_ann
+        .children
+        .iter()
+        .zip(new_ann.children.iter())
+        .map(|(old_child, new_child)| {
+            if annotated_subtree_equal(old_child, new_child) {
+                return DiffNode {
+                    node: new_child.clone(),
+                    status: NodeStatus::Unchanged,
+                    children: vec![],
+                    page_styles: page_styles.clone(),
+                };
+            }
+
+            if can_recurse_via_slots(old_child, new_child) {
+                let grandchildren = diff_slot_children(old_child, new_child, page_styles);
+                let any_changed = grandchildren
+                    .iter()
+                    .any(|n| !matches!(n.status, NodeStatus::Unchanged));
+                if any_changed {
+                    return DiffNode {
+                        node: new_child.clone(),
+                        status: NodeStatus::HasChangedDescendants,
+                        children: grandchildren,
+                        page_styles: page_styles.clone(),
+                    };
+                }
+                return DiffNode {
+                    node: new_child.clone(),
+                    status: NodeStatus::Unchanged,
+                    children: vec![],
+                    page_styles: page_styles.clone(),
+                };
+            }
+
+            if let Some((old_inner, new_inner)) =
+                find_slot_bearing_descendant_pair(old_child, new_child)
+            {
+                let inner_grandchildren = diff_slot_children(old_inner, new_inner, page_styles);
+                let any_changed = inner_grandchildren
+                    .iter()
+                    .any(|n| !matches!(n.status, NodeStatus::Unchanged));
+                if any_changed {
+                    let inner_diff = DiffNode {
+                        node: new_inner.clone(),
+                        status: NodeStatus::HasChangedDescendants,
+                        children: inner_grandchildren,
+                        page_styles: page_styles.clone(),
+                    };
+                    return DiffNode {
+                        node: new_child.clone(),
+                        status: NodeStatus::HasChangedDescendants,
+                        children: vec![inner_diff],
+                        page_styles: page_styles.clone(),
+                    };
+                }
+            }
+
+            let old_effective = effective_content(old_child);
+            let new_effective = effective_content(new_child);
+            let old_tokens = extract_words(&old_effective);
+            let new_tokens = extract_words(&new_effective);
+            let word_ops = diff_words(&old_tokens, &new_tokens);
+            let status = if has_textual_word_change(&word_ops) {
+                NodeStatus::Modified(word_ops)
+            } else {
+                NodeStatus::Unchanged
+            };
+            DiffNode {
+                node: new_child.clone(),
+                status,
+                children: vec![],
+                page_styles: page_styles.clone(),
+            }
+        })
+        .collect()
+}
+
+fn diff_slot_children(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+    page_styles: &Styles,
+) -> Vec<DiffNode> {
+    if old_ann.children.len() == new_ann.children.len() {
+        diff_slot_children_same_shape(old_ann, new_ann, page_styles)
+    } else {
+        diff_slot_children_lcs(old_ann, new_ann, page_styles)
+    }
+}
+
+fn diff_slot_children_lcs(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+    page_styles: &Styles,
+) -> Vec<DiffNode> {
+    let old_h: Vec<HashableContent> = old_ann
+        .children
+        .iter()
+        .map(|child| HashableContent(effective_content(child)))
+        .collect();
+    let new_h: Vec<HashableContent> = new_ann
+        .children
+        .iter()
+        .map(|child| HashableContent(effective_content(child)))
+        .collect();
+    let ops = capture_diff_slices(Algorithm::Myers, &old_h, &new_h);
+
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
+                for i in 0..len {
+                    let old_child = &old_ann.children[old_index + i];
+                    let new_child = &new_ann.children[new_index + i];
+                    let (status, children) = if annotated_subtree_equal(old_child, new_child) {
+                        (NodeStatus::Unchanged, vec![])
+                    } else {
+                        let children = diff_slot_children(old_child, new_child, page_styles);
+                        (NodeStatus::HasChangedDescendants, children)
+                    };
+                    out.push(DiffNode {
+                        node: new_child.clone(),
+                        status,
+                        children,
+                        page_styles: page_styles.clone(),
+                    });
+                }
+            }
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
+                for i in 0..old_len {
+                    out.push(DiffNode {
+                        node: old_ann.children[old_index + i].clone(),
+                        status: NodeStatus::Deleted,
+                        children: vec![],
+                        page_styles: page_styles.clone(),
+                    });
+                }
+            }
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                for i in 0..new_len {
+                    out.push(DiffNode {
+                        node: new_ann.children[new_index + i].clone(),
+                        status: NodeStatus::Inserted,
+                        children: vec![],
+                        page_styles: page_styles.clone(),
+                    });
+                }
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                let paired = old_len.min(new_len);
+                for i in 0..paired {
+                    let old_child = &old_ann.children[old_index + i];
+                    let new_child = &new_ann.children[new_index + i];
+                    if can_recurse_via_slots(old_child, new_child) {
+                        let grandchildren = diff_slot_children(old_child, new_child, page_styles);
+                        let any_changed = grandchildren
+                            .iter()
+                            .any(|n| !matches!(n.status, NodeStatus::Unchanged));
+                        out.push(DiffNode {
+                            node: new_child.clone(),
+                            status: if any_changed {
+                                NodeStatus::HasChangedDescendants
+                            } else {
+                                NodeStatus::Unchanged
+                            },
+                            children: if any_changed { grandchildren } else { vec![] },
+                            page_styles: page_styles.clone(),
+                        });
+                    } else {
+                        let old_effective = effective_content(old_child);
+                        let new_effective = effective_content(new_child);
+                        let old_tokens = extract_words(&old_effective);
+                        let new_tokens = extract_words(&new_effective);
+                        let word_ops = diff_words(&old_tokens, &new_tokens);
+                        let status = if has_textual_word_change(&word_ops) {
+                            NodeStatus::Modified(word_ops)
+                        } else {
+                            NodeStatus::Unchanged
+                        };
+                        out.push(DiffNode {
+                            node: new_child.clone(),
+                            status,
+                            children: vec![],
+                            page_styles: page_styles.clone(),
+                        });
+                    }
+                }
+                for i in paired..old_len {
+                    out.push(DiffNode {
+                        node: old_ann.children[old_index + i].clone(),
+                        status: NodeStatus::Deleted,
+                        children: vec![],
+                        page_styles: page_styles.clone(),
+                    });
+                }
+                for i in paired..new_len {
+                    out.push(DiffNode {
+                        node: new_ann.children[new_index + i].clone(),
+                        status: NodeStatus::Inserted,
+                        children: vec![],
+                        page_styles: page_styles.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1802,395 @@ mod tests {
         };
         let result = diff_annotated(&node_a, &node_a);
         assert!(result.blocks.iter().all(|n| matches!(n.status, NodeStatus::Unchanged)));
+    }
+
+    #[test]
+    fn find_annotated_child_returns_child_with_matching_realized() {
+        use crate::annotated::{AnnotatedContent, Annotation};
+
+        let target = TextElem::packed("hello");
+        let other = TextElem::packed("world");
+        let root = AnnotatedContent {
+            realized: TextElem::packed("root"),
+            annotation: Annotation::default(),
+            children: vec![
+                AnnotatedContent {
+                    realized: other.clone(),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+                AnnotatedContent {
+                    realized: target.clone(),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+            ],
+        };
+        let found = find_annotated_child(&root, &target);
+        assert!(found.is_some());
+        assert!(found.unwrap().realized == target);
+    }
+
+    #[test]
+    fn find_annotated_child_returns_none_when_no_match() {
+        use crate::annotated::{AnnotatedContent, Annotation};
+
+        let root = AnnotatedContent {
+            realized: TextElem::packed("root"),
+            annotation: Annotation::default(),
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("child"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+        assert!(find_annotated_child(&root, &TextElem::packed("missing")).is_none());
+    }
+
+    #[test]
+    fn can_recurse_via_slots_true_for_matching_list_kinds() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let make = |kind: SemanticKind| AnnotatedContent {
+            realized: TextElem::packed("x"),
+            annotation: Annotation {
+                semantic_kind: Some(kind),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("item"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+        let old = make(SemanticKind::List);
+        let new = make(SemanticKind::List);
+        assert!(can_recurse_via_slots(&old, &new));
+    }
+
+    #[test]
+    fn can_recurse_via_slots_false_for_equation() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let eq = AnnotatedContent {
+            realized: TextElem::packed("x"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Equation),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![],
+        };
+        assert!(!can_recurse_via_slots(&eq, &eq));
+    }
+
+    #[test]
+    fn find_slot_bearing_descendant_pair_finds_nested_list() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let make_inner_list = || AnnotatedContent {
+            realized: TextElem::packed("inner-list"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("inner-item"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+
+        let make_outer = || AnnotatedContent {
+            realized: TextElem::packed("outer-body"),
+            annotation: Annotation::default(),
+            children: vec![
+                AnnotatedContent {
+                    realized: TextElem::packed("Plan release"),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+                make_inner_list(),
+            ],
+        };
+
+        let old = make_outer();
+        let new = make_outer();
+        let pair = find_slot_bearing_descendant_pair(&old, &new);
+        assert!(pair.is_some(), "expected to find inner list pair");
+        let (oi, ni) = pair.unwrap();
+        assert_eq!(oi.annotation.semantic_kind, Some(SemanticKind::List));
+        assert_eq!(ni.annotation.semantic_kind, Some(SemanticKind::List));
+    }
+
+    #[test]
+    fn find_slot_bearing_descendant_pair_returns_none_when_no_descendant() {
+        use crate::annotated::{AnnotatedContent, Annotation};
+
+        let leaf = AnnotatedContent {
+            realized: TextElem::packed("just text"),
+            annotation: Annotation::default(),
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("inner"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+        assert!(find_slot_bearing_descendant_pair(&leaf, &leaf).is_none());
+    }
+
+    #[test]
+    fn find_slot_bearing_descendant_pair_returns_none_with_multiple_candidates() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let make_list = || AnnotatedContent {
+            realized: TextElem::packed("list"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("item"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+
+        let node = AnnotatedContent {
+            realized: TextElem::packed("body"),
+            annotation: Annotation::default(),
+            children: vec![make_list(), make_list()],
+        };
+        assert!(find_slot_bearing_descendant_pair(&node, &node).is_none());
+    }
+
+    #[test]
+    fn diff_slot_children_same_shape_marks_changed_item_modified() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let make_child = |text: &str| AnnotatedContent {
+            realized: TextElem::packed(text),
+            annotation: Annotation::default(),
+            children: vec![],
+        };
+        let make_list = |texts: &[&str]| AnnotatedContent {
+            realized: TextElem::packed("list"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| SemanticSlot {
+                        label: SlotStep::ListItem(i),
+                        child_index: i,
+                    })
+                    .collect(),
+                ..Annotation::default()
+            },
+            children: texts.iter().map(|text| make_child(text)).collect(),
+        };
+
+        let old = make_list(&["Item A", "Old item", "Item C"]);
+        let new = make_list(&["Item A", "New item", "Item C"]);
+        let styles = Styles::new();
+
+        let result = diff_slot_children_same_shape(&old, &new, &styles);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0].status, NodeStatus::Unchanged));
+        assert!(matches!(result[1].status, NodeStatus::Modified(_)));
+        assert!(matches!(result[2].status, NodeStatus::Unchanged));
+    }
+
+    #[test]
+    fn diff_slot_children_same_shape_all_unchanged_when_equal() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let make_list = |texts: &[&str]| AnnotatedContent {
+            realized: TextElem::packed("list"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| SemanticSlot {
+                        label: SlotStep::ListItem(i),
+                        child_index: i,
+                    })
+                    .collect(),
+                ..Annotation::default()
+            },
+            children: texts
+                .iter()
+                .map(|text| AnnotatedContent {
+                    realized: TextElem::packed(*text),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                })
+                .collect(),
+        };
+
+        let list = make_list(&["A", "B", "C"]);
+        let result = diff_slot_children_same_shape(&list, &list, &Styles::new());
+        assert_eq!(result.len(), 3);
+        for child in &result {
+            assert!(matches!(child.status, NodeStatus::Unchanged));
+        }
+    }
+
+    #[test]
+    fn identical_non_leaf_subtree_collapses_to_unchanged_without_children() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let inner_list = AnnotatedContent {
+            realized: TextElem::packed(""),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("Nested item"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+        let parent = AnnotatedContent {
+            realized: TextElem::packed("parent"),
+            annotation: Annotation::default(),
+            children: vec![inner_list],
+        };
+        let container = AnnotatedContent {
+            realized: TextElem::packed("outer"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![parent],
+        };
+
+        let result = diff_slot_children_same_shape(&container, &container, &Styles::new());
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].status, NodeStatus::Unchanged));
+        assert!(
+            result[0].children.is_empty(),
+            "unchanged non-leaf subtree should not be expanded"
+        );
+    }
+
+    #[test]
+    fn diff_slot_children_same_shape_recurses_into_nested_descendant() {
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+        use crate::content_slots::SlotStep;
+
+        let make_inner_list = |item_text: &str| AnnotatedContent {
+            realized: TextElem::packed(item_text),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::ListItem(0),
+                    child_index: 0,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed(item_text),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+
+        let make_item_body = |inner_text: &str, body_id: &str| AnnotatedContent {
+            realized: TextElem::packed(body_id),
+            annotation: Annotation::default(),
+            children: vec![
+                AnnotatedContent {
+                    realized: TextElem::packed("Plan release"),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+                make_inner_list(inner_text),
+            ],
+        };
+
+        let outer_old = AnnotatedContent {
+            realized: TextElem::packed("outer-list-old"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::List),
+                slots: vec![
+                    SemanticSlot {
+                        label: SlotStep::ListItem(0),
+                        child_index: 0,
+                    },
+                    SemanticSlot {
+                        label: SlotStep::ListItem(1),
+                        child_index: 1,
+                    },
+                ],
+                ..Annotation::default()
+            },
+            children: vec![
+                make_item_body("Old inner", "item-0-body-old"),
+                AnnotatedContent {
+                    realized: TextElem::packed("Ship release"),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+            ],
+        };
+        let outer_new = AnnotatedContent {
+            realized: TextElem::packed("outer-list-new"),
+            annotation: outer_old.annotation.clone(),
+            children: vec![
+                make_item_body("New inner", "item-0-body-new"),
+                AnnotatedContent {
+                    realized: TextElem::packed("Ship release"),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+            ],
+        };
+
+        let result = diff_slot_children_same_shape(&outer_old, &outer_new, &Styles::new());
+        assert_eq!(result.len(), 2);
+        assert!(matches!(
+            result[0].status,
+            NodeStatus::HasChangedDescendants
+        ));
+        assert_eq!(result[0].children.len(), 1);
+        assert!(matches!(
+            result[0].children[0].status,
+            NodeStatus::HasChangedDescendants
+        ));
+        assert!(matches!(result[1].status, NodeStatus::Unchanged));
     }
 
     // --- extract_blocks tests ---

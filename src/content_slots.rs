@@ -8,15 +8,16 @@
 //! now supplied by the annotated tree (`annotation.slots`) rather than extracted from
 //! realized content.
 
-use typst::foundations::{Content, SequenceElem, StyledElem};
+use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridChild, GridElem, GridItem, PadElem,
     PlaceElem, StackChild, StackElem,
 };
 use typst::model::{
     EnumElem, EnumItem, FigureElem, FootnoteBody, FootnoteElem, ListElem, ListItem, ParElem,
-    QuoteElem, TableChild, TableElem, TableItem, TermItem, TermsElem,
+    ParbreakElem, QuoteElem, TableChild, TableElem, TableItem, TermItem, TermsElem,
 };
+use typst::text::SpaceElem;
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
 /// One step in a path from a container element to a leaf slot.
@@ -81,28 +82,52 @@ fn group_list_item_runs(children: Vec<Content>) -> Vec<Content> {
         if children[index].is::<ListItem>() {
             let span = children[index].span();
             let mut items = Vec::new();
-            while index < children.len() && children[index].is::<ListItem>() {
-                let child = children[index].clone();
-                items.push(child.into_packed::<ListItem>().unwrap());
-                index += 1;
+            while index < children.len() {
+                if children[index].is::<ListItem>() {
+                    let child = children[index].clone();
+                    items.push(child.into_packed::<ListItem>().unwrap());
+                    index += 1;
+                    continue;
+                }
+                if children[index].is::<SpaceElem>() || children[index].is::<ParbreakElem>() {
+                    index += 1;
+                    continue;
+                }
+                break;
             }
             grouped.push(Content::new(ListElem::new(items)).spanned(span));
         } else if children[index].is::<EnumItem>() {
             let span = children[index].span();
             let mut items = Vec::new();
-            while index < children.len() && children[index].is::<EnumItem>() {
-                let child = children[index].clone();
-                items.push(child.into_packed::<EnumItem>().unwrap());
-                index += 1;
+            while index < children.len() {
+                if children[index].is::<EnumItem>() {
+                    let child = children[index].clone();
+                    items.push(child.into_packed::<EnumItem>().unwrap());
+                    index += 1;
+                    continue;
+                }
+                if children[index].is::<SpaceElem>() || children[index].is::<ParbreakElem>() {
+                    index += 1;
+                    continue;
+                }
+                break;
             }
             grouped.push(Content::new(EnumElem::new(items)).spanned(span));
         } else if children[index].is::<TermItem>() {
             let span = children[index].span();
             let mut items = Vec::new();
-            while index < children.len() && children[index].is::<TermItem>() {
-                let child = children[index].clone();
-                items.push(child.into_packed::<TermItem>().unwrap());
-                index += 1;
+            while index < children.len() {
+                if children[index].is::<TermItem>() {
+                    let child = children[index].clone();
+                    items.push(child.into_packed::<TermItem>().unwrap());
+                    index += 1;
+                    continue;
+                }
+                if children[index].is::<SpaceElem>() || children[index].is::<ParbreakElem>() {
+                    index += 1;
+                    continue;
+                }
+                break;
             }
             grouped.push(Content::new(TermsElem::new(items)).spanned(span));
         } else {
@@ -112,6 +137,99 @@ fn group_list_item_runs(children: Vec<Content>) -> Vec<Content> {
     }
 
     grouped
+}
+
+pub fn rebuild_realized_grid_with_cells(
+    container: &Content,
+    cell_bodies: Vec<Content>,
+) -> Option<Content> {
+    let mut content = container.clone();
+    rebuild_grid_in_realized(&mut content, &cell_bodies)?;
+    Some(content)
+}
+
+fn rebuild_grid_in_realized(content: &mut Content, cell_bodies: &[Content]) -> Option<()> {
+    if content.to_packed::<GridElem>().is_some() {
+        return rebuild_grid_body_cells(content, cell_bodies);
+    }
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        return rebuild_grid_in_realized(&mut styled.child, cell_bodies);
+    }
+    if let Some(block) = content.to_packed_mut::<BlockElem>() {
+        let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) else {
+            return None;
+        };
+        let mut body = body;
+        rebuild_grid_in_realized(&mut body, cell_bodies)?;
+        block.body.set(Some(BlockBody::Content(body)));
+        return Some(());
+    }
+    None
+}
+
+fn rebuild_grid_body_cells(content: &mut Content, cell_bodies: &[Content]) -> Option<()> {
+    use typst::foundations::Packed;
+    use typst::layout::GridCell;
+
+    let grid = content.to_packed_mut::<GridElem>()?;
+    let mut new_children: Vec<GridChild> = Vec::with_capacity(grid.children.len());
+    let mut idx = 0usize;
+
+    for child in &grid.children {
+        match child {
+            GridChild::Item(GridItem::Cell(cell)) => {
+                if idx < cell_bodies.len() {
+                    let mut new_cell = (**cell).clone();
+                    new_cell.body = cell_bodies[idx].clone();
+                    new_children.push(GridChild::Item(GridItem::Cell(Packed::new(new_cell))));
+                    idx += 1;
+                } else {
+                    new_children.push(child.clone());
+                }
+            }
+            other => new_children.push(other.clone()),
+        }
+    }
+
+    while idx < cell_bodies.len() {
+        let cell = GridCell::new(cell_bodies[idx].clone());
+        new_children.push(GridChild::Item(GridItem::Cell(Packed::new(cell))));
+        idx += 1;
+    }
+
+    grid.children = new_children;
+    Some(())
+}
+
+pub fn replace_subtree(
+    haystack: &Content,
+    needle: &Content,
+    replacement: Content,
+) -> Option<Content> {
+    if haystack == needle {
+        return Some(replacement);
+    }
+
+    let mut content = haystack.clone();
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        for child in &mut seq.children {
+            if let Some(patched) = replace_subtree(child, needle, replacement.clone()) {
+                *child = patched;
+                return Some(content);
+            }
+        }
+        return None;
+    }
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        if let Some(patched) = replace_subtree(&styled.child, needle, replacement) {
+            styled.child = patched;
+            return Some(content);
+        }
+        return None;
+    }
+
+    None
 }
 
 /// Write `replacement` into the slot identified by `path` inside a clone of `template`.
@@ -559,5 +677,112 @@ mod tests {
                 .plain_text(),
             "New text"
         );
+    }
+
+    #[test]
+    fn rebuild_realized_grid_replaces_each_cell_body_in_order() {
+        use typst::layout::{GridCell, GridChild, GridElem, GridItem};
+
+        let cells = vec![
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("A"))))),
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("B"))))),
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("C"))))),
+        ];
+        let grid = Content::new(GridElem::new(cells));
+        let container = Content::new(BlockElem::new().with_body(Some(BlockBody::Content(grid))));
+
+        let rebuilt =
+            rebuild_realized_grid_with_cells(&container, vec![text("X"), text("Y"), text("Z")])
+                .unwrap();
+        let plain = rebuilt.plain_text();
+        assert!(plain.contains('X'));
+        assert!(plain.contains('Y'));
+        assert!(plain.contains('Z'));
+        assert!(!plain.contains('A'));
+        assert!(!plain.contains('B'));
+        assert!(!plain.contains('C'));
+    }
+
+    #[test]
+    fn rebuild_realized_grid_appends_extra_cells_at_end() {
+        use typst::layout::{GridCell, GridChild, GridElem, GridItem};
+
+        let cells = vec![
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("A"))))),
+            GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(text("B"))))),
+        ];
+        let grid = Content::new(GridElem::new(cells));
+        let container = Content::new(BlockElem::new().with_body(Some(BlockBody::Content(grid))));
+
+        let rebuilt = rebuild_realized_grid_with_cells(
+            &container,
+            vec![text("X"), text("Y"), text("Z"), text("W")],
+        )
+        .unwrap();
+        let plain = rebuilt.plain_text();
+        assert!(plain.contains('X'));
+        assert!(plain.contains('Y'));
+        assert!(plain.contains('Z'));
+        assert!(plain.contains('W'));
+    }
+
+    #[test]
+    fn rebuild_realized_grid_descends_through_styled_block_wrappers() {
+        use typst::layout::{GridCell, GridChild, GridElem, GridItem};
+        use typst::visualize::Color;
+
+        let cells = vec![GridChild::Item(GridItem::Cell(Packed::new(GridCell::new(
+            text("A"),
+        ))))];
+        let grid = Content::new(GridElem::new(cells));
+        let block = Content::new(BlockElem::new().with_body(Some(BlockBody::Content(grid))));
+        let container = block.styled(TextElem::fill.set(Color::from_u8(0, 0, 0, 255).into()));
+
+        let rebuilt = rebuild_realized_grid_with_cells(&container, vec![text("Z")]).unwrap();
+        assert!(rebuilt.plain_text().contains('Z'));
+    }
+
+    #[test]
+    fn rebuild_realized_grid_returns_none_when_no_grid_present() {
+        let container = text("just text");
+        assert!(rebuild_realized_grid_with_cells(&container, vec![text("X")]).is_none());
+    }
+
+    #[test]
+    fn replace_subtree_swaps_matching_node_inside_sequence() {
+        let needle = text("inner");
+        let haystack = Content::sequence([text("before"), needle.clone(), text("after")]);
+        let patched = replace_subtree(&haystack, &needle, text("REPLACED")).unwrap();
+
+        assert!(patched.plain_text().contains("REPLACED"));
+        assert!(!patched.plain_text().contains("inner"));
+        assert!(patched.plain_text().contains("before"));
+        assert!(patched.plain_text().contains("after"));
+    }
+
+    #[test]
+    fn replace_subtree_returns_none_when_needle_not_found() {
+        let haystack = Content::sequence([text("a"), text("b")]);
+        let needle = text("missing");
+        assert!(replace_subtree(&haystack, &needle, text("Z")).is_none());
+    }
+
+    #[test]
+    fn replace_subtree_walks_through_styled_wrapper() {
+        use typst::visualize::Color;
+
+        let needle = text("inner");
+        let haystack = Content::sequence([text("a"), needle.clone()])
+            .styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
+        let patched = replace_subtree(&haystack, &needle, text("Z")).unwrap();
+        assert!(patched.plain_text().contains('Z'));
+        assert!(!patched.plain_text().contains("inner"));
+    }
+
+    #[test]
+    fn replace_subtree_at_root_matches_haystack_directly() {
+        let needle = text("whole");
+        let patched = replace_subtree(&needle, &needle, text("Z")).unwrap();
+        assert_eq!(patched.plain_text(), "Z");
     }
 }
