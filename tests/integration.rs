@@ -975,6 +975,41 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
 }
 
 #[test]
+fn inline_math_changes_are_diffed_as_equation_tokens() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        "The kinetic energy is $E_k = 1/2 m v^2$ where $m$ is mass and $v$ is velocity.\n\nThe potential energy satisfies $E_p = m g h$ near the Earth's surface.",
+        "The kinetic energy is $E_k = 1/2 m v^2$ where $m$ is mass and $v$ is velocity.\n\nThe total mechanical energy satisfies $E = E_k + E_p$ when no friction is present.",
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let log = result.modification_log();
+
+    assert!(log.contains("deleted: potential"), "{log}");
+    assert!(log.contains("inserted: total mechanical"), "{log}");
+    assert!(log.contains("attach(base: [E], b: [p])"), "{log}");
+    assert!(log.contains("attach(base: [E], b: [k])"), "{log}");
+}
+
+#[test]
+fn display_math_changes_are_diffed_as_equation_tokens() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        "The sum is:\n\n$ sum_(i=1)^n i = (n(n+1))/2 $\n\nThis result is known as the triangular number formula.",
+        "The sum is:\n\n$ sum_(i=1)^n i^2 = (n(n+1)(2n+1))/6 $\n\nThis result is the sum-of-squares formula.",
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let log = result.modification_log();
+
+    assert!(log.contains("frac("), "{log}");
+    assert!(log.contains("attach(base: [i], t: [2])"), "{log}");
+    assert!(log.contains("sum-of-squares"), "{log}");
+}
+
+#[test]
 fn repeated_same_span_blocks_preserve_document_order() {
     let (_dir, _old_world, world) = temp_worlds(
         "",

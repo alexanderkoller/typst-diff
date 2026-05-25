@@ -68,6 +68,7 @@ pub fn eval_to_realized_content(world: &dyn World) -> Result<crate::annotated::A
     let introspector = layout_introspector(world, &pre_content)?;
     let realized_content = realize_to_content(world, &pre_content, introspector)?;
     let mut annotated = crate::annotated::annotate_realized(&pre_content, &realized_content);
+    crate::annotated::annotate_equation_origins(&pre_content, &mut annotated);
     let footnotes = collect_footnotes(&pre_content);
     let mut next = 0;
     crate::annotated::annotate_footnote_markers(&mut annotated, &footnotes, &mut next);

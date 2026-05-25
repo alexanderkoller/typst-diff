@@ -6,7 +6,9 @@
 //! never mutated.
 
 use crate::container_ops::{self, ContainerKind};
-use typst::foundations::{Content, SequenceElem, StyledElem};
+use std::collections::VecDeque;
+use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
+use typst::layout::{BlockBody, BlockElem};
 use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem};
 use typst::syntax::Span;
@@ -65,6 +67,8 @@ pub struct Annotation {
     pub footnote: Option<FootnoteInfo>,
     /// Structured content to use as the local edit surface when realization is opaque.
     pub patch_surface: Option<Content>,
+    /// Source equations whose realized math carriers live under this realized node.
+    pub equation_origins: Vec<Content>,
     /// Source span for diagnostics (not used as a lookup key).
     pub span: Span,
 }
@@ -76,6 +80,7 @@ impl Default for Annotation {
             slots: vec![],
             footnote: None,
             patch_surface: None,
+            equation_origins: vec![],
             span: Span::detached(),
         }
     }
@@ -395,6 +400,7 @@ fn annotate_container(pre: &Content, realized: &Content, kind: ContainerKind) ->
             semantic_kind: Some(semantic_kind),
             slots: mapping.slots,
             patch_surface,
+            equation_origins: vec![],
             span: pre.span(),
             footnote: None,
         },
@@ -436,6 +442,75 @@ pub fn annotate_footnote_markers(
             return;
         }
     }
+}
+
+/// Attach source equation nodes to the realized leaves that contain their realized math.
+///
+/// Typst realization turns math into render-oriented `inline` / `display` content, often
+/// wrapped in paragraphs, blocks, and styles. The diff needs logical equation identity,
+/// so this pass maps source `EquationElem`s to realized math carriers in document order
+/// without changing the realized tree shape.
+pub fn annotate_equation_origins(pre: &Content, node: &mut AnnotatedContent) {
+    let mut equations = VecDeque::from(collect_source_equations(pre));
+    assign_equation_origins(node, &mut equations);
+}
+
+fn collect_source_equations(content: &Content) -> Vec<Content> {
+    let mut equations = Vec::new();
+    let _ = content.traverse::<_, ()>(&mut |content| {
+        if content.is::<EquationElem>() {
+            equations.push(content);
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    equations
+}
+
+fn assign_equation_origins(node: &mut AnnotatedContent, equations: &mut VecDeque<Content>) {
+    if node.children.is_empty() {
+        let count = realized_equation_carrier_count(&node.realized).min(equations.len());
+        node.annotation.equation_origins =
+            (0..count).filter_map(|_| equations.pop_front()).collect();
+        return;
+    }
+
+    for child in &mut node.children {
+        assign_equation_origins(child, equations);
+    }
+}
+
+fn realized_equation_carrier_count(content: &Content) -> usize {
+    if is_realized_equation_carrier(content) {
+        return 1;
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .map(realized_equation_carrier_count)
+            .sum();
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return realized_equation_carrier_count(&styled.child);
+    }
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return realized_equation_carrier_count(&par.body);
+    }
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return realized_equation_carrier_count(&heading.body);
+    }
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        return realized_equation_carrier_count(&body);
+    }
+    0
+}
+
+fn is_realized_equation_carrier(content: &Content) -> bool {
+    content.is::<EquationElem>()
+        || matches!(content.func().name(), "inline" | "display")
+        || (content.is::<BlockElem>() && content.plain_text().is_empty())
 }
 
 fn is_footnote_marker_text(content: &Content, number: usize) -> bool {

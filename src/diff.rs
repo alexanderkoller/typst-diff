@@ -365,6 +365,8 @@ impl Hash for Token {
 ///
 /// - `TextElem` / `SpaceElem` nodes are split on whitespace boundaries.
 /// - `EquationElem` nodes become a single token whose text is the equation's `repr`.
+///   When annotated equation origins are available, realized math carriers use
+///   the source equation as their token content.
 /// - Slot-container nodes (lists, figures, …) are recursed via [`collect_slot_tokens`].
 /// - Any other node becomes a single atomic token. If the node's plain text exceeds
 ///   500 characters it is split into word/space tokens instead of kept atomic, so
@@ -373,6 +375,46 @@ pub fn extract_words(content: &Content) -> Vec<Token> {
     let mut tokens = Vec::new();
     collect_tokens(content, &mut tokens);
     tokens
+}
+
+fn extract_words_for_annotated(
+    fallback: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> Vec<Token> {
+    let Some(annotated) = annotated else {
+        return extract_words(fallback);
+    };
+    if !has_equation_origins(annotated) {
+        return extract_words(fallback);
+    }
+
+    let mut tokens = Vec::new();
+    collect_annotated_tokens(annotated, &mut tokens);
+    if tokens.is_empty() {
+        extract_words(fallback)
+    } else {
+        tokens
+    }
+}
+
+fn has_equation_origins(node: &AnnotatedContent) -> bool {
+    !node.annotation.equation_origins.is_empty() || node.children.iter().any(has_equation_origins)
+}
+
+fn collect_annotated_tokens(node: &AnnotatedContent, out: &mut Vec<Token>) {
+    if !node.annotation.equation_origins.is_empty() {
+        let mut origins = node.annotation.equation_origins.iter();
+        collect_tokens_with_equation_origins(&node.realized, &mut origins, out);
+        return;
+    }
+
+    if node.children.is_empty() {
+        collect_tokens(&node.realized, out);
+    } else {
+        for child in &node.children {
+            collect_annotated_tokens(child, out);
+        }
+    }
 }
 
 fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
@@ -412,6 +454,46 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             });
         }
     }
+}
+
+fn collect_tokens_with_equation_origins<'a>(
+    content: &Content,
+    origins: &mut impl Iterator<Item = &'a Content>,
+    out: &mut Vec<Token>,
+) {
+    if is_realized_equation_carrier(content) {
+        if let Some(origin) = origins.next() {
+            collect_tokens(origin, out);
+        } else {
+            collect_tokens(content, out);
+        }
+    } else if let Some(seq) = content.to_packed::<SequenceElem>() {
+        for child in &seq.children {
+            collect_tokens_with_equation_origins(child, origins, out);
+        }
+    } else if let Some(styled) = content.to_packed::<StyledElem>() {
+        let before = out.len();
+        collect_tokens_with_equation_origins(&styled.child, origins, out);
+        for token in &mut out[before..] {
+            token.content = token.content.clone().styled_with_map(styled.styles.clone());
+        }
+    } else if let Some(par) = content.to_packed::<ParElem>() {
+        collect_tokens_with_equation_origins(&par.body, origins, out);
+    } else if let Some(block) = content.to_packed::<BlockElem>() {
+        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
+            collect_tokens_with_equation_origins(&body, origins, out);
+        } else {
+            collect_tokens(content, out);
+        }
+    } else {
+        collect_tokens(content, out);
+    }
+}
+
+fn is_realized_equation_carrier(content: &Content) -> bool {
+    content.is::<EquationElem>()
+        || matches!(content.func().name(), "inline" | "display")
+        || (content.is::<BlockElem>() && content.plain_text().is_empty())
 }
 
 fn collect_slot_tokens(_content: &Content, _out: &mut Vec<Token>) -> bool {
@@ -1221,6 +1303,23 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                         };
                     }
                 }
+                if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
+                    && (has_equation_origins(old_ann) || has_equation_origins(new_ann))
+                {
+                    let old_tokens = extract_words_for_annotated(&old_block.content, Some(old_ann));
+                    let new_tokens = extract_words_for_annotated(&new_block.content, Some(new_ann));
+                    let word_ops = diff_words(&old_tokens, &new_tokens);
+                    if has_textual_word_change(&word_ops) {
+                        return DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            edits: vec![RealizedEdit::WholeBlock(EditContent::Modified {
+                                base: new_block.content.clone(),
+                                word_ops,
+                            })],
+                            page_styles,
+                        };
+                    }
+                }
                 DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, None),
                     edits: vec![],
@@ -1271,8 +1370,8 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                     };
                 }
 
-                let old_tokens = extract_words(&old_block.content);
-                let new_tokens = extract_words(&new_block.content);
+                let old_tokens = extract_words_for_annotated(&old_block.content, old_ann);
+                let new_tokens = extract_words_for_annotated(&new_block.content, new_ann);
                 let word_ops = diff_words(&old_tokens, &new_tokens);
                 let edits = if has_textual_word_change(&word_ops) {
                     vec![RealizedEdit::WholeBlock(EditContent::Modified {
@@ -1464,8 +1563,8 @@ fn push_modified_slot_edit(
 ) {
     let old_effective = effective_content(old_child);
     let new_effective = effective_content(new_child);
-    let old_tokens = extract_words(&old_effective);
-    let new_tokens = extract_words(&new_effective);
+    let old_tokens = extract_words_for_annotated(&old_effective, Some(old_child));
+    let new_tokens = extract_words_for_annotated(&new_effective, Some(new_child));
     let word_ops = diff_words(&old_tokens, &new_tokens);
     if has_textual_word_change(&word_ops) {
         edits.push(RealizedEdit::ReplaceAt {
