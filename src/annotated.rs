@@ -22,6 +22,7 @@ use typst::visualize::{CircleElem, EllipseElem, RectElem};
 use crate::content_slots::SlotStep;
 
 /// A realized Content node together with its semantic identity.
+#[derive(Clone)]
 pub struct AnnotatedContent {
     /// The realized content as Typst produced it (what gets rendered).
     pub realized: Content,
@@ -44,6 +45,7 @@ impl AnnotatedContent {
     }
 }
 
+#[derive(Clone)]
 pub struct Annotation {
     /// Pre-realization element type if this node is a tracked structural element.
     /// `None` for plain text, spaces, anonymous wrappers.
@@ -100,6 +102,7 @@ pub struct SemanticSlot {
     pub child_index: usize,
 }
 
+#[derive(Clone)]
 pub struct FootnoteInfo {
     pub body: Content,
 }
