@@ -1202,7 +1202,10 @@ pub enum EditContent {
 
 impl DiffResult {
     pub fn modification_log(&self) -> String {
-        let mut log = String::new();
+        let mut log = format!(
+            "generated_by: {}\n\n",
+            crate::build_info::build_report_line()
+        );
         for (index, block) in self.blocks.iter().enumerate() {
             log_block_edit(&mut log, block, index);
         }
@@ -1271,36 +1274,44 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
 }
 
 pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
-    let old_blocks = extract_block_units(&old.realized);
-    let new_blocks = extract_block_units(&new.realized);
+    let new_surface = effective_content(new);
+    let new_layout_blocks = extract_block_units(&new_surface);
+    let old_realized_blocks = extract_block_units(&old.realized);
+    let new_realized_blocks = extract_block_units(&new.realized);
+    let old_blocks = non_parbreak_blocks(&old_realized_blocks);
+    let new_blocks = non_parbreak_blocks(&new_realized_blocks);
     let raw = diff_block_units_raw(&old_blocks, &new_blocks);
     let matched = match_edit_zones(raw);
     let root_styles = root_page_styles(&new.realized);
 
-    let blocks = matched
-        .into_iter()
-        .map(|op| match op {
+    let mut layout = LayoutCursor::new(&new_layout_blocks);
+    let mut blocks = Vec::new();
+    for op in matched {
+        match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
                 let old_ann = find_annotated_child(old, &old_block.content);
                 let new_ann = find_annotated_child(new, &new_block.content);
+                blocks.extend(layout.take_before(&new_block.content));
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
                     if annotated_subtree_equal(old_ann, new_ann) {
-                        return DiffBlockEdit {
+                        blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, None),
                             edits: vec![],
                             page_styles,
-                        };
+                        });
+                        continue;
                     }
                     let edits = diff_slot_edits(old_ann, new_ann);
                     if !edits.is_empty() {
-                        return DiffBlockEdit {
+                        blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
                             edits,
                             page_styles,
-                        };
+                        });
+                        continue;
                     }
                 }
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
@@ -1310,67 +1321,75 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                     let new_tokens = extract_words_for_annotated(&new_block.content, Some(new_ann));
                     let word_ops = diff_words(&old_tokens, &new_tokens);
                     if has_textual_word_change(&word_ops) {
-                        return DiffBlockEdit {
+                        blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
                             edits: vec![RealizedEdit::WholeBlock(EditContent::Modified {
                                 base: new_block.content.clone(),
                                 word_ops,
                             })],
                             page_styles,
-                        };
+                        });
+                        continue;
                     }
                 }
-                DiffBlockEdit {
+                blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, None),
                     edits: vec![],
                     page_styles: new_block.page_styles,
-                }
+                });
             }
             BlockOp::Delete(old_block) => {
                 let old_ann = find_annotated_child(old, &old_block.content);
-                DiffBlockEdit {
+                blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&old_block.content, old_ann),
                     edits: vec![RealizedEdit::WholeBlock(deleted_edit(
                         old_block.content.clone(),
                     ))],
                     page_styles: old_block.page_styles,
-                }
+                });
             }
-            BlockOp::Insert(new_block) => DiffBlockEdit {
-                base: annotated_block_from(&new_block.content, None),
-                edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
-                    new_block.content.clone(),
-                ))],
-                page_styles: new_block.page_styles,
-            },
+            BlockOp::Insert(new_block) => {
+                blocks.extend(layout.take_before(&new_block.content));
+                blocks.push(DiffBlockEdit {
+                    base: annotated_block_from(&new_block.content, None),
+                    edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
+                        new_block.content.clone(),
+                    ))],
+                    page_styles: new_block.page_styles,
+                });
+            }
             BlockOp::Replace(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
                 let old_ann = find_annotated_child(old, &old_block.content);
                 let new_ann = find_annotated_child(new, &new_block.content);
+                blocks.extend(layout.take_before(&new_block.content));
 
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
                     if annotated_subtree_equal(old_ann, new_ann) {
-                        return DiffBlockEdit {
+                        blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, None),
                             edits: vec![],
                             page_styles,
-                        };
+                        });
+                        continue;
                     }
                     let edits = diff_slot_edits(old_ann, new_ann);
                     if !edits.is_empty() {
-                        return DiffBlockEdit {
+                        blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
                             edits,
                             page_styles,
-                        };
+                        });
+                        continue;
                     }
-                    return DiffBlockEdit {
+                    blocks.push(DiffBlockEdit {
                         base: annotated_block_from(&new_block.content, None),
                         edits: vec![],
                         page_styles,
-                    };
+                    });
+                    continue;
                 }
 
                 let old_tokens = extract_words_for_annotated(&old_block.content, old_ann);
@@ -1384,19 +1403,77 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 } else {
                     vec![]
                 };
-                DiffBlockEdit {
+                blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, None),
                     edits,
                     page_styles,
-                }
+                });
             }
-        })
-        .collect();
+        }
+    }
+    blocks.extend(layout.take_trailing());
 
     DiffResult {
         blocks,
         root_styles,
     }
+}
+
+fn non_parbreak_blocks(blocks: &[DiffBlock]) -> Vec<DiffBlock> {
+    blocks
+        .iter()
+        .filter(|block| !block.content.is::<ParbreakElem>())
+        .cloned()
+        .collect()
+}
+
+struct LayoutCursor<'a> {
+    blocks: &'a [DiffBlock],
+    index: usize,
+}
+
+impl<'a> LayoutCursor<'a> {
+    fn new(blocks: &'a [DiffBlock]) -> Self {
+        Self { blocks, index: 0 }
+    }
+
+    fn take_before(&mut self, target: &Content) -> Vec<DiffBlockEdit> {
+        let mut out = Vec::new();
+        while let Some(block) = self.blocks.get(self.index) {
+            self.index += 1;
+            if block.content.is::<ParbreakElem>() {
+                out.push(layout_block_edit(block));
+                continue;
+            }
+            if layout_content_matches(&block.content, target) {
+                break;
+            }
+        }
+        out
+    }
+
+    fn take_trailing(&mut self) -> Vec<DiffBlockEdit> {
+        let mut out = Vec::new();
+        while let Some(block) = self.blocks.get(self.index) {
+            self.index += 1;
+            if block.content.is::<ParbreakElem>() {
+                out.push(layout_block_edit(block));
+            }
+        }
+        out
+    }
+}
+
+fn layout_block_edit(block: &DiffBlock) -> DiffBlockEdit {
+    DiffBlockEdit {
+        base: annotated_block_from(&block.content, None),
+        edits: vec![],
+        page_styles: block.page_styles.clone(),
+    }
+}
+
+fn layout_content_matches(layout: &Content, target: &Content) -> bool {
+    layout == target || layout.plain_text() == target.plain_text()
 }
 
 fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) -> AnnotatedContent {

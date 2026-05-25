@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
 use typst::layout::{BlockBody, BlockElem};
 use typst::math::EquationElem;
-use typst::model::{HeadingElem, ParElem};
+use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::syntax::Span;
 use typst::text::RawElem;
 
@@ -160,9 +160,15 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     if pre.to_packed::<SequenceElem>().is_some() {
         if let Some(styled) = realized.to_packed::<StyledElem>() {
             let inner = annotate_realized(pre, &styled.child);
+            let patch_surface = inner
+                .annotation
+                .patch_surface
+                .clone()
+                .map(|surface| surface.styled_with_map(styled.styles.clone()));
             return AnnotatedContent {
                 realized: realized.clone(),
                 annotation: Annotation {
+                    patch_surface: patch_surface.filter(|surface| surface != realized),
                     span: pre.span(),
                     ..Annotation::default()
                 },
@@ -204,7 +210,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         pre.to_packed::<SequenceElem>(),
         realized.to_packed::<SequenceElem>(),
     ) {
-        let children = if pre_seq.children.len() == real_seq.children.len() {
+        let children: Vec<AnnotatedContent> = if pre_seq.children.len() == real_seq.children.len() {
             pre_seq
                 .children
                 .iter()
@@ -214,9 +220,15 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         } else {
             pair_sequence_by_span(&pre_seq.children, &real_seq.children)
         };
+        let patch_surface = sequence_patch_surface(&children);
+        let has_layout_surface = children.len() != real_seq.children.len()
+            && children
+                .iter()
+                .any(|child| child.realized.is::<ParbreakElem>());
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
+                patch_surface: has_layout_surface.then_some(patch_surface),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -224,14 +236,19 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         };
     }
     if let Some(pre_seq) = pre.to_packed::<SequenceElem>() {
-        let children = pre_seq
+        let children: Vec<AnnotatedContent> = pre_seq
             .children
             .iter()
             .map(|child| annotate_realized(child, child))
             .collect();
+        let patch_surface = sequence_patch_surface(&children);
+        let has_layout_surface = children
+            .iter()
+            .any(|child| child.realized.is::<ParbreakElem>());
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
+                patch_surface: has_layout_surface.then_some(patch_surface),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -286,6 +303,18 @@ fn leaf_annotated(realized: &Content, annotation: Annotation) -> AnnotatedConten
     }
 }
 
+fn annotated_surface(node: &AnnotatedContent) -> Content {
+    node.annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized)
+        .clone()
+}
+
+fn sequence_patch_surface(children: &[AnnotatedContent]) -> Content {
+    Content::sequence(children.iter().map(annotated_surface))
+}
+
 fn heading_annotation(pre: &Content) -> Annotation {
     Annotation {
         semantic_kind: Some(SemanticKind::Heading),
@@ -330,8 +359,10 @@ fn effective_span(c: &Content) -> typst::syntax::Span {
 /// Used when a `SequenceElem`'s pre and realized children counts diverge.
 /// Walks both sequences in document order; for each pre child, advances a
 /// cursor through realized children seeking a span match. Skipped realized
-/// children become anonymous leaves. Pre children with no realized partner
-/// are dropped. Trailing realized children become anonymous leaves.
+/// children become anonymous leaves. Layout-bearing pre children with no
+/// realized partner, such as `ParbreakElem`, are preserved without consuming a
+/// realized child. Other unmatched pre children use the existing positional
+/// fallback. Trailing realized children become anonymous leaves.
 ///
 /// Realized children that are `StyledElem` wrappers (added by realization)
 /// are matched by looking through the wrapper to the inner content's span via
@@ -343,6 +374,11 @@ fn pair_sequence_by_span(
     let mut out: Vec<AnnotatedContent> = Vec::new();
     let mut cursor: usize = 0;
     for pre_child in pre_children {
+        if pre_child.is::<ParbreakElem>() {
+            out.push(annotate_realized(pre_child, pre_child));
+            continue;
+        }
+
         let target = pre_child.span();
         let mut match_idx = None;
         for (idx, real_child) in real_children.iter().enumerate().skip(cursor) {
@@ -605,6 +641,38 @@ mod tests {
         assert_eq!(node.children.len(), 2);
         assert_eq!(node.children[0].realized.plain_text(), "a");
         assert_eq!(node.children[1].realized.plain_text(), "b");
+    }
+
+    #[test]
+    fn annotate_sequence_preserves_unrealized_parbreak_before_list() {
+        use typst::foundations::Packed;
+        use typst::model::{ListElem, ListItem, ParbreakElem};
+
+        let list = Content::new(ListElem::new(vec![Packed::new(ListItem::new(text(
+            "item",
+        )))]));
+        let pre = seq([
+            text("Intro"),
+            Content::new(ParbreakElem::new()),
+            list.clone(),
+        ]);
+        let realized = seq([text("Intro"), list.clone()]);
+
+        let node = annotate_realized(&pre, &realized);
+        let surface = node
+            .annotation
+            .patch_surface
+            .as_ref()
+            .expect("parbreak-preserving surface should differ from realized");
+
+        assert_eq!(node.children.len(), 3);
+        assert!(node.children[1].realized.is::<ParbreakElem>());
+        assert!(node.children[2].realized.is::<ListElem>());
+        assert!(surface.to_packed::<SequenceElem>().is_some_and(|seq| {
+            seq.children.len() == 3
+                && seq.children[1].is::<ParbreakElem>()
+                && seq.children[2].is::<ListElem>()
+        }));
     }
 
     #[test]

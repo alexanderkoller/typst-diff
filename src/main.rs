@@ -1,4 +1,4 @@
-use typst_diff::{annotate, diff, eval_to_realized_content, render_to_pdf, world};
+use typst_diff::{annotate, build_info, diff, eval_to_realized_content, render_to_pdf, world};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -37,6 +37,7 @@ fn main() -> Result<()> {
 
     let inputs = resolve_inputs(&args)?;
 
+    eprintln!("typst-diff build: {}", build_info::build_report_line());
     eprintln!("Loading old document: {}", inputs.old.display());
     let old_world = world::SystemWorld::new(&inputs.old)
         .with_context(|| format!("failed to load old document {:?}", inputs.old))?;

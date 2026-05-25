@@ -615,6 +615,10 @@ fn cli_writes_modification_log_when_requested() {
     assert_command_success(cli, "typst-diff");
     assert_valid_pdf(&std::fs::read(pdf_path).unwrap());
     let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        log.contains(&typst_diff::build_info::build_report_line()),
+        "{log}"
+    );
     assert!(log.contains("modify"), "{log}");
     assert!(log.contains("old"), "{log}");
     assert!(log.contains("new"), "{log}");
@@ -772,6 +776,16 @@ fn list_item_added_tree_render_styles_inserted_text() {
     assert!(
         text_has_any_style(&annotated, "Stable internet connection"),
         "inserted list item is present but not styled as changed"
+    );
+}
+
+#[test]
+fn list_item_added_tree_render_preserves_paragraph_list_boundary() {
+    let annotated = annotated_tree_corpus("19-list-item-added");
+
+    assert!(
+        count_nodes::<typst::model::ParbreakElem>(&annotated) >= 1,
+        "diff output should preserve the source blank line between paragraph and list"
     );
 }
 
