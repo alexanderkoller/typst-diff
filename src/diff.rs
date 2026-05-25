@@ -1326,13 +1326,16 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                     page_styles: new_block.page_styles,
                 }
             }
-            BlockOp::Delete(old_block) => DiffBlockEdit {
-                base: annotated_block_from(&old_block.content, None),
-                edits: vec![RealizedEdit::WholeBlock(EditContent::Deleted(
-                    old_block.content.clone(),
-                ))],
-                page_styles: old_block.page_styles,
-            },
+            BlockOp::Delete(old_block) => {
+                let old_ann = find_annotated_child(old, &old_block.content);
+                DiffBlockEdit {
+                    base: annotated_block_from(&old_block.content, old_ann),
+                    edits: vec![RealizedEdit::WholeBlock(deleted_edit(
+                        old_block.content.clone(),
+                    ))],
+                    page_styles: old_block.page_styles,
+                }
+            }
             BlockOp::Insert(new_block) => DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, None),
                 edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
@@ -1714,7 +1717,7 @@ fn push_deleted_slot_edit(
     new_slots: &[(&SemanticSlot, &AnnotatedContent)],
     new_index: usize,
 ) {
-    let content = EditContent::Deleted(effective_content(old_child));
+    let content = deleted_edit(effective_content(old_child));
     if let Some((slot, _)) = new_slots.get(new_index) {
         edits.push(RealizedEdit::InsertBefore {
             anchor: slot.path.clone(),
@@ -1732,6 +1735,10 @@ fn push_deleted_slot_edit(
     } else {
         edits.push(RealizedEdit::Append { content });
     }
+}
+
+fn deleted_edit(content: Content) -> EditContent {
+    EditContent::Deleted(content)
 }
 
 #[cfg(test)]

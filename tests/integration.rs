@@ -95,6 +95,12 @@ fn max_style_count_for_text(content: &Content, needle: &str) -> usize {
         if let Some(par) = content.to_packed::<typst::model::ParElem>() {
             return inner(&par.body, needle, styles);
         }
+        if let Some(block) = content.to_packed::<typst::layout::BlockElem>()
+            && let Some(typst::layout::BlockBody::Content(body)) =
+                block.body.get_cloned(Default::default())
+        {
+            return inner(&body, needle, styles);
+        }
         if let Some(heading) = content.to_packed::<typst::model::HeadingElem>() {
             return inner(&heading.body, needle, styles);
         }
@@ -449,7 +455,12 @@ fn deleted_headings_keep_heading_formatting() {
     let plain = annotated.plain_text();
 
     assert!(plain.contains("Chapter Two"), "{plain}");
-    assert!(max_style_count_for_text(&annotated, "Chapter Two") >= 2);
+    let kept_heading_styles = max_style_count_for_text(&annotated, "Chapter One");
+    let deleted_heading_styles = max_style_count_for_text(&annotated, "Chapter Two");
+    assert!(
+        deleted_heading_styles > kept_heading_styles,
+        "deleted heading should keep heading styles and add deletion styles; kept={kept_heading_styles}, deleted={deleted_heading_styles}\n{plain}"
+    );
     assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
 }
 

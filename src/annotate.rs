@@ -19,7 +19,7 @@
 
 use typst::foundations::Content;
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::Abs;
+use typst::layout::{Abs, BlockBody, BlockElem};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
@@ -52,15 +52,6 @@ fn flush_group(
         Some(styles) => group.styled_with_map(styles),
         None => group,
     });
-}
-
-/// Strip all structure from `content` and return a single `TextElem` with its plain text.
-///
-/// Deleted blocks are flattened to avoid re-triggering heading counters, TOC entries,
-/// and other document-level side effects that block elements carry.
-fn plain_content(content: &Content) -> Content {
-    let text = content.plain_text();
-    TextElem::packed(text.as_str())
 }
 
 /// Turn a [`WordOp`] sequence into a flat inline `Content` sequence with colour annotations.
@@ -267,6 +258,60 @@ fn apply_fill_inside(content: &Content, fill: Color) -> Content {
     }
 
     content.styled(TextElem::fill.set(fill.into()))
+}
+
+fn apply_delete_inside(content: &Content) -> Content {
+    let mut content = content.clone();
+
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        seq.children = seq.children.iter().map(apply_delete_inside).collect();
+        return content;
+    }
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        styled.child = apply_delete_inside(&styled.child);
+        return content;
+    }
+
+    if let Some(par) = content.to_packed_mut::<ParElem>() {
+        par.body = apply_delete_inside(&par.body);
+        return content;
+    }
+
+    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
+        heading.body = apply_delete_inside(&heading.body);
+        return content;
+    }
+
+    if let Some(block) = content.to_packed_mut::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        block
+            .body
+            .set(Some(BlockBody::Content(apply_delete_inside(&body))));
+        return content;
+    }
+
+    if let Some(list) = content.to_packed_mut::<ListElem>() {
+        for item in &mut list.children {
+            item.body = apply_delete_inside(&item.body);
+        }
+        return content;
+    }
+
+    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
+        for item in &mut enm.children {
+            item.body = apply_delete_inside(&item.body);
+        }
+        return content;
+    }
+
+    if content.plain_text().is_empty() {
+        return content;
+    }
+
+    let colored = content.styled(TextElem::fill.set(red().into()));
+    Content::new(StrikeElem::new(colored))
 }
 
 /// Build annotated content from the new tree-shaped [`crate::diff::DiffResult`].
@@ -498,11 +543,7 @@ fn render_edit_content(content: &EditContent, compact: bool) -> Content {
                 apply_fill_inside(content, green())
             }
         }
-        EditContent::Deleted(content) => {
-            let colored = plain_content(content).styled(TextElem::fill.set(red().into()));
-            let struck = Content::new(StrikeElem::new(colored));
-            replace_text_container(content, &struck).unwrap_or(struck)
-        }
+        EditContent::Deleted(content) => apply_delete_inside(content),
         EditContent::Modified { base, word_ops } => {
             let inline = annotated_inline_content(word_ops, compact);
             replace_text_container(base, &inline).unwrap_or(inline)
@@ -595,6 +636,7 @@ mod tests {
     use crate::annotated::{AnnotatedContent, Annotation, annotate_realized};
     use crate::diff::{DiffBlockEdit, DiffResult, EditContent, RealizedEdit, Token, WordOp};
     use typst::foundations::{NativeElement, Packed};
+    use typst::layout::BlockElem;
     use typst::model::{HeadingElem, ListElem, ListItem};
     use typst::text::TextElem;
 
@@ -683,6 +725,22 @@ mod tests {
         let content = render(heading.clone(), whole(EditContent::Deleted(heading)), false);
 
         assert_eq!(count_elem::<HeadingElem>(&content), 1);
+        assert_eq!(count_elem::<StrikeElem>(&content), 1);
+        assert!(content.plain_text().contains("Old heading"));
+    }
+
+    #[test]
+    fn deleted_semantic_heading_block_keeps_block_formatting() {
+        let heading_block = Content::new(typst::layout::BlockElem::new().with_body(Some(
+            typst::layout::BlockBody::Content(TextElem::packed("Old heading")),
+        )));
+        let content = render(
+            heading_block.clone(),
+            whole(EditContent::Deleted(heading_block)),
+            false,
+        );
+
+        assert_eq!(count_elem::<BlockElem>(&content), 1);
         assert_eq!(count_elem::<StrikeElem>(&content), 1);
         assert!(content.plain_text().contains("Old heading"));
     }

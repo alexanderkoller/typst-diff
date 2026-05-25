@@ -186,14 +186,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         );
     }
     if pre.is::<HeadingElem>() {
-        return leaf_annotated(
-            realized,
-            Annotation {
-                semantic_kind: Some(SemanticKind::Heading),
-                span: pre.span(),
-                ..Annotation::default()
-            },
-        );
+        return annotate_heading(pre, realized);
     }
     if pre.is::<RawElem>() {
         return leaf_annotated(
@@ -291,6 +284,28 @@ fn leaf_annotated(realized: &Content, annotation: Annotation) -> AnnotatedConten
         annotation,
         children: vec![],
     }
+}
+
+fn heading_annotation(pre: &Content) -> Annotation {
+    Annotation {
+        semantic_kind: Some(SemanticKind::Heading),
+        span: pre.span(),
+        ..Annotation::default()
+    }
+}
+
+fn annotate_heading(pre: &Content, realized: &Content) -> AnnotatedContent {
+    if let Some(styled) = realized.to_packed::<StyledElem>()
+        && styled.child.is::<BlockElem>()
+    {
+        return AnnotatedContent {
+            realized: realized.clone(),
+            annotation: heading_annotation(pre),
+            children: vec![leaf_annotated(&styled.child, heading_annotation(pre))],
+        };
+    }
+
+    leaf_annotated(realized, heading_annotation(pre))
 }
 
 /// Return the effective span of a realized content node.
@@ -907,6 +922,26 @@ mod tests {
         );
         assert!(node.realized.plain_text().contains('1'));
         assert!(node.realized.plain_text().contains("Intro"));
+    }
+
+    #[test]
+    fn annotate_realized_heading_block_remembers_heading_origin() {
+        use typst::model::HeadingElem;
+        use typst::visualize::Color;
+
+        let pre = Content::new(HeadingElem::new(text("Intro")));
+        let block =
+            Content::new(BlockElem::new().with_body(Some(BlockBody::Content(text("Intro")))));
+        let realized = block.styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
+        let node = annotate_realized(&pre, &realized);
+
+        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Heading));
+        assert_eq!(node.children.len(), 1);
+        assert!(node.children[0].realized.is::<BlockElem>());
+        assert_eq!(
+            node.children[0].annotation.semantic_kind,
+            Some(SemanticKind::Heading)
+        );
     }
 
     #[test]
