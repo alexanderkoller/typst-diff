@@ -17,16 +17,19 @@
 //! started whenever the page styles change. This preserves `#set page(…)` boundaries
 //! (margins, headers, footers) across section breaks in the diff output.
 
-use typst::foundations::Content;
+use typst::foundations::{Content, Smart, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::{Abs, BlockBody, BlockElem};
+use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
 use crate::container_ops;
-use crate::diff::{DiffBlock, DiffBlockEdit, EditContent, RealizedEdit, WordOp};
+use crate::diff::{
+    DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
+    RegionPath, WordOp,
+};
 
 fn green() -> Color {
     Color::from_u8(0, 180, 0, 255)
@@ -323,11 +326,16 @@ pub fn build_annotated_content_from_tree(
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles: Option<typst::foundations::Styles> = None;
 
-    for annotated_block in result
+    for mut annotated_block in result
         .blocks
         .iter()
         .map(|block| annotate_block_edit(block, compact_substitutions))
     {
+        apply_region_edits_to_page_styles(
+            &mut annotated_block.page_styles,
+            &result.regions,
+            compact_substitutions,
+        );
         if current_page_styles
             .as_ref()
             .is_some_and(|s| s != &annotated_block.page_styles)
@@ -338,7 +346,9 @@ pub fn build_annotated_content_from_tree(
         current_blocks.push(annotated_block.content);
     }
     flush_group(&mut groups, &mut current_blocks, current_page_styles);
-    Content::sequence(groups).styled_with_map(result.root_styles.clone())
+    let mut root_styles = result.root_styles.clone();
+    apply_region_edits_to_root_styles(&mut root_styles, &result.regions, compact_substitutions);
+    Content::sequence(groups).styled_with_map(root_styles)
 }
 
 fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
@@ -348,7 +358,7 @@ fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
     }
 }
 
-fn apply_edits_to_base(
+pub(crate) fn apply_edits_to_base(
     base: &crate::annotated::AnnotatedContent,
     edits: &[RealizedEdit],
     compact: bool,
@@ -375,6 +385,69 @@ fn apply_edits_to_base(
         }
     }
     effective_realized_content(&node)
+}
+
+fn apply_region_edits_to_root_styles(
+    root_styles: &mut Styles,
+    regions: &[DiffRegionEdit],
+    compact: bool,
+) {
+    for region in regions {
+        let content = apply_edits_to_base(&region.base, &region.edits, compact);
+        match region.path {
+            RegionPath::RootPage(kind) => set_root_page_region(root_styles, kind, content),
+        }
+    }
+}
+
+fn apply_region_edits_to_page_styles(
+    page_styles: &mut Styles,
+    regions: &[DiffRegionEdit],
+    compact: bool,
+) {
+    if page_styles.is_empty() {
+        return;
+    }
+    for region in regions {
+        let RegionPath::RootPage(kind) = region.path;
+        if !page_styles_has_region(page_styles, kind) {
+            continue;
+        }
+        let content = apply_edits_to_base(&region.base, &region.edits, compact);
+        set_root_page_region(page_styles, kind, content);
+    }
+}
+
+fn page_styles_has_region(page_styles: &Styles, kind: PageRegionKind) -> bool {
+    match kind {
+        PageRegionKind::Header => page_styles.has(PageElem::header),
+        PageRegionKind::Footer => page_styles.has(PageElem::footer),
+        PageRegionKind::Background => page_styles.has(PageElem::background),
+        PageRegionKind::Foreground => page_styles.has(PageElem::foreground),
+    }
+}
+
+fn set_root_page_region(root_styles: &mut Styles, kind: PageRegionKind, content: Content) {
+    match kind {
+        PageRegionKind::Header => {
+            root_styles.push(PageElem::header.set(Smart::Custom(Some(marginal_content(content)))))
+        }
+        PageRegionKind::Footer => {
+            root_styles.push(PageElem::footer.set(Smart::Custom(Some(marginal_content(content)))))
+        }
+        PageRegionKind::Background => root_styles.push(PageElem::background.set(Some(content))),
+        PageRegionKind::Foreground => root_styles.push(PageElem::foreground.set(Some(content))),
+    }
+}
+
+fn marginal_content(content: Content) -> Content {
+    Content::new(
+        BlockElem::new()
+            .with_width(Smart::Custom(Rel::one()))
+            .with_body(Some(BlockBody::Content(
+                content.styled(ParElem::justify.set(false)),
+            ))),
+    )
 }
 
 fn insertion_anchor(edit: &RealizedEdit) -> Option<(bool, &[usize])> {
@@ -678,6 +751,7 @@ mod tests {
                 page_styles: Default::default(),
             }],
             root_styles: Default::default(),
+            regions: vec![],
         };
         build_annotated_content_from_tree(&result, compact)
     }

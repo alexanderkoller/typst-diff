@@ -215,6 +215,55 @@ fn collect_modified_word_texts(blocks: &[typst_diff::diff::DiffBlockEdit]) -> (S
     (deleted.join(" | "), inserted.join(" | "))
 }
 
+fn collect_region_modified_word_texts(
+    regions: &[typst_diff::diff::DiffRegionEdit],
+) -> (String, String) {
+    use typst_diff::diff::{EditContent, RealizedEdit, WordOp};
+
+    fn walk_content(content: &EditContent, deleted: &mut Vec<String>, inserted: &mut Vec<String>) {
+        match content {
+            EditContent::Modified { word_ops, .. } => {
+                for op in word_ops {
+                    match op {
+                        WordOp::Delete(tokens) => {
+                            deleted.push(tokens.iter().map(|t| t.text.as_str()).collect())
+                        }
+                        WordOp::Insert(tokens) => {
+                            inserted.push(tokens.iter().map(|t| t.text.as_str()).collect())
+                        }
+                        WordOp::Equal(_) => {}
+                    }
+                }
+            }
+            EditContent::Nested { edits, .. } => {
+                for edit in edits {
+                    walk_edit(edit, deleted, inserted);
+                }
+            }
+            EditContent::Inserted(_) | EditContent::Deleted(_) => {}
+        }
+    }
+
+    fn walk_edit(edit: &RealizedEdit, deleted: &mut Vec<String>, inserted: &mut Vec<String>) {
+        match edit {
+            RealizedEdit::ReplaceAt { content, .. }
+            | RealizedEdit::InsertBefore { content, .. }
+            | RealizedEdit::InsertAfter { content, .. }
+            | RealizedEdit::Append { content }
+            | RealizedEdit::WholeBlock(content) => walk_content(content, deleted, inserted),
+        }
+    }
+
+    let mut deleted = Vec::new();
+    let mut inserted = Vec::new();
+    for region in regions {
+        for edit in &region.edits {
+            walk_edit(edit, &mut deleted, &mut inserted);
+        }
+    }
+    (deleted.join(" | "), inserted.join(" | "))
+}
+
 fn collect_modified_bases(blocks: &[typst_diff::diff::DiffBlockEdit]) -> Vec<String> {
     use typst_diff::diff::{EditContent, RealizedEdit};
 
@@ -987,6 +1036,166 @@ fn table_row_inserted_middle_includes_inserted_cells() {
         inserted >= 1,
         "expected inserted cells for the inserted middle row"
     );
+}
+
+#[test]
+fn corpus_32_header_change_is_page_region_edit() {
+    use typst_diff::diff::{PageRegionKind, RegionPath};
+
+    let result = diff_annotated_corpus("32-headers-and-footers");
+    assert!(
+        result
+            .regions
+            .iter()
+            .any(|region| region.path == RegionPath::RootPage(PageRegionKind::Header)),
+        "expected a root page header region edit"
+    );
+    let (deleted, inserted) = collect_region_modified_word_texts(&result.regions);
+    assert!(deleted.contains("Old"), "deleted region text: {deleted}");
+    assert!(deleted.contains("Draft"), "deleted region text: {deleted}");
+    assert!(inserted.contains("New"), "inserted region text: {inserted}");
+    assert!(
+        inserted.contains("Final"),
+        "inserted region text: {inserted}"
+    );
+
+    let log = result.modification_log();
+    assert!(log.contains("Old"), "{log}");
+    assert!(log.contains("New"), "{log}");
+
+    let new_world = corpus_world("32-headers-and-footers/new.typ");
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn header_footer_add_delete_change_are_page_region_edits() {
+    use typst_diff::diff::{EditContent, PageRegionKind, RealizedEdit, RegionPath};
+
+    fn has_region(name: &str, kind: PageRegionKind, matches_content: fn(&EditContent) -> bool) {
+        let result = diff_annotated_corpus(name);
+        let region = result
+            .regions
+            .iter()
+            .find(|region| region.path == RegionPath::RootPage(kind))
+            .unwrap_or_else(|| panic!("expected {kind:?} region for {name}"));
+        assert!(
+            region.edits.iter().any(|edit| match edit {
+                RealizedEdit::WholeBlock(content)
+                | RealizedEdit::ReplaceAt { content, .. }
+                | RealizedEdit::InsertBefore { content, .. }
+                | RealizedEdit::InsertAfter { content, .. }
+                | RealizedEdit::Append { content } => matches_content(content),
+            }),
+            "unexpected region edits for {name}"
+        );
+    }
+
+    has_region(
+        "80-footer-text-changed",
+        PageRegionKind::Footer,
+        |content| matches!(content, EditContent::Modified { .. }),
+    );
+    has_region("81-header-added", PageRegionKind::Header, |content| {
+        matches!(content, EditContent::Inserted(_))
+    });
+    has_region("82-header-deleted", PageRegionKind::Header, |content| {
+        matches!(content, EditContent::Deleted(_))
+    });
+}
+
+#[test]
+fn grid_inside_header_uses_slot_level_region_edit() {
+    use typst_diff::diff::{EditContent, PageRegionKind, RealizedEdit, RegionPath};
+
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set page(header: grid(columns: (1fr, 1fr), [Old left], [Stable right]))
+
+Body unchanged.
+"#,
+        r#"#set page(header: grid(columns: (1fr, 1fr), [New left], [Stable right]))
+
+Body unchanged.
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let header = result
+        .regions
+        .iter()
+        .find(|region| region.path == RegionPath::RootPage(PageRegionKind::Header))
+        .expect("expected header region edit");
+    assert!(
+        header.edits.iter().any(|edit| matches!(
+            edit,
+            RealizedEdit::ReplaceAt {
+                content: EditContent::Modified { .. },
+                ..
+            }
+        )),
+        "expected a slot-level replacement inside the header grid"
+    );
+    assert!(
+        !header
+            .edits
+            .iter()
+            .any(|edit| matches!(edit, RealizedEdit::WholeBlock(_))),
+        "header grid should recurse instead of falling back to a whole-region edit"
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn background_and_foreground_text_changes_are_page_region_edits() {
+    use typst_diff::diff::{PageRegionKind, RegionPath};
+
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set page(background: text(18pt)[DRAFT], foreground: text(8pt)[Review copy])
+
+Body unchanged.
+"#,
+        r#"#set page(background: text(18pt)[FINAL], foreground: text(8pt)[Release copy])
+
+Body unchanged.
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    assert!(
+        result
+            .regions
+            .iter()
+            .any(|region| region.path == RegionPath::RootPage(PageRegionKind::Background)),
+        "expected background region edit"
+    );
+    assert!(
+        result
+            .regions
+            .iter()
+            .any(|region| region.path == RegionPath::RootPage(PageRegionKind::Foreground)),
+        "expected foreground region edit"
+    );
+    let (deleted, inserted) = collect_region_modified_word_texts(&result.regions);
+    assert!(deleted.contains("DRAFT"), "deleted region text: {deleted}");
+    assert!(
+        inserted.contains("FINAL"),
+        "inserted region text: {inserted}"
+    );
+    assert!(deleted.contains("Review"), "deleted region text: {deleted}");
+    assert!(
+        inserted.contains("Release"),
+        "inserted region text: {inserted}"
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
 }
 
 #[test]

@@ -31,7 +31,7 @@ use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
-use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep};
+use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized};
 
 /// A block-level unit of content together with the page styles active at its position.
 ///
@@ -1065,11 +1065,11 @@ fn single_line(text: &str) -> String {
     result.trim().to_string()
 }
 
-fn root_page_styles(content: &Content) -> Styles {
+fn root_page_styles_raw(content: &Content) -> Styles {
     if let Some(styled) = content.to_packed::<StyledElem>()
         && styled.child.to_packed::<SequenceElem>().is_some()
     {
-        return page_styles(&styled.styles);
+        return page_styles_raw(&styled.styles);
     }
 
     let Some(seq) = content.to_packed::<SequenceElem>() else {
@@ -1084,23 +1084,30 @@ fn root_page_styles(content: &Content) -> Styles {
                 .child
                 .to_packed::<SequenceElem>()
                 .is_some()
-                .then(|| page_styles(&styled.styles))
+                .then(|| page_styles_raw(&styled.styles))
         })
         .find(|styles| !styles.is_empty())
         .unwrap_or_default()
 }
 
-fn page_styles(styles: &Styles) -> Styles {
-    let mut result: Styles = styles
+fn page_styles_raw(styles: &Styles) -> Styles {
+    styles
         .iter()
         .filter(|style| is_page_style(style))
         .cloned()
         .map(Style::wrap)
-        .collect();
-    if !result.is_empty() {
-        sanitize_page_marginals(&mut result);
+        .collect()
+}
+
+fn page_styles(styles: &Styles) -> Styles {
+    sanitize_page_styles(page_styles_raw(styles))
+}
+
+fn sanitize_page_styles(mut styles: Styles) -> Styles {
+    if !styles.is_empty() {
+        sanitize_page_marginals(&mut styles);
     }
-    result
+    styles
 }
 
 fn sanitize_page_marginals(styles: &mut Styles) {
@@ -1157,6 +1164,7 @@ fn is_page_style(style: &Style) -> bool {
 pub struct DiffResult {
     pub blocks: Vec<DiffBlockEdit>,
     pub root_styles: Styles,
+    pub regions: Vec<DiffRegionEdit>,
 }
 
 pub struct DiffBlockEdit {
@@ -1166,6 +1174,25 @@ pub struct DiffBlockEdit {
     pub edits: Vec<RealizedEdit>,
     /// Page styles active at this block's position (for output grouping).
     pub page_styles: Styles,
+}
+
+pub struct DiffRegionEdit {
+    pub path: RegionPath,
+    pub base: AnnotatedContent,
+    pub edits: Vec<RealizedEdit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionPath {
+    RootPage(PageRegionKind),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageRegionKind {
+    Header,
+    Footer,
+    Background,
+    Foreground,
 }
 
 pub enum RealizedEdit {
@@ -1209,7 +1236,25 @@ impl DiffResult {
         for (index, block) in self.blocks.iter().enumerate() {
             log_block_edit(&mut log, block, index);
         }
+        for region in &self.regions {
+            log_region_edit(&mut log, region);
+        }
         log
+    }
+}
+
+fn log_region_edit(log: &mut String, region: &DiffRegionEdit) {
+    for edit in &region.edits {
+        log_realized_edit(log, edit, region_log_index(region.path));
+    }
+}
+
+fn region_log_index(path: RegionPath) -> usize {
+    match path {
+        RegionPath::RootPage(PageRegionKind::Header) => 0,
+        RegionPath::RootPage(PageRegionKind::Footer) => 1,
+        RegionPath::RootPage(PageRegionKind::Background) => 2,
+        RegionPath::RootPage(PageRegionKind::Foreground) => 3,
     }
 }
 
@@ -1282,7 +1327,10 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
     let new_blocks = non_parbreak_blocks(&new_realized_blocks);
     let raw = diff_block_units_raw(&old_blocks, &new_blocks);
     let matched = match_edit_zones(raw);
-    let root_styles = root_page_styles(&new.realized);
+    let old_region_styles = document_page_styles_raw(&old.realized, &old_realized_blocks);
+    let new_region_styles = document_page_styles_raw(&new.realized, &new_realized_blocks);
+    let regions = diff_root_page_regions(&old_region_styles, &new_region_styles);
+    let root_styles = sanitize_page_styles(root_page_styles_raw(&new.realized));
 
     let mut layout = LayoutCursor::new(&new_layout_blocks);
     let mut blocks = Vec::new();
@@ -1416,6 +1464,110 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
     DiffResult {
         blocks,
         root_styles,
+        regions,
+    }
+}
+
+fn diff_root_page_regions(old_styles: &Styles, new_styles: &Styles) -> Vec<DiffRegionEdit> {
+    [
+        PageRegionKind::Header,
+        PageRegionKind::Footer,
+        PageRegionKind::Background,
+        PageRegionKind::Foreground,
+    ]
+    .into_iter()
+    .filter_map(|kind| {
+        diff_page_region(
+            kind,
+            page_region_content(old_styles, kind),
+            page_region_content(new_styles, kind),
+        )
+    })
+    .collect()
+}
+
+fn document_page_styles_raw(content: &Content, blocks: &[DiffBlock]) -> Styles {
+    let root = root_page_styles_raw(content);
+    if !root.is_empty() {
+        return root;
+    }
+    blocks
+        .iter()
+        .find_map(|block| (!block.page_styles.is_empty()).then(|| block.page_styles.clone()))
+        .unwrap_or_default()
+}
+
+fn page_region_content(styles: &Styles, kind: PageRegionKind) -> Option<Content> {
+    let chain = StyleChain::new(styles);
+    match kind {
+        PageRegionKind::Header => chain.get_cloned(PageElem::header).custom().flatten(),
+        PageRegionKind::Footer => chain.get_cloned(PageElem::footer).custom().flatten(),
+        PageRegionKind::Background => chain.get_cloned(PageElem::background),
+        PageRegionKind::Foreground => chain.get_cloned(PageElem::foreground),
+    }
+}
+
+fn diff_page_region(
+    kind: PageRegionKind,
+    old_content: Option<Content>,
+    new_content: Option<Content>,
+) -> Option<DiffRegionEdit> {
+    match (old_content, new_content) {
+        (None, None) => None,
+        (None, Some(new_content)) => {
+            let base = annotate_realized(&new_content, &new_content);
+            Some(DiffRegionEdit {
+                path: RegionPath::RootPage(kind),
+                edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(new_content))],
+                base,
+            })
+        }
+        (Some(old_content), None) => {
+            let base = annotate_realized(&old_content, &old_content);
+            Some(DiffRegionEdit {
+                path: RegionPath::RootPage(kind),
+                edits: vec![RealizedEdit::WholeBlock(deleted_edit(old_content))],
+                base,
+            })
+        }
+        (Some(old_content), Some(new_content)) => {
+            let old_ann = annotate_realized(&old_content, &old_content);
+            let new_ann = annotate_realized(&new_content, &new_content);
+            let edits = diff_region_edits(&old_ann, &new_ann);
+            (!edits.is_empty()).then_some(DiffRegionEdit {
+                path: RegionPath::RootPage(kind),
+                base: new_ann,
+                edits,
+            })
+        }
+    }
+}
+
+fn diff_region_edits(old: &AnnotatedContent, new: &AnnotatedContent) -> Vec<RealizedEdit> {
+    if annotated_subtree_equal(old, new) {
+        return vec![];
+    }
+
+    if can_recurse_via_slots(old, new) {
+        return diff_slot_edits(old, new);
+    }
+
+    if let Some(content) = recursive_slot_edit_content(old, new) {
+        return vec![RealizedEdit::WholeBlock(content)];
+    }
+
+    let old_effective = effective_content(old);
+    let new_effective = effective_content(new);
+    let old_tokens = extract_words_for_annotated(&old_effective, Some(old));
+    let new_tokens = extract_words_for_annotated(&new_effective, Some(new));
+    let word_ops = diff_words(&old_tokens, &new_tokens);
+    if has_textual_word_change(&word_ops) {
+        vec![RealizedEdit::WholeBlock(EditContent::Modified {
+            base: new_effective,
+            word_ops,
+        })]
+    } else {
+        vec![]
     }
 }
 
