@@ -1076,6 +1076,29 @@ fn table_row_inserted_middle_includes_inserted_cells() {
 }
 
 #[test]
+fn opaque_wrapper_changes_are_reported_once() {
+    for name in [
+        "54-align-changed",
+        "55-pad-changed",
+        "57-columns-changed",
+        "58-stack-changed",
+        "60-rect-changed",
+        "61-circle-changed",
+        "56-place-changed",
+    ] {
+        let result = diff_annotated_corpus(name);
+        let log = result.modification_log();
+        let modifications = log.lines().filter(|line| line.starts_with("## ")).count();
+        assert_eq!(
+            modifications, 1,
+            "unexpected modifications for {name}:\n{log}"
+        );
+        assert!(log.contains("Old"), "{name} log missing old text:\n{log}");
+        assert!(log.contains("New"), "{name} log missing new text:\n{log}");
+    }
+}
+
+#[test]
 fn corpus_32_header_change_is_page_region_edit() {
     use typst_diff::diff::{PageRegionKind, RegionPath};
 

@@ -1393,7 +1393,8 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 let old_ann = find_annotated_child(old, &old_block.content);
                 let new_ann = find_annotated_child(new, &new_block.content);
                 blocks.extend(layout.take_before(&new_block.content));
-                if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
+                if !new_block.content.plain_text().is_empty()
+                    && let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
                     if annotated_subtree_equal(old_ann, new_ann) {
@@ -1460,8 +1461,18 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
             }
             BlockOp::Replace(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
-                let old_ann = find_annotated_child(old, &old_block.content);
-                let new_ann = find_annotated_child(new, &new_block.content);
+                let old_ann = find_annotated_block_owner(old, &old_block.content);
+                let new_ann = find_annotated_block_owner(new, &new_block.content);
+                let unique_changed_pair = if old_ann
+                    .zip(new_ann)
+                    .is_some_and(|(old_ann, new_ann)| can_recurse_via_slots(old_ann, new_ann))
+                {
+                    None
+                } else if new_block.content.plain_text().is_empty() {
+                    find_unique_changed_slot_pair(old, new)
+                } else {
+                    None
+                };
                 blocks.extend(layout.take_before(&new_block.content));
 
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
@@ -1490,6 +1501,17 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                         page_styles,
                     });
                     continue;
+                }
+                if let Some((old_ann, new_ann)) = unique_changed_pair {
+                    let edits = diff_slot_edits(old_ann, new_ann);
+                    if !edits.is_empty() {
+                        blocks.push(DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            edits,
+                            page_styles,
+                        });
+                        continue;
+                    }
                 }
 
                 let old_tokens = extract_words_for_annotated(&old_block.content, old_ann);
@@ -1913,7 +1935,12 @@ fn layout_block_edit(block: &DiffBlock) -> DiffBlockEdit {
 }
 
 fn layout_content_matches(layout: &Content, target: &Content) -> bool {
-    layout == target || layout.plain_text() == target.plain_text()
+    if layout == target {
+        return true;
+    }
+    let layout_text = layout.plain_text();
+    let target_text = target.plain_text();
+    !layout_text.is_empty() && layout_text == target_text
 }
 
 fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) -> AnnotatedContent {
@@ -1933,56 +1960,104 @@ fn find_annotated_child<'a>(
     target: &Content,
 ) -> Option<&'a AnnotatedContent> {
     let mut exact = Vec::new();
-    collect_annotated_matches(root, target, MatchKind::Exact, &mut exact);
-    if let Some(best) = exact
+    collect_annotated_matches(root, target, &mut exact);
+    exact
         .into_iter()
         .max_by_key(|node| node.annotation.slots.len())
-    {
-        return Some(best);
-    }
-
-    let target_text = target.plain_text();
-    let mut text_matches = Vec::new();
-    collect_annotated_matches(
-        root,
-        target,
-        MatchKind::PlainText(target_text.as_str()),
-        &mut text_matches,
-    );
-    text_matches
-        .into_iter()
-        .max_by_key(|node| node.annotation.slots.len())
-}
-
-#[derive(Clone, Copy)]
-enum MatchKind<'a> {
-    Exact,
-    PlainText(&'a str),
 }
 
 fn collect_annotated_matches<'a>(
     node: &'a AnnotatedContent,
     target: &Content,
-    kind: MatchKind<'_>,
     out: &mut Vec<&'a AnnotatedContent>,
 ) {
-    let matches = match kind {
-        MatchKind::Exact => node.realized == *target,
-        MatchKind::PlainText(text) => node.realized.plain_text().as_str() == text,
-    };
-    if matches {
+    if node.realized == *target {
         out.push(node);
     }
     for child in &node.children {
-        collect_annotated_matches(
-            child,
-            target,
-            match kind {
-                MatchKind::Exact => MatchKind::Exact,
-                MatchKind::PlainText(text) => MatchKind::PlainText(text),
-            },
-            out,
-        );
+        collect_annotated_matches(child, target, out);
+    }
+}
+
+fn find_single_block_semantic_owner<'a>(
+    root: &'a AnnotatedContent,
+    target: &Content,
+) -> Option<&'a AnnotatedContent> {
+    let mut owners = Vec::new();
+    collect_single_block_semantic_owners(root, target, &mut owners);
+    owners
+        .into_iter()
+        .max_by_key(|node| node.annotation.slots.len())
+}
+
+fn collect_single_block_semantic_owners<'a>(
+    node: &'a AnnotatedContent,
+    target: &Content,
+    out: &mut Vec<&'a AnnotatedContent>,
+) {
+    if !node.annotation.slots.is_empty() {
+        let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
+        if blocks.len() == 1 && blocks[0].content == *target {
+            out.push(node);
+        }
+    }
+    for child in &node.children {
+        collect_single_block_semantic_owners(child, target, out);
+    }
+}
+
+fn find_annotated_block_owner<'a>(
+    root: &'a AnnotatedContent,
+    target: &Content,
+) -> Option<&'a AnnotatedContent> {
+    let exact = find_annotated_child(root, target);
+    if exact.is_some_and(|node| !node.annotation.slots.is_empty()) {
+        return exact;
+    }
+    find_single_block_semantic_owner(root, target).or(exact)
+}
+
+fn find_unique_changed_slot_pair<'a>(
+    old: &'a AnnotatedContent,
+    new: &'a AnnotatedContent,
+) -> Option<(&'a AnnotatedContent, &'a AnnotatedContent)> {
+    let old_nodes = slot_bearing_nodes(old);
+    let new_nodes = slot_bearing_nodes(new);
+    let mut pair = None;
+
+    for old_node in old_nodes {
+        for new_node in &new_nodes {
+            if !can_recurse_via_slots(old_node, new_node) {
+                continue;
+            }
+            if annotated_subtree_equal(old_node, new_node) {
+                continue;
+            }
+            if diff_slot_edits(old_node, new_node).is_empty() {
+                continue;
+            }
+            if pair.is_some() {
+                return None;
+            }
+            pair = Some((old_node, *new_node));
+        }
+    }
+
+    pair
+}
+
+fn slot_bearing_nodes<'a>(root: &'a AnnotatedContent) -> Vec<&'a AnnotatedContent> {
+    let mut out = Vec::new();
+    collect_slot_bearing_nodes(root, &mut out);
+    out
+}
+
+fn collect_slot_bearing_nodes<'a>(node: &'a AnnotatedContent, out: &mut Vec<&'a AnnotatedContent>) {
+    if !node.annotation.slots.is_empty() {
+        out.push(node);
+    }
+    for child in &node.children {
+        collect_slot_bearing_nodes(child, out);
     }
 }
 
@@ -2435,6 +2510,37 @@ mod tests {
             }],
         };
         assert!(find_annotated_child(&root, &TextElem::packed("missing")).is_none());
+    }
+
+    #[test]
+    fn find_annotated_child_does_not_match_empty_text_fallback() {
+        use crate::annotated::{
+            AnnotatedContent, Annotation, SemanticKind, SemanticSlot, SlotStep, WrapperKind,
+        };
+
+        let target = Content::sequence([]);
+        let root = AnnotatedContent {
+            realized: TextElem::packed("root"),
+            annotation: Annotation::default(),
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed(""),
+                annotation: Annotation {
+                    semantic_kind: Some(SemanticKind::Wrapper(WrapperKind::Pad)),
+                    slots: vec![SemanticSlot {
+                        label: SlotStep::WrapperBody,
+                        path: vec![0],
+                    }],
+                    ..Annotation::default()
+                },
+                children: vec![AnnotatedContent {
+                    realized: TextElem::packed("body"),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                }],
+            }],
+        };
+
+        assert!(find_annotated_child(&root, &target).is_none());
     }
 
     #[test]
