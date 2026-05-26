@@ -19,7 +19,7 @@
 //!    recurses through semantic slots when a structured container can be matched.
 //!    Leaf replacements fall back to [`diff_words`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
@@ -28,12 +28,15 @@ use typst::foundations::{
     Content, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem, Styles,
 };
 use typst::introspection::Tag;
-use typst::layout::{BlockBody, BlockElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel};
+use typst::layout::{
+    BlockBody, BlockElem, BoxElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel,
+};
 use typst::math::EquationElem;
 use typst::model::{HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized};
+use crate::container_ops;
 
 /// A block-level unit of content together with the page styles active at its position.
 ///
@@ -69,7 +72,7 @@ fn extract_block_units(content: &Content) -> Vec<DiffBlock> {
 /// sibling blocks that follow without any page-style update inherit the last seen one.
 fn make_page_styles_sticky(blocks: &mut [DiffBlock]) {
     let mut current = Styles::new();
-    for block in blocks {
+    for block in &mut *blocks {
         if !block.page_styles.is_empty() {
             current = block.page_styles.clone();
         }
@@ -369,10 +372,8 @@ impl Hash for Token {
 /// - `EquationElem` nodes become a single token whose text is the equation's `repr`.
 ///   When annotated equation origins are available, realized math carriers use
 ///   the source equation as their token content.
-/// - Slot-container nodes (lists, figures, …) are recursed via [`collect_slot_tokens`].
-/// - Any other node becomes a single atomic token. If the node's plain text exceeds
-///   500 characters it is split into word/space tokens instead of kept atomic, so
-///   that large opaque elements (e.g. huge `StrongElem` runs) are still word-diffable.
+/// - Semantic containers recurse through `container_ops` children.
+/// - Any other node becomes a single atomic token.
 pub fn extract_words(content: &Content) -> Vec<Token> {
     let mut tokens = Vec::new();
     collect_tokens(content, &mut tokens);
@@ -386,10 +387,6 @@ fn extract_words_for_annotated(
     let Some(annotated) = annotated else {
         return extract_words(fallback);
     };
-    if !has_equation_origins(annotated) {
-        return extract_words(fallback);
-    }
-
     let mut tokens = Vec::new();
     collect_annotated_tokens(annotated, &mut tokens);
     if tokens.is_empty() {
@@ -410,13 +407,26 @@ fn collect_annotated_tokens(node: &AnnotatedContent, out: &mut Vec<Token>) {
         return;
     }
 
-    if node.children.is_empty() {
-        collect_tokens(&node.realized, out);
-    } else {
+    let slots = resolved_slots(node);
+    if !slots.is_empty() {
+        for (_slot, child) in slots {
+            collect_annotated_tokens(child, out);
+        }
+        return;
+    }
+
+    if node.children.iter().any(has_annotated_token_metadata) {
         for child in &node.children {
             collect_annotated_tokens(child, out);
         }
+        return;
     }
+
+    collect_tokens(&node.realized, out);
+}
+
+fn has_annotated_token_metadata(node: &AnnotatedContent) -> bool {
+    has_equation_origins(node) || node.children.iter().any(has_annotated_token_metadata)
 }
 
 fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
@@ -437,7 +447,7 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             text: equation.body.repr().to_string(),
             content: content.clone(),
         });
-    } else if collect_slot_tokens(content, out) {
+    } else if collect_semantic_child_tokens(content, out) {
     } else if let Some(text_elem) = content.to_packed::<TextElem>() {
         collect_text_tokens(text_elem.text.as_str(), out);
     } else if content.is::<SpaceElem>() {
@@ -446,15 +456,10 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             content: content.clone(),
         });
     } else {
-        let text = content.plain_text();
-        if text.len() > 500 {
-            collect_text_tokens(text.as_str(), out);
-        } else {
-            out.push(Token {
-                text: text.to_string(),
-                content: content.clone(),
-            });
-        }
+        out.push(Token {
+            text: content.plain_text().to_string(),
+            content: content.clone(),
+        });
     }
 }
 
@@ -498,11 +503,25 @@ fn is_realized_equation_carrier(content: &Content) -> bool {
         || (content.is::<BlockElem>() && content.plain_text().is_empty())
 }
 
-fn collect_slot_tokens(_content: &Content, _out: &mut Vec<Token>) -> bool {
-    // Phase A: slot-bearing elements fall through to atomic plain-text
-    // tokenization. Slot-level diffing is now handled via annotation.slots
-    // in the new tree path (diff_annotated).
-    false
+fn collect_semantic_child_tokens(content: &Content, out: &mut Vec<Token>) -> bool {
+    let children = container_ops::semantic_diff_child_contents(content);
+    if children.is_empty() {
+        return false;
+    }
+    for (index, child) in children.into_iter().enumerate() {
+        let before = out.len();
+        collect_tokens(&child, out);
+        if content.is::<BoxElem>() {
+            for token in &mut out[before..] {
+                if let Some(wrapped) =
+                    container_ops::replace_realized_child(content, index, token.content.clone())
+                {
+                    token.content = wrapped;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
@@ -1386,6 +1405,7 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
 
     let mut layout = LayoutCursor::new(&new_layout_blocks);
     let mut blocks = Vec::new();
+    let mut recursed_equal_semantic_nodes = HashSet::new();
     for op in matched {
         match op {
             BlockOp::Equal(old_block, new_block) => {
@@ -1393,10 +1413,20 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 let old_ann = find_annotated_child(old, &old_block.content);
                 let new_ann = find_annotated_child(new, &new_block.content);
                 blocks.extend(layout.take_before(&new_block.content));
-                if !new_block.content.plain_text().is_empty()
-                    && let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
+                if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
+                    if new_block.content.plain_text().is_empty() {
+                        let recursed_key = semantic_edit_claim_key(new_ann);
+                        if !recursed_equal_semantic_nodes.insert(recursed_key) {
+                            blocks.push(DiffBlockEdit {
+                                base: annotated_block_from(&new_block.content, None),
+                                edits: vec![],
+                                page_styles,
+                            });
+                            continue;
+                        }
+                    }
                     if annotated_subtree_equal(old_ann, new_ann) {
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, None),
@@ -1463,15 +1493,14 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 let page_styles = new_block.page_styles.clone();
                 let old_ann = find_annotated_block_owner(old, &old_block.content);
                 let new_ann = find_annotated_block_owner(new, &new_block.content);
-                let unique_changed_pair = if old_ann
-                    .zip(new_ann)
-                    .is_some_and(|(old_ann, new_ann)| can_recurse_via_slots(old_ann, new_ann))
-                {
-                    None
-                } else if new_block.content.plain_text().is_empty() {
-                    find_unique_changed_slot_pair(old, new)
-                } else {
-                    None
+                let unique_changed_pair = match (old_ann, new_ann) {
+                    (Some(old_ann), Some(new_ann)) if can_recurse_via_slots(old_ann, new_ann) => {
+                        None
+                    }
+                    (Some(old_ann), Some(new_ann)) => {
+                        find_unique_changed_slot_pair(old_ann, new_ann)
+                    }
+                    _ => find_unique_changed_slot_pair(old, new),
                 };
                 blocks.extend(layout.take_before(&new_block.content));
 
@@ -1534,12 +1563,92 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
         }
     }
     blocks.extend(layout.take_trailing());
+    prune_duplicate_empty_container_edits(&mut blocks);
 
     DiffResult {
         blocks,
         root_styles,
         regions,
         rendered_regions: vec![],
+    }
+}
+
+fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
+    let mut nonempty_signatures = HashSet::new();
+    for block in blocks.iter() {
+        if block.base.realized.plain_text().is_empty() {
+            continue;
+        }
+        for edit in &block.edits {
+            collect_modified_signatures(edit, &mut nonempty_signatures);
+        }
+    }
+
+    if nonempty_signatures.is_empty() {
+        return;
+    }
+
+    for block in &mut *blocks {
+        if !block.base.realized.plain_text().is_empty() {
+            continue;
+        }
+        block.edits.retain(|edit| {
+            !edit_modified_signatures(edit)
+                .iter()
+                .any(|sig| nonempty_signatures.contains(sig))
+        });
+    }
+
+    let mut seen_signatures = HashSet::new();
+    for block in blocks {
+        block.edits.retain(|edit| {
+            let signatures = edit_modified_signatures(edit);
+            signatures.is_empty()
+                || signatures
+                    .iter()
+                    .all(|signature| seen_signatures.insert(signature.clone()))
+        });
+    }
+}
+
+fn edit_modified_signatures(edit: &RealizedEdit) -> Vec<String> {
+    let mut signatures = HashSet::new();
+    collect_modified_signatures(edit, &mut signatures);
+    signatures.into_iter().collect()
+}
+
+fn collect_modified_signatures(edit: &RealizedEdit, signatures: &mut HashSet<String>) {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content) => collect_edit_content_signature(content, signatures),
+    }
+}
+
+fn collect_edit_content_signature(content: &EditContent, signatures: &mut HashSet<String>) {
+    match content {
+        EditContent::Modified { base, word_ops } if has_textual_word_change(word_ops) => {
+            signatures.insert(format!(
+                "{}\n{}\n{}",
+                single_line(&base.plain_text()),
+                single_line(&collect_word_op_text(word_ops, |op| match op {
+                    WordOp::Delete(t) => Some(t),
+                    _ => None,
+                })),
+                single_line(&collect_word_op_text(word_ops, |op| match op {
+                    WordOp::Insert(t) => Some(t),
+                    _ => None,
+                }))
+            ));
+        }
+        EditContent::Nested { edits, .. } => {
+            for edit in edits {
+                collect_modified_signatures(edit, signatures);
+            }
+        }
+        EditContent::Inserted(_) | EditContent::Deleted(_) | EditContent::Modified { .. } => {}
     }
 }
 
@@ -2210,6 +2319,15 @@ fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
         .iter()
         .map(|slot| &slot.label)
         .collect()
+}
+
+fn semantic_edit_claim_key(node: &AnnotatedContent) -> String {
+    format!(
+        "{:?}|{:?}|{}",
+        node.annotation.semantic_kind,
+        slot_labels(node),
+        effective_content(node).plain_text()
+    )
 }
 
 fn resolved_slots<'a>(node: &'a AnnotatedContent) -> Vec<(&'a SemanticSlot, &'a AnnotatedContent)> {
@@ -3193,16 +3311,31 @@ mod tests {
     }
 
     #[test]
-    fn large_atomic_content_splits_into_words() {
+    fn large_atomic_content_stays_atomic_without_semantic_children() {
         use typst::model::StrongElem;
 
         let text = "alpha beta gamma ".repeat(40);
         let strong = Content::new(StrongElem::new(TextElem::packed(text.as_str())));
         let tokens = extract_words(&strong);
 
-        assert!(tokens.len() > 1);
-        assert!(tokens.iter().any(|t| t.text == "alpha"));
-        assert!(tokens.iter().all(|t| !t.content.is::<StrongElem>()));
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, text);
+        assert!(tokens[0].content.is::<StrongElem>());
+    }
+
+    #[test]
+    fn semantic_wrapper_body_splits_into_words() {
+        use typst::layout::{BlockBody, BlockElem};
+
+        let block = Content::new(BlockElem::new().with_body(Some(BlockBody::Content(
+            TextElem::packed("alpha beta gamma"),
+        ))));
+        let tokens = extract_words(&block);
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+
+        assert!(texts.contains(&"alpha"), "tokens: {texts:?}");
+        assert!(texts.contains(&"beta"), "tokens: {texts:?}");
+        assert!(texts.contains(&"gamma"), "tokens: {texts:?}");
     }
 
     // --- diff_blocks_raw tests ---

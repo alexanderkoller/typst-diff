@@ -962,12 +962,12 @@ fn nested_list_item_change_tree_render_contains_old_and_new_text() {
     let plain = annotated.plain_text();
 
     assert!(
-        plain.contains("old description of mammals"),
-        "rendered annotated content omitted deleted nested list text: {plain:?}"
+        plain.contains("old") && plain.contains("mammals"),
+        "rendered annotated content omitted deleted nested list words: {plain:?}"
     );
     assert!(
-        plain.contains("updated description of warm-blooded vertebrates"),
-        "rendered annotated content omitted inserted nested list text: {plain:?}"
+        plain.contains("updated") && plain.contains("warm-blooded vertebrates"),
+        "rendered annotated content omitted inserted nested list words: {plain:?}"
     );
 }
 
@@ -976,15 +976,13 @@ fn nested_list_item_change_tree_render_styles_old_and_new_text() {
     let annotated = annotated_tree_corpus("20-nested-list-changed");
 
     assert!(
-        text_is_struck(&annotated, "old description of mammals"),
-        "deleted nested list text should be struck in rendered annotated content"
+        text_is_struck(&annotated, "old") && text_is_struck(&annotated, "mammals"),
+        "deleted nested list words should be struck in rendered annotated content"
     );
     assert!(
-        text_has_any_style(
-            &annotated,
-            "updated description of warm-blooded vertebrates"
-        ),
-        "inserted nested list text should be styled in rendered annotated content"
+        text_has_any_style(&annotated, "updated")
+            && text_has_any_style(&annotated, "warm-blooded vertebrates"),
+        "inserted nested list words should be styled in rendered annotated content"
     );
 }
 
@@ -1096,6 +1094,66 @@ fn opaque_wrapper_changes_are_reported_once() {
         assert!(log.contains("Old"), "{name} log missing old text:\n{log}");
         assert!(log.contains("New"), "{name} log missing new text:\n{log}");
     }
+}
+
+#[test]
+fn semantic_container_changes_are_word_localized() {
+    let cases = [
+        (
+            "52-block-changed",
+            ["deleted: Old | a manual", "inserted: New | an automated"],
+            [
+                "deleted: Old block content describes a manual workflow.",
+                "inserted: New block content describes an automated workflow.",
+            ],
+        ),
+        (
+            "53-box-changed",
+            ["deleted: old pending", "inserted: new approved"],
+            ["deleted: old pending label", "inserted: new approved label"],
+        ),
+        (
+            "87-show-paragraph-wrapper-changed",
+            ["deleted: old", "inserted: new"],
+            [
+                "deleted: This wrapped paragraph mentions the old schedule.",
+                "inserted: This wrapped paragraph mentions the new schedule.",
+            ],
+        ),
+    ];
+
+    for (name, expected, forbidden) in cases {
+        let log = diff_annotated_corpus(name).modification_log();
+        for needle in expected {
+            assert!(
+                log.contains(needle),
+                "{name} log missing {needle:?}:\n{log}"
+            );
+        }
+        for needle in forbidden {
+            assert!(
+                !log.contains(needle),
+                "{name} log should not contain whole-container edit {needle:?}:\n{log}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nearby_footnote_insert_keeps_existing_note_body_localized() {
+    let log = diff_annotated_corpus("74-footnote-added-near-existing-footnote").modification_log();
+
+    assert!(log.contains("inserted: It remains reproducible.2"), "{log}");
+    assert!(
+        log.contains("block: Existing note mentions revised settings."),
+        "{log}"
+    );
+    assert!(log.contains("deleted: baseline"), "{log}");
+    assert!(log.contains("inserted: revised"), "{log}");
+    assert!(
+        !log.contains("deleted: Existing note mentions baseline settings."),
+        "{log}"
+    );
 }
 
 #[test]

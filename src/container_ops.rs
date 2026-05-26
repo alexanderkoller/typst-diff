@@ -579,6 +579,10 @@ pub(crate) fn realized_child_contents(content: &Content) -> Vec<Content> {
     vec![]
 }
 
+pub(crate) fn semantic_diff_child_contents(content: &Content) -> Vec<Content> {
+    realized_child_contents(content)
+}
+
 pub(crate) fn collect_leaf_block_child_paths(content: &Content) -> Vec<Vec<usize>> {
     if let Some(block) = content.to_packed::<BlockElem>()
         && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())

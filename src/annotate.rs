@@ -184,6 +184,15 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
         return Some(content);
     }
 
+    if let Some(block) = content.to_packed_mut::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        let body =
+            replace_text_container(&body, replacement).unwrap_or_else(|| replacement.clone());
+        block.body.set(Some(BlockBody::Content(body)));
+        return Some(content);
+    }
+
     if let Some(styled) = content.to_packed_mut::<StyledElem>()
         && let Some(child) = replace_text_container(&styled.child, replacement)
     {
