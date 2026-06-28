@@ -19,7 +19,7 @@
 
 use typst::foundations::{Content, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel};
+use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{EmphElem, EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
@@ -428,6 +428,21 @@ fn apply_delete_inside(content: &Content) -> Content {
 
     let colored = content.clone().styled(TextElem::fill.set(red().into()));
     Content::new(StrikeElem::new(colored))
+}
+
+fn framed_opaque_visual(content: &Content, color: Color) -> Content {
+    // Opaque replacements cannot expose word-level anchors, so render the old
+    // and new visual payloads as framed block-level alternatives.
+    Content::new(
+        BlockElem::new()
+            .with_width(Smart::Custom(Rel::one()))
+            .with_stroke(Sides::splat(Some(Some(Stroke::from_pair(
+                color,
+                Abs::pt(0.8).into(),
+            )))))
+            .with_inset(Sides::splat(Some(Abs::pt(2.0).into())))
+            .with_body(Some(BlockBody::Content(content.clone()))),
+    )
 }
 
 /// Build annotated content from the new tree-shaped [`crate::diff::DiffResult`].
@@ -887,6 +902,10 @@ fn render_edit_content(content: &EditContent, compact: bool) -> Content {
             }
         }
         EditContent::Deleted(content) => apply_delete_inside(content),
+        EditContent::OpaqueReplacement { old, new } => Content::sequence([
+            framed_opaque_visual(old, red()),
+            framed_opaque_visual(new, green()),
+        ]),
         EditContent::Modified { base, word_ops } => {
             let inline = annotated_inline_content(word_ops, compact);
             replace_text_container(base, &inline).unwrap_or(inline)

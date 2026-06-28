@@ -183,14 +183,18 @@ its current fallback behavior. These are the contracts the pipeline relies on.
   at construction time.
 - `Annotation` may explain or supplement `realized`, but it should not rewrite
   what Typst produced.
-- Every `SemanticSlot.path` must resolve through `AnnotatedContent.children`.
-  A slot whose path cannot be resolved is not a usable semantic slot.
+- Every `SemanticSlot.path` must resolve against the node's patch surface and
+  the annotated children built for that surface. A slot whose path cannot be
+  resolved is not a usable semantic slot.
 - Slot labels are semantic positions, not display text. `ListItem(1)`,
   `FigureCaption`, and `TableCell(3)` describe roles in a container.
 - A node may recurse through slots only when old and new nodes have the same
   `semantic_kind` and both have resolved slots.
 - A `patch_surface`, when present, is the local surface to patch and render; it
   does not replace the meaning of `realized`.
+- Realized layout scaffolding (`tag`, `v`, parbreaks, styled/block wrappers)
+  may be useful to render, but it must not claim ownership of a semantic
+  container edit.
 - Empty realized text is not proof that a node is semantically empty. Empty
   wrappers, equations, shapes, and page regions may still carry changes.
 
@@ -200,6 +204,9 @@ its current fallback behavior. These are the contracts the pipeline relies on.
   the only place structural meaning is recovered.
 - Slot diffing is the preferred path for structured containers. Word diffing is
   the final local edit surface once structural descent is exhausted.
+- Block matching must pair compatible semantic owners before falling back to
+  visible-text similarity. One changed semantic owner should produce at most one
+  owner-level edit block.
 - `plain_text()` is a useful similarity signal, but it is not a complete
   identity. Links, labels, equations, styles, and repeated identical text can
   differ while visible text is the same.
@@ -231,6 +238,8 @@ contract changes intentionally.
 | `AnnotatedContent.realized` is preserved exactly. | `annotate_preserves_realized_content_unchanged` in `src/annotated.rs`. |
 | Every emitted semantic slot path resolves. | `slot_paths_resolve_in_changed_blocks_for_representative_corpus_cases` in `tests/integration.rs`; plus many slot-specific unit tests in `src/annotated.rs`. |
 | Changed-block edit paths are render-applicable. | `changed_block_edit_paths_resolve_for_representative_corpus_cases` in `tests/integration.rs`. |
+| Figure ownership noise does not steal or duplicate edits. | `figure_caption_slot_paths_ignore_realized_layout_scaffolding`, `figure_caption_add_delete_pair_by_semantic_owner_not_text`, and `ownership_noise_does_not_steal_figure_or_duplicate_caption_text` in `tests/integration.rs`. |
+| Text-empty structural changes produce visible edits. | `text_empty_structural_visual_changes_produce_opaque_replacement` and `opaque_figure_body_and_caption_change_share_one_owner_block` in `tests/integration.rs`. |
 | Slot-level edits render inserted/deleted/modified content. | `edit_contract_guarantees_rendering_for_corpus_18/19/20` and related list/table tests in `tests/integration.rs`; targeted edit-application tests in `src/annotate.rs`. |
 | Page styles remain separated and correctly applied. | `style_partitioning_separates_page_and_non_page_styles` in `src/eval.rs`; page-region tests in `tests/integration.rs`. |
 
@@ -272,8 +281,9 @@ document in place.
 
 ### Realized Children Versus Semantic Slots
 
-`children` mirrors useful descent points in the realized tree. A child path such
-as `[2, 0]` means "child 2, then child 0" in this annotated tree.
+`children` mirrors useful descent points for the node's edit surface. For most
+nodes that surface is the realized tree. For containers with explicit patch
+surfaces, such as figures, the children mirror the patch surface instead.
 
 `slots` names important semantic positions inside `children`. A slot has:
 
@@ -285,9 +295,9 @@ pub struct SemanticSlot {
 ```
 
 The path invariant is important: if `node.annotation.slots` contains a slot,
-`node.get_path(&slot.path)` should return the annotated child for that slot.
-Downstream diffing treats unresolved paths as absent, so a broken path silently
-removes structure from the diff.
+`node.get_path(&slot.path)` should return the annotated child for that slot on
+the patch surface. Downstream diffing treats unresolved paths as absent, so a
+broken path silently removes structure from the diff.
 
 For a list:
 
@@ -324,9 +334,13 @@ For a figure:
 
 ```text
 Figure
-├─ slot FigureBody
-└─ slot FigureCaption
+├─ slot FigureBody    -> path [0]
+└─ slot FigureCaption -> path [1]
 ```
+
+Those are authored figure paths. A realized captioned figure may contain a body,
+vertical spacer, caption node, and paragraph break, but that realized child
+order is layout scaffolding and is not used as the slot map.
 
 For wrappers such as `box`, `block`, `align`, `pad`, `place`, `columns`,
 `rect`, `circle`, and `ellipse`, the slot is `WrapperBody`.
@@ -410,6 +424,9 @@ example:
 - a container may realize to fewer addressable children than its semantic slot
   count;
 - a wrapper may hide its body under styled or block output.
+- a figure may realize into body, vertical spacing, caption, and paragraph-break
+  scaffolding even though the authored patch surface is simply `FigureElem`
+  body `[0]` and caption `[1]`.
 
 A patch surface should be understood as "the content tree we will patch and
 render for this node", while `realized` remains "the content Typst gave us."
@@ -421,6 +438,10 @@ edited, the renderable container shape, and any layout boundary that Typst's
 realized tree omitted but the annotated output still needs. If a patch surface
 exists only because one corpus case needed a leading paragraph break, that is a
 sign the invariant has not yet been expressed cleanly enough.
+
+The most important rule is that slot paths are owned by the patch surface. If a
+realized child order and the authored semantic order compete, the authored
+semantic order wins.
 
 ## Block Extraction
 
@@ -509,9 +530,19 @@ subtree. This matters because a block may be the realized representation of a
 larger semantic owner, such as one item inside a list or one cell inside a
 table.
 
-The lookup prefers exact realized-content matches with slots. If an exact match
-is not slot-bearing, it may look for a single-block semantic owner whose
-extracted block equals the target.
+The lookup emits semantic owner claims in document order. A claim has a
+`SemanticOwnerKey`: semantic kind plus owner ordinal. The key deliberately does
+not include visible text or current slot shape, because those can change while
+the owner remains the same.
+
+When a deleted block is immediately followed by an inserted block and both
+claim the same semantic owner key, the pair becomes a semantic replacement even
+if plain-text similarity would not pair it. This is how caption add/delete
+stays one figure edit instead of becoming a deleted empty figure followed by an
+inserted captioned figure.
+
+The lookup still uses realized-content and visible-text matching to align
+ordinary blocks, but those signals are secondary to semantic owner claims.
 
 ### 4. Slot Diff
 
@@ -531,7 +562,8 @@ new slots: ListItem(0), ListItem(1), ListItem(2)
 
 children are compared position by position. Equal annotated subtrees produce no
 edit. Changed children either recurse into nested slots or produce a word-level
-`Modified` edit at that slot path.
+`Modified` edit at that slot path. If the slot has no textual word change but
+its rendered content changed, the slot produces `OpaqueReplacement`.
 
 #### Changed Labels
 
@@ -572,6 +604,10 @@ preserving the list structure.
 
 For deletions, the edit is inserted before or after a nearby new-side slot, or
 appended if there is no anchor.
+
+Changed-label LCS still checks matched `Equal` slots for structural changes.
+That matters for text-empty slots: a figure body can match as the same slot
+while its rectangle fill, SVG payload, or raw graphic changed.
 
 ### 5. Word Diff
 
@@ -641,6 +677,7 @@ Main edit forms:
 | `Inserted` | Green fill inside the content. |
 | `Deleted` | Red fill plus strikeout; equations use math cancel. |
 | `Modified` | Word ops are converted into inline colored/struck content and grafted into the base. |
+| `OpaqueReplacement` | Old visual payload is framed red; new visual payload is framed green. |
 | `Nested` | Recursively apply another edit list to an annotated subtree. |
 
 After each block is annotated, blocks are grouped by page style. A new group is
@@ -733,6 +770,39 @@ This design is not a full table-layout diff. It does not understand row groups,
 column spans, or header/footer insertion as first-class row operations. It uses
 document-order cells as the current semantic unit.
 
+## A Worked Example: A Figure Caption Is Added
+
+Input:
+
+```typst
+// old
+#figure(rect(width: 4cm, height: 2cm))
+
+// new
+#figure(
+  rect(width: 4cm, height: 2cm),
+  caption: [Distribution of measurements],
+)
+```
+
+The old figure has empty visible text; the new figure's realized block contains
+caption text. A plain-text matcher would see a delete plus insert. The semantic
+owner cursor instead claims both blocks as the same `Figure` owner, so
+`diff_annotated` treats them as one replacement.
+
+`FigureOps` provides the authored patch surface:
+
+```text
+FigureElem
+├─ FigureBody    path [0]
+└─ FigureCaption path [1]
+```
+
+The added caption becomes `ReplaceAt { path: [1], content: Inserted(...) }`.
+Rendering applies that edit to the authored `FigureElem`, not to Typst's
+realized spacer/caption/parbreak scaffolding. The output therefore contains one
+patched figure, not a plain new figure plus a second annotated caption.
+
 ## A Worked Example: Contextual Footer
 
 Input:
@@ -760,8 +830,9 @@ The codebase is most coherent when it follows these principles:
 1. Diff evaluated, realized output, not raw source.
 2. Preserve Typst's realized content verbatim; attach semantic annotations
    beside it.
-3. Represent structure once through annotated slots, then recurse generically.
-4. Treat block diffing, slot diffing, and word diffing as layers of the same
+3. Represent authored structure through semantic owners and annotated slots,
+   then recurse generically.
+4. Treat block diffing, owner pairing, slot diffing, and word diffing as layers of the same
    algorithm, not as independent code paths.
 5. Keep container-specific knowledge centralized in `container_ops.rs`.
 6. Prefer structural identity and explicit paths over `plain_text()` guesses.
@@ -783,10 +854,11 @@ When diagnosing a bug, walk the pipeline in order:
 4. Does `annotate_realized` attach the expected `semantic_kind` and slots?
 5. Does block extraction produce the expected block boundaries?
 6. Does block matching pair the intended old/new blocks?
-7. Does slot diff recurse to the intended semantic unit?
-8. Does word diff produce the expected token operations?
-9. Does `build_annotated_content_from_tree` preserve the surrounding container?
-10. Does layout/rendering show the same content contract the edit script
+7. Does the semantic owner claim reject layout scaffolding noise?
+8. Does slot diff recurse to the intended semantic unit?
+9. Does word diff or opaque replacement produce the expected edit content?
+10. Does `build_annotated_content_from_tree` preserve the surrounding container?
+11. Does layout/rendering show the same content contract the edit script
     promised?
 
 For invariant-focused debugging, attach an expectation to each step. For

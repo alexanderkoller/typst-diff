@@ -16,8 +16,8 @@ use typst::layout::{
     PadElem, PlaceElem, StackChild, StackElem,
 };
 use typst::model::{
-    EnumElem, EnumItem, FigureElem, FootnoteBody, FootnoteElem, ListElem, ListItem, ParElem,
-    ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermsElem,
+    EnumElem, EnumItem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem, ListElem, ListItem,
+    ParElem, ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermsElem,
 };
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
@@ -70,6 +70,15 @@ pub(crate) struct SlotMapping {
 trait ContainerOps: Sync {
     fn kind(&self, content: &Content) -> Option<ContainerKind>;
     fn slot_parts(&self, content: &Content) -> Option<Vec<SlotPart>>;
+
+    fn map_slots(
+        &self,
+        _pre_container: &Content,
+        _realized: &Content,
+        _parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        None
+    }
 
     fn child_contents(&self, content: &Content) -> Option<Vec<Content>> {
         self.slot_parts(content).map(|parts| {
@@ -457,6 +466,42 @@ impl ContainerOps for FigureOps {
         }
         None
     }
+
+    fn insert_child(
+        &self,
+        content: &mut Content,
+        index: usize,
+        insertion: Content,
+        before: bool,
+    ) -> Option<()> {
+        let figure = content.to_packed_mut::<FigureElem>()?;
+        if index == 0 && !before && figure.caption.get_cloned(StyleChain::default()).is_none() {
+            figure
+                .caption
+                .set(Some(Packed::new(FigureCaption::new(insertion))));
+            return Some(());
+        }
+        None
+    }
+
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        _realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        // Figure slots are authored positions on FigureElem; realized v/caption
+        // scaffolding is not part of the patch-surface path contract.
+        let paths = figure_slot_paths(&parts);
+        if paths.len() != parts.len() {
+            return None;
+        }
+        Some(map_explicit_patch_surface(
+            pre_container.clone(),
+            parts,
+            paths,
+        ))
+    }
 }
 
 impl ContainerOps for FootnoteOps {
@@ -552,6 +597,12 @@ pub(crate) fn map_container(
     let Some(ops) = ops_for(pre) else {
         return empty_mapping(realized);
     };
+    let Some(parts) = ops.slot_parts(pre) else {
+        return empty_mapping(realized);
+    };
+    if let Some(mapping) = ops.map_slots(pre, realized, parts) {
+        return mapping;
+    }
     let Some(parts) = ops.slot_parts(pre) else {
         return empty_mapping(realized);
     };
@@ -738,6 +789,44 @@ fn map_slot_parts(
         }
         let pre_content = normalize_list_item_runs(part.pre_content);
         let replacement = annotate_realized(&pre_content, &realized_child);
+        if replace_annotated_at_path(&mut tree, &path, replacement) {
+            slots.push(SemanticSlot {
+                label: part.label,
+                path,
+            });
+        }
+    }
+
+    SlotMapping {
+        patch_surface: tree.realized,
+        children: tree.children,
+        slots,
+    }
+}
+
+fn figure_slot_paths(parts: &[SlotPart]) -> Vec<Vec<usize>> {
+    let mut paths = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part.label {
+            SlotStep::FigureBody => paths.push(vec![0]),
+            SlotStep::FigureCaption => paths.push(vec![1]),
+            _ => return vec![],
+        }
+    }
+    paths
+}
+
+fn map_explicit_patch_surface(
+    patch_surface: Content,
+    parts: Vec<SlotPart>,
+    paths: Vec<Vec<usize>>,
+) -> SlotMapping {
+    let mut tree = anonymous_realized_tree(&patch_surface);
+    let mut slots = Vec::new();
+
+    for (part, path) in parts.into_iter().zip(paths) {
+        let pre_content = normalize_list_item_runs(part.pre_content);
+        let replacement = annotate_realized(&pre_content, &pre_content);
         if replace_annotated_at_path(&mut tree, &path, replacement) {
             slots.push(SemanticSlot {
                 label: part.label,

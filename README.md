@@ -91,6 +91,9 @@ blue. This reduces visual noise when many individual words change at once.
   whole-expression delete + insert. Deleted equations are rendered with Typst's
   `math.cancel` mark.
 - **Code blocks** are atomic. Changes appear as a whole-block delete + insert.
+- **Opaque visuals** such as raw graphics, SVGs, and text-empty shapes are not
+  diffed word-by-word. Structural visual changes are shown as an old visual
+  replacement framed in red plus a new visual replacement framed in green.
 - **Moved paragraphs** show as a deletion at the old location plus an insertion
   at the new location.
 - **PDF only.** No other output formats are supported.
@@ -99,5 +102,7 @@ blue. This reduces visual noise when many individual words change at once.
 
 - [docs/technical.md](docs/technical.md) — architecture, algorithms, and data
   structures
+- [docs/figure-and-opaque-diffs.md](docs/figure-and-opaque-diffs.md) —
+  figure/caption and opaque visual diff behavior
 - [docs/contributing.md](docs/contributing.md) — building from source and
   running the test suite

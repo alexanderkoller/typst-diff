@@ -234,7 +234,9 @@ fn collect_modified_word_texts(blocks: &[typst_diff::diff::DiffBlockEdit]) -> (S
                     walk_edit(edit, deleted, inserted);
                 }
             }
-            EditContent::Inserted(_) | EditContent::Deleted(_) => {}
+            EditContent::Inserted(_)
+            | EditContent::Deleted(_)
+            | EditContent::OpaqueReplacement { .. } => {}
         }
     }
 
@@ -283,7 +285,9 @@ fn collect_region_modified_word_texts(
                     walk_edit(edit, deleted, inserted);
                 }
             }
-            EditContent::Inserted(_) | EditContent::Deleted(_) => {}
+            EditContent::Inserted(_)
+            | EditContent::Deleted(_)
+            | EditContent::OpaqueReplacement { .. } => {}
         }
     }
 
@@ -318,7 +322,9 @@ fn collect_modified_bases(blocks: &[typst_diff::diff::DiffBlockEdit]) -> Vec<Str
                     walk_edit(edit, bases);
                 }
             }
-            EditContent::Inserted(_) | EditContent::Deleted(_) => {}
+            EditContent::Inserted(_)
+            | EditContent::Deleted(_)
+            | EditContent::OpaqueReplacement { .. } => {}
         }
     }
 
@@ -439,6 +445,7 @@ fn collect_edit_texts(
                     walk_edit(edit, inserted, deleted, modified_inserted, modified_deleted);
                 }
             }
+            EditContent::OpaqueReplacement { .. } => {}
         }
     }
 
@@ -598,6 +605,245 @@ fn assert_edit_paths_resolve_for_base(
                 walk_content(content);
             }
         }
+    }
+}
+
+fn changed_blocks(result: &typst_diff::diff::DiffResult) -> Vec<&typst_diff::diff::DiffBlockEdit> {
+    result
+        .blocks
+        .iter()
+        .filter(|block| !block.edits.is_empty())
+        .collect()
+}
+
+fn only_changed_figure_block<'a>(
+    result: &'a typst_diff::diff::DiffResult,
+    case: &str,
+) -> &'a typst_diff::diff::DiffBlockEdit {
+    let changed = changed_blocks(result);
+    assert_eq!(
+        changed.len(),
+        1,
+        "{case} should produce one semantic-owner edit block"
+    );
+    let block = changed[0];
+    assert!(
+        matches!(
+            block.base.annotation.semantic_kind,
+            Some(typst_diff::annotated::SemanticKind::Figure)
+        ),
+        "{case} changed block should be owned by the figure, not layout scaffolding"
+    );
+    block
+}
+
+fn assert_figure_slots_are_patch_surface_paths(block: &typst_diff::diff::DiffBlockEdit) {
+    use typst_diff::annotated::SlotStep;
+
+    let body = block
+        .base
+        .annotation
+        .slots
+        .iter()
+        .find(|slot| matches!(slot.label, SlotStep::FigureBody))
+        .expect("figure body slot should exist");
+    assert_eq!(body.path, vec![0]);
+
+    if let Some(caption) = block
+        .base
+        .annotation
+        .slots
+        .iter()
+        .find(|slot| matches!(slot.label, SlotStep::FigureCaption))
+    {
+        assert_eq!(caption.path, vec![1]);
+    }
+}
+
+fn edit_is_whole_block_insert_or_delete(edit: &typst_diff::diff::RealizedEdit) -> bool {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    matches!(
+        edit,
+        RealizedEdit::WholeBlock(EditContent::Inserted(_))
+            | RealizedEdit::WholeBlock(EditContent::Deleted(_))
+    )
+}
+
+fn edit_content_is_opaque(content: &typst_diff::diff::EditContent) -> bool {
+    matches!(
+        content,
+        typst_diff::diff::EditContent::OpaqueReplacement { .. }
+    )
+}
+
+fn count_opaque_replacements(blocks: &[typst_diff::diff::DiffBlockEdit]) -> usize {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    fn walk(content: &EditContent) -> usize {
+        match content {
+            EditContent::OpaqueReplacement { .. } => 1,
+            EditContent::Nested { edits, .. } => edits.iter().map(walk_edit).sum(),
+            EditContent::Inserted(_) | EditContent::Deleted(_) | EditContent::Modified { .. } => 0,
+        }
+    }
+
+    fn walk_edit(edit: &RealizedEdit) -> usize {
+        match edit {
+            RealizedEdit::ReplaceAt { content, .. }
+            | RealizedEdit::InsertBefore { content, .. }
+            | RealizedEdit::InsertAfter { content, .. }
+            | RealizedEdit::Append { content }
+            | RealizedEdit::WholeBlock(content) => walk(content),
+        }
+    }
+
+    blocks
+        .iter()
+        .flat_map(|block| &block.edits)
+        .map(walk_edit)
+        .sum()
+}
+
+fn plain_occurrences(content: &Content, needle: &str) -> usize {
+    content.plain_text().matches(needle).count()
+}
+
+#[test]
+fn figure_caption_slot_paths_ignore_realized_layout_scaffolding() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let result = diff_annotated_corpus("34-figure-with-caption");
+    let figure = changed_blocks(&result)
+        .into_iter()
+        .find(|block| {
+            matches!(
+                block.base.annotation.semantic_kind,
+                Some(typst_diff::annotated::SemanticKind::Figure)
+            )
+        })
+        .expect("case 34 should include a changed figure block");
+
+    assert_figure_slots_are_patch_surface_paths(figure);
+    assert!(
+        figure.edits.iter().any(|edit| matches!(
+            edit,
+            RealizedEdit::ReplaceAt {
+                path,
+                content: EditContent::Modified { .. },
+            } if path == &vec![1]
+        )),
+        "caption edit should target authored caption path [1]"
+    );
+    assert!(
+        !figure.edits.iter().any(|edit| matches!(
+            edit,
+            RealizedEdit::ReplaceAt { path, .. } if path == &vec![0, 0, 1]
+        )),
+        "caption edit must not target realized v/caption scaffolding"
+    );
+}
+
+#[test]
+fn figure_caption_add_delete_pair_by_semantic_owner_not_text() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let added = diff_annotated_corpus("71-figure-caption-added");
+    let added_figure = only_changed_figure_block(&added, "71-figure-caption-added");
+    assert_figure_slots_are_patch_surface_paths(added_figure);
+    assert!(
+        added_figure
+            .edits
+            .iter()
+            .all(|edit| !edit_is_whole_block_insert_or_delete(edit)),
+        "caption add should not become whole-block delete/insert"
+    );
+    assert!(matches!(
+        added_figure.edits.as_slice(),
+        [RealizedEdit::ReplaceAt {
+            path,
+            content: EditContent::Inserted(_),
+        }] if path.as_slice() == [1]
+    ));
+
+    let deleted = diff_annotated_corpus("72-figure-caption-deleted");
+    let deleted_figure = only_changed_figure_block(&deleted, "72-figure-caption-deleted");
+    assert_figure_slots_are_patch_surface_paths(deleted_figure);
+    assert!(
+        deleted_figure
+            .edits
+            .iter()
+            .all(|edit| !edit_is_whole_block_insert_or_delete(edit)),
+        "caption delete should not become whole-block delete/insert"
+    );
+    assert!(matches!(
+        deleted_figure.edits.as_slice(),
+        [RealizedEdit::InsertAfter {
+            anchor,
+            content: EditContent::Deleted(_),
+        }] if anchor.as_slice() == [0]
+    ));
+}
+
+#[test]
+fn ownership_noise_does_not_steal_figure_or_duplicate_caption_text() {
+    for (case, caption) in [
+        ("71-figure-caption-added", "Distribution of measurements"),
+        ("72-figure-caption-deleted", "Distribution of measurements"),
+        (
+            "73-figure-body-changed-caption-added",
+            "Updated measurements",
+        ),
+    ] {
+        let result = diff_annotated_corpus(case);
+        let figure = only_changed_figure_block(&result, case);
+        assert_figure_slots_are_patch_surface_paths(figure);
+        assert_edit_paths_resolve_for_base(&figure.base, &figure.edits);
+
+        let rendered = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+        assert_eq!(
+            plain_occurrences(&rendered, caption),
+            1,
+            "{case} should not leave both a plain new caption and a patched caption"
+        );
+    }
+}
+
+#[test]
+fn opaque_figure_body_and_caption_change_share_one_owner_block() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let result = diff_annotated_corpus("92-diagram-caption-and-opaque-body-changed");
+    let figure = only_changed_figure_block(&result, "92-diagram-caption-and-opaque-body-changed");
+    assert_figure_slots_are_patch_surface_paths(figure);
+    assert_eq!(figure.edits.len(), 2);
+    assert!(matches!(
+        &figure.edits[0],
+        RealizedEdit::ReplaceAt { path, content }
+            if path.as_slice() == [0] && edit_content_is_opaque(content)
+    ));
+    assert!(matches!(
+        &figure.edits[1],
+        RealizedEdit::ReplaceAt {
+            path,
+            content: EditContent::Modified { .. },
+        } if path.as_slice() == [1]
+    ));
+}
+
+#[test]
+fn text_empty_structural_visual_changes_produce_opaque_replacement() {
+    for case in [
+        "90-opaque-graphic-replaced",
+        "91-raw-svg-graphic-replaced",
+        "73-figure-body-changed-caption-added",
+        "92-diagram-caption-and-opaque-body-changed",
+    ] {
+        let result = diff_annotated_corpus(case);
+        assert!(
+            count_opaque_replacements(&result.blocks) >= 1,
+            "{case} should produce an opaque visual replacement"
+        );
     }
 }
 

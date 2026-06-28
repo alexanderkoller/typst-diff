@@ -37,7 +37,7 @@ use typst::text::{RawElem, SpaceElem, TextElem};
 
 use crate::annotated::{
     AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized,
-    effective_text_content,
+    effective_render_content, effective_text_content,
 };
 use crate::container_ops;
 
@@ -50,6 +50,14 @@ use crate::container_ops;
 pub struct DiffBlock {
     pub content: Content,
     pub page_styles: Styles,
+}
+
+/// Stable semantic identity for pairing authored owners before text similarity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SemanticOwnerKey {
+    kind: SemanticKind,
+    slot_labels: Vec<SlotStep>,
+    ordinal: usize,
 }
 
 /// Segment a `Content` tree into block-level units (page styles discarded).
@@ -1113,6 +1121,12 @@ fn single_line(text: &str) -> String {
     result.trim().to_string()
 }
 
+fn content_signature(content: &Content) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn root_page_styles_raw(content: &Content) -> Styles {
     if let Some(styled) = content.to_packed::<StyledElem>()
         && styled.child.to_packed::<SequenceElem>().is_some()
@@ -1386,6 +1400,10 @@ pub enum RealizedEdit {
 pub enum EditContent {
     Inserted(Content),
     Deleted(Content),
+    OpaqueReplacement {
+        old: Content,
+        new: Content,
+    },
     Modified {
         base: Content,
         word_ops: Vec<WordOp>,
@@ -1477,6 +1495,16 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
             "delete",
             &[("text", content.plain_text().to_string())],
         ),
+        EditContent::OpaqueReplacement { .. } => push_log_entry(
+            log,
+            index,
+            "modify",
+            &[
+                ("block", "[opaque visual content]".to_string()),
+                ("deleted", "[old visual]".to_string()),
+                ("inserted", "[new visual]".to_string()),
+            ],
+        ),
         EditContent::Modified { base, word_ops } => {
             if has_textual_word_change(word_ops) {
                 let deletes = collect_word_op_text(word_ops, |op| match op {
@@ -1552,6 +1580,90 @@ pub fn diff_annotated_with_block_debug(
     (result, debug.expect("debug capture requested"))
 }
 
+fn replace_block_edit(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    old_block: &DiffBlock,
+    new_block: &DiffBlock,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+) -> DiffBlockEdit {
+    let page_styles = new_block.page_styles.clone();
+    let unique_changed_pair = match (old_ann, new_ann) {
+        (Some(old_ann), Some(new_ann)) if can_recurse_via_slots(old_ann, new_ann) => None,
+        (Some(old_ann), Some(new_ann)) => find_unique_changed_slot_pair(old_ann, new_ann),
+        _ => find_unique_changed_slot_pair(old, new),
+    };
+
+    if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
+        && can_recurse_via_slots(old_ann, new_ann)
+    {
+        if annotated_subtree_equal(old_ann, new_ann) {
+            return DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, None),
+                edits: vec![],
+                page_styles,
+            };
+        }
+        let edits = diff_slot_edits(old_ann, new_ann);
+        if !edits.is_empty() {
+            return DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, Some(new_ann)),
+                edits,
+                page_styles,
+            };
+        }
+        if let Some(edit) = owned_surface_modified_edit(old_ann, new_ann) {
+            return DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, Some(new_ann)),
+                edits: vec![edit],
+                page_styles,
+            };
+        }
+        return DiffBlockEdit {
+            base: annotated_block_from(&new_block.content, None),
+            edits: vec![],
+            page_styles,
+        };
+    }
+
+    if let Some((old_ann, new_ann)) = unique_changed_pair {
+        let edits = diff_slot_edits(old_ann, new_ann);
+        if !edits.is_empty() {
+            return DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, Some(new_ann)),
+                edits,
+                page_styles,
+            };
+        }
+    }
+
+    let old_tokens = extract_words_for_annotated(&old_block.content, old_ann);
+    let new_tokens = extract_words_for_annotated(&new_block.content, new_ann);
+    let word_ops = diff_words(&old_tokens, &new_tokens);
+    let edits = if has_textual_word_change(&word_ops) {
+        vec![RealizedEdit::WholeBlock(EditContent::Modified {
+            base: new_block.content.clone(),
+            word_ops,
+        })]
+    } else if old_block.content != new_block.content
+        && old_block.content.plain_text().is_empty()
+        && new_block.content.plain_text().is_empty()
+    {
+        vec![RealizedEdit::WholeBlock(EditContent::OpaqueReplacement {
+            old: old_block.content.clone(),
+            new: new_block.content.clone(),
+        })]
+    } else {
+        vec![]
+    };
+    DiffBlockEdit {
+        base: annotated_block_from(&new_block.content, None),
+        edits,
+        page_styles,
+    }
+}
+
 fn diff_annotated_inner(
     old: &AnnotatedContent,
     new: &AnnotatedContent,
@@ -1568,7 +1680,11 @@ fn diff_annotated_inner(
     let mut new_owners = BlockOwnerCursor::new(new);
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
-    for op in prepared.matched_ops {
+    let matched_ops = prepared.matched_ops;
+    let mut op_index = 0;
+    while op_index < matched_ops.len() {
+        let op = matched_ops[op_index].clone();
+        op_index += 1;
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
@@ -1646,8 +1762,26 @@ fn diff_annotated_inner(
                 });
             }
             BlockOp::Delete(old_block) => {
-                let old_ann = old_owners
-                    .take_owner_for(&old_block.content)
+                let old_claim = old_owners.take_claim_for(&old_block.content);
+                if let Some(BlockOp::Insert(new_block)) = matched_ops.get(op_index).cloned() {
+                    let new_claim = new_owners.peek_claim_for(&new_block.content);
+                    if semantic_owner_claims_match(&old_claim, &new_claim) {
+                        let new_claim = new_owners.take_claim_for(&new_block.content);
+                        blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
+                        blocks.push(replace_block_edit(
+                            old,
+                            new,
+                            &old_block,
+                            &new_block,
+                            old_claim.owner,
+                            new_claim.owner,
+                        ));
+                        op_index += 1;
+                        continue;
+                    }
+                }
+                let old_ann = old_claim
+                    .owner
                     .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&old_block.content, old_ann),
@@ -1671,87 +1805,16 @@ fn diff_annotated_inner(
                 });
             }
             BlockOp::Replace(old_block, new_block) => {
-                let page_styles = new_block.page_styles.clone();
                 let old_ann = old_owners
                     .take_owner_for(&old_block.content)
                     .or_else(|| find_nonempty_annotated_block_owner(old, &old_block.content));
                 let new_ann = new_owners
                     .take_owner_for(&new_block.content)
                     .or_else(|| find_nonempty_annotated_block_owner(new, &new_block.content));
-                let unique_changed_pair = match (old_ann, new_ann) {
-                    (Some(old_ann), Some(new_ann)) if can_recurse_via_slots(old_ann, new_ann) => {
-                        None
-                    }
-                    (Some(old_ann), Some(new_ann)) => {
-                        find_unique_changed_slot_pair(old_ann, new_ann)
-                    }
-                    _ => find_unique_changed_slot_pair(old, new),
-                };
                 blocks.extend(layout.take_before(&new_block.content, new_ann));
-
-                if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
-                    && can_recurse_via_slots(old_ann, new_ann)
-                {
-                    if annotated_subtree_equal(old_ann, new_ann) {
-                        blocks.push(DiffBlockEdit {
-                            base: annotated_block_from(&new_block.content, None),
-                            edits: vec![],
-                            page_styles,
-                        });
-                        continue;
-                    }
-                    let edits = diff_slot_edits(old_ann, new_ann);
-                    if !edits.is_empty() {
-                        blocks.push(DiffBlockEdit {
-                            base: annotated_block_from(&new_block.content, Some(new_ann)),
-                            edits,
-                            page_styles,
-                        });
-                        continue;
-                    }
-                    if let Some(edit) = owned_surface_modified_edit(old_ann, new_ann) {
-                        blocks.push(DiffBlockEdit {
-                            base: annotated_block_from(&new_block.content, Some(new_ann)),
-                            edits: vec![edit],
-                            page_styles,
-                        });
-                        continue;
-                    }
-                    blocks.push(DiffBlockEdit {
-                        base: annotated_block_from(&new_block.content, None),
-                        edits: vec![],
-                        page_styles,
-                    });
-                    continue;
-                }
-                if let Some((old_ann, new_ann)) = unique_changed_pair {
-                    let edits = diff_slot_edits(old_ann, new_ann);
-                    if !edits.is_empty() {
-                        blocks.push(DiffBlockEdit {
-                            base: annotated_block_from(&new_block.content, Some(new_ann)),
-                            edits,
-                            page_styles,
-                        });
-                        continue;
-                    }
-                }
-
-                let old_tokens = extract_words_for_annotated(&old_block.content, old_ann);
-                let new_tokens = extract_words_for_annotated(&new_block.content, new_ann);
-                let word_ops = diff_words(&old_tokens, &new_tokens);
-                let edits = if has_textual_word_change(&word_ops) {
-                    vec![RealizedEdit::WholeBlock(EditContent::Modified {
-                        base: new_block.content.clone(),
-                        word_ops,
-                    })]
-                } else {
-                    vec![]
-                };
-                blocks.push(DiffBlockEdit {
-                    base: annotated_block_from(&new_block.content, None),
-                    edits,
-                    page_styles,
-                });
+                blocks.push(replace_block_edit(
+                    old, new, &old_block, &new_block, old_ann, new_ann,
+                ));
             }
         }
     }
@@ -2001,6 +2064,13 @@ fn collect_edit_content_signature(content: &EditContent, signatures: &mut HashSe
                 collect_modified_signatures(edit, signatures);
             }
         }
+        EditContent::OpaqueReplacement { old, new } => {
+            signatures.insert(format!(
+                "opaque\n{}\n{}",
+                content_signature(old),
+                content_signature(new)
+            ));
+        }
         EditContent::Inserted(_) | EditContent::Deleted(_) | EditContent::Modified { .. } => {}
     }
 }
@@ -2171,6 +2241,8 @@ fn diff_region_edits(old: &AnnotatedContent, new: &AnnotatedContent) -> Vec<Real
             base: new_effective,
             word_ops,
         })]
+    } else if let Some(content) = opaque_replacement_content(old, new) {
+        vec![RealizedEdit::WholeBlock(content)]
     } else {
         vec![]
     }
@@ -3000,6 +3072,13 @@ impl<'a> LayoutCursor<'a> {
 struct BlockOwnerClaim<'a> {
     content: Content,
     owner: Option<&'a AnnotatedContent>,
+    key: Option<SemanticOwnerKey>,
+}
+
+#[derive(Clone)]
+struct BlockOwnerMatch<'a> {
+    owner: Option<&'a AnnotatedContent>,
+    key: Option<SemanticOwnerKey>,
 }
 
 struct BlockOwnerCursor<'a> {
@@ -3011,17 +3090,73 @@ impl<'a> BlockOwnerCursor<'a> {
     fn new(root: &'a AnnotatedContent) -> Self {
         let mut claims = Vec::new();
         collect_block_owner_claims(root, &mut claims);
+        attach_semantic_owner_keys(&mut claims);
         Self { claims, index: 0 }
     }
 
     fn take_owner_for(&mut self, target: &Content) -> Option<&'a AnnotatedContent> {
-        let claim = self.claims.get(self.index)?;
+        self.take_claim_for(target).owner
+    }
+
+    fn take_claim_for(&mut self, target: &Content) -> BlockOwnerMatch<'a> {
+        let Some(claim) = self.claims.get(self.index) else {
+            return BlockOwnerMatch {
+                owner: None,
+                key: None,
+            };
+        };
         self.index += 1;
         if owned_block_matches(&claim.content, target) {
-            claim.owner
+            BlockOwnerMatch {
+                owner: claim.owner,
+                key: claim.key.clone(),
+            }
         } else {
-            None
+            BlockOwnerMatch {
+                owner: None,
+                key: None,
+            }
         }
+    }
+
+    fn peek_claim_for(&self, target: &Content) -> BlockOwnerMatch<'a> {
+        let Some(claim) = self.claims.get(self.index) else {
+            return BlockOwnerMatch {
+                owner: None,
+                key: None,
+            };
+        };
+        if owned_block_matches(&claim.content, target) {
+            BlockOwnerMatch {
+                owner: claim.owner,
+                key: claim.key.clone(),
+            }
+        } else {
+            BlockOwnerMatch {
+                owner: None,
+                key: None,
+            }
+        }
+    }
+}
+
+fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
+    let mut ordinals: HashMap<SemanticKind, usize> = HashMap::new();
+    for claim in claims {
+        let Some(owner) = claim.owner else {
+            continue;
+        };
+        let Some(kind) = owner.annotation.semantic_kind.clone() else {
+            continue;
+        };
+        let slot_labels = slot_labels_owned(owner);
+        let ordinal = ordinals.entry(kind.clone()).or_default();
+        claim.key = Some(SemanticOwnerKey {
+            kind,
+            slot_labels,
+            ordinal: *ordinal,
+        });
+        *ordinal += 1;
     }
 }
 
@@ -3033,6 +3168,7 @@ fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<Bloc
             out.push(BlockOwnerClaim {
                 content: blocks[0].content.clone(),
                 owner,
+                key: None,
             });
             return;
         }
@@ -3042,6 +3178,7 @@ fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<Bloc
         out.extend(blocks.into_iter().map(|block| BlockOwnerClaim {
             content: block.content,
             owner: None,
+            key: None,
         }));
     } else {
         for child in &node.children {
@@ -3057,6 +3194,21 @@ fn is_owned_diff_region(node: &AnnotatedContent) -> bool {
 
 fn owned_block_matches(owner_block: &Content, target: &Content) -> bool {
     owner_block == target || normalized_visible_text_matches(owner_block, target)
+}
+
+fn semantic_owner_claims_match(
+    old_claim: &BlockOwnerMatch<'_>,
+    new_claim: &BlockOwnerMatch<'_>,
+) -> bool {
+    // Ownership noise may change slot shape or realized text, but not the
+    // semantic owner kind and document-order identity.
+    let (Some(old_key), Some(new_key)) = (&old_claim.key, &new_claim.key) else {
+        return false;
+    };
+    old_claim.owner.is_some()
+        && new_claim.owner.is_some()
+        && old_key.kind == new_key.kind
+        && old_key.ordinal == new_key.ordinal
 }
 
 fn layout_block_edit(block: &DiffBlock) -> DiffBlockEdit {
@@ -3396,12 +3548,14 @@ fn owned_surface_modified_edit(
     let old_tokens = extract_words(&old_effective);
     let new_tokens = extract_words(&new_effective);
     let word_ops = diff_words(&old_tokens, &new_tokens);
-    has_textual_word_change(&word_ops).then(|| {
-        RealizedEdit::WholeBlock(EditContent::Modified {
+    if has_textual_word_change(&word_ops) {
+        return Some(RealizedEdit::WholeBlock(EditContent::Modified {
             base: new_effective,
             word_ops,
-        })
-    })
+        }));
+    }
+
+    opaque_replacement_content(old_ann, new_ann).map(RealizedEdit::WholeBlock)
 }
 
 fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
@@ -3412,12 +3566,21 @@ fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
         .collect()
 }
 
+fn slot_labels_owned(node: &AnnotatedContent) -> Vec<SlotStep> {
+    node.annotation
+        .slots
+        .iter()
+        .map(|slot| slot.label.clone())
+        .collect()
+}
+
 fn semantic_edit_claim_key(node: &AnnotatedContent) -> String {
     format!(
-        "{:?}|{:?}|{}",
+        "{:?}|{:?}|{}|{}",
         node.annotation.semantic_kind,
         slot_labels(node),
-        effective_text_content(node).plain_text()
+        effective_text_content(node).plain_text(),
+        content_signature(&effective_render_content(node))
     )
 }
 
@@ -3432,7 +3595,7 @@ fn resolved_slots(node: &AnnotatedContent) -> Vec<(&SemanticSlot, &AnnotatedCont
 fn annotated_subtree_equal(old: &AnnotatedContent, new: &AnnotatedContent) -> bool {
     old.annotation.semantic_kind == new.annotation.semantic_kind
         && slot_labels(old) == slot_labels(new)
-        && effective_text_content(old) == effective_text_content(new)
+        && effective_render_content(old) == effective_render_content(new)
         && old.children.len() == new.children.len()
         && old
             .children
@@ -3490,10 +3653,32 @@ fn modified_edit_content(
     let old_tokens = extract_words_for_annotated(&old_effective, Some(old_child));
     let new_tokens = extract_words_for_annotated(&new_effective, Some(new_child));
     let word_ops = diff_words(&old_tokens, &new_tokens);
-    has_textual_word_change(&word_ops).then_some(EditContent::Modified {
-        base: new_effective,
-        word_ops,
-    })
+    if has_textual_word_change(&word_ops) {
+        return Some(EditContent::Modified {
+            base: new_effective,
+            word_ops,
+        });
+    }
+
+    opaque_replacement_content(old_child, new_child)
+}
+
+fn opaque_replacement_content(
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+) -> Option<EditContent> {
+    let old_visual = effective_render_content(old_child);
+    let new_visual = effective_render_content(new_child);
+    if old_visual != new_visual
+        && old_visual.plain_text().is_empty()
+        && new_visual.plain_text().is_empty()
+    {
+        return Some(EditContent::OpaqueReplacement {
+            old: old_visual,
+            new: new_visual,
+        });
+    }
+    None
 }
 
 fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {
@@ -3537,13 +3722,21 @@ fn diff_slot_edits_lcs(
                 for i in 0..len {
                     let old_child = old_slots[old_index + i].1;
                     let new_child = new_slots[new_index + i].1;
-                    if !annotated_subtree_equal(old_child, new_child)
-                        && let Some(content) = recursive_slot_edit_content(old_child, new_child)
-                    {
+                    if annotated_subtree_equal(old_child, new_child) {
+                        continue;
+                    }
+                    if let Some(content) = recursive_slot_edit_content(old_child, new_child) {
                         edits.push(RealizedEdit::ReplaceAt {
                             path: new_slots[new_index + i].0.path.clone(),
                             content,
                         });
+                    } else {
+                        push_modified_slot_edit(
+                            &mut edits,
+                            old_child,
+                            new_child,
+                            &new_slots[new_index + i].0.path,
+                        );
                     }
                 }
             }

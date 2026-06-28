@@ -92,7 +92,8 @@ pub struct Annotation {
     pub slots: Vec<SemanticSlot>,
     /// Footnote body if this realized node is a footnote marker site.
     pub footnote: Option<FootnoteInfo>,
-    /// Structured content to use as the local edit surface when realization is opaque.
+    /// Structured content to use as the local edit surface when realization is
+    /// opaque or when realized layout scaffolding differs from authored slots.
     pub patch_surface: Option<Content>,
     /// Source equations whose realized math carriers live under this realized node.
     pub equation_origins: Vec<Content>,
@@ -113,7 +114,7 @@ impl Default for Annotation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum SemanticKind {
     Paragraph,
     Heading,
@@ -131,7 +132,7 @@ pub enum SemanticKind {
     Wrapper(WrapperKind),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum WrapperKind {
     Align,
     Pad,
@@ -145,7 +146,7 @@ pub enum WrapperKind {
 }
 
 /// One semantic slot label inside a structured container.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum SlotStep {
     ListItem(usize),
     EnumItem(usize),
@@ -163,8 +164,8 @@ pub enum SlotStep {
 
 /// A named semantic position within an [`AnnotatedContent`] node.
 ///
-/// `path` points through the annotated realized tree's `children` vec.
-/// `label` identifies the slot's role (e.g. `ListItem(0)`).
+/// `path` is relative to the node's patch surface, not incidental realized
+/// layout scaffolding. `label` identifies the slot's role (e.g. `ListItem(0)`).
 #[derive(Clone, Debug)]
 pub struct SemanticSlot {
     pub label: SlotStep,

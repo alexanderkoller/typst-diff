@@ -875,6 +875,13 @@ fn summarize_edit_content(content: &EditContent) -> EditContentSummary {
             word_ops: Vec::new(),
             nested_edits: Vec::new(),
         },
+        EditContent::OpaqueReplacement { old, new } => EditContentSummary {
+            kind: "opaque_replacement".to_string(),
+            content: Some(summarize_content(new, 0)),
+            base: Some(summarize_content(old, 0)),
+            word_ops: Vec::new(),
+            nested_edits: Vec::new(),
+        },
         EditContent::Modified { base, word_ops } => EditContentSummary {
             kind: "modified".to_string(),
             content: None,
