@@ -45,6 +45,81 @@ The clippy cleanup touched only:
 - `src/container_ops.rs`
 - `src/diff.rs`
 
+## Follow-up: Owned Block-Region Trial
+
+After identifying wrapper/repeated-macro failures as an ownership problem, a
+first focused extension was implemented in `src/diff.rs` and then broadened into
+the current owned-region pass:
+
+- block edits now use a document-order owner cursor for one-block semantic
+  owners instead of only rediscovering owners through global content search;
+- owner claims cover slot-bearing semantic regions except footnotes, plus
+  equation carriers;
+- owner claims match both realized and effective one-block surfaces, with
+  normalized visible-text matching limited to this owner-claim path;
+- `Replace` blocks whose slot recursion finds no path edits now fall back to a
+  word diff over the owned effective surface;
+- empty `Equal` blocks with owned regions can also use the owned effective
+  surface, which is the key path for opaque wrapper/layout containers;
+- duplicate empty-wrapper edits are pruned even when all duplicates are empty
+  wrappers, and a pruned duplicate wrapper no longer renders its `patch_surface`.
+- footnote body changes are appended from semantic `FootnoteBody` slots rather
+  than from positional empty-block matching, so nearby inserted footnotes do not
+  steal the existing footnote's body edit.
+
+New non-visual regression tests were added:
+
+- `opaque_wrapper_change_renders_only_the_annotated_replacement` checks that
+  `54-align-changed` does not leave an extra plain new wrapper body behind.
+- `repeated_macro_container_edit_is_reported_on_the_changed_instance` checks
+  that `103-repeated-macro-containers-with-one-edit` reports exactly the changed
+  `Beta` card and does not mention unchanged `Alpha` or `Gamma`.
+- `paragraph_split_inside_wrapper_keeps_shared_prefix_localized` checks that
+  `105-paragraph-split-inside-wrapper` does not widen the edit to the unchanged
+  `summary` prefix.
+
+Verification after the trial:
+
+```sh
+cargo fmt --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+bash tests/run_corpus.sh --only-failures
+```
+
+Results:
+
+- `cargo test --all-targets`: pass, 114 library/unit tests and 46 integration
+  tests.
+- `cargo fmt --check`: pass.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- Corpus: 58 passed, 43 failed, 0 new, 0 skipped, 101 tests total, 118 seconds.
+
+Important interpretation after the owned-region trial, before the later
+token-boundary reference flips:
+
+- The owned wrapper/layout failures that motivated this pass now disappear from
+  the full failure list: `54`, `55`, `57`, `58`, `60`, `61`, `62`, `103`, and
+  `105` all pass the corpus harness. `56-place-changed` was already passing.
+- `103-repeated-macro-containers-with-one-edit` is now semantically detected:
+  its modification log contains one edit for `BetaWaiting for approval.`,
+  `deleted: data`, `inserted: approval`, and no mentions of unchanged `Alpha`
+  or `Gamma`.
+- `54-align-changed` now has one generated body copy and one localized old/new
+  edit, not an extra plain new wrapper body.
+- `105-paragraph-split-inside-wrapper` now localizes the split around `and` /
+  `.It also has` instead of treating the unchanged `summary` prefix as changed.
+- The raw corpus pass count is worse after this pass because several references
+  encode older, coarser renderings. For example, `20-nested-list-changed` now
+  renders a word-level edit inside the nested list item, while the reference
+  expects a whole nested item deletion and insertion. This should be treated as
+  a reference-policy question, not automatically as a code regression.
+- Current known guardrail: footnotes must stay out of the main owned block
+  stream. Matching them as empty block owners can pair an existing old footnote
+  with a newly inserted first footnote. Semantic footnote-body matching avoids
+  that failure and keeps `nearby_footnote_insert_keeps_existing_note_body_localized`
+  green.
+
 ## What Works
 
 The Rust-level pipeline is healthy. Passing tests cover:
@@ -64,9 +139,10 @@ The current architecture is coherent: evaluate Typst, build annotated realized
 trees, diff to path-addressed edits, apply edits to the new realized content,
 and render.
 
-## Current Corpus Failure Clusters
+## Initial Corpus Failure Clusters
 
-The 37 corpus failures cluster into these areas:
+The 37 corpus failures from the initial audit clustered into these areas. Some
+entries in this list were fixed by later follow-up work below.
 
 - Wrapper and opaque realization ownership: `54-62`, `103`, `105`.
 - Figures and captions: `34`, `71-73`, `89`, `92`.
@@ -81,10 +157,11 @@ rendering a whole-heading deletion plus insertion. That looks plausibly better
 than the old reference and should not drive code changes until the desired
 output is explicitly chosen.
 
-## Definitely Wrong Corpus Cases To Automate First
+## Definitely Wrong Corpus Cases From The Initial Audit
 
-These are good candidates for immediate non-visual regression tests because the
-current generated output contradicts the source change or the modification log.
+These were good candidates for immediate non-visual regression tests because the
+generated output contradicted the source change or the modification log. Status
+notes reflect the follow-up work in this session.
 
 1. `45-package-showybox`
 
@@ -102,6 +179,12 @@ current generated output contradicts the source change or the modification log.
    Suggested assertion: exactly the changed repeated macro expansion is owned
    and annotated; the unchanged `Alpha` and `Gamma` cards remain untouched.
 
+   Status: semantic detection is fixed and covered by
+   `repeated_macro_container_edit_is_reported_on_the_changed_instance`. After
+   the token-boundary fix, the corpus PNG reference is stale because it expects
+   `dataapproval`; the current output renders the old and new variants as
+   `data approval`.
+
 3. `54-align-changed` as the representative wrapper case
 
    Symptom: the generated diff duplicates the aligned body: one plain new copy
@@ -110,6 +193,9 @@ current generated output contradicts the source change or the modification log.
 
    Suggested assertion: wrapper body edits should produce one localized edit on
    the wrapper body and must not leave an extra plain new wrapper body behind.
+
+   Status: fixed for the representative wrapper family and covered by
+   `opaque_wrapper_change_renders_only_the_annotated_replacement`.
 
 4. `71-figure-caption-added`
 
@@ -185,3 +271,82 @@ so it may need follow-up despite the issue being closed.
 - Opaque content must have an explicit replacement policy. "No text" should not
   mean "no change."
 
+## 2026-06-28 Token-Boundary Follow-Up
+
+After the wrapper ownership fix, several flipped-to-fail corpus examples showed
+glued old/new variants such as `matterentirely`, `literaturemodern`, and
+`metricsshows`. The shared rendering bug was in inline insertion boundary
+handling: insertions only considered a preceding delete run, so an insertion
+after an equal word could be rendered adjacent to that equal word. A later
+unchanged punctuation token had also been treated as relevant to the left
+boundary, which suppressed needed prose spacing in cases like corpus `07`.
+
+The fix keeps rendering simple and general: both the content renderer and the
+generated Typst-snippet renderer now add a separator before an insertion when the
+immediate left boundary and the first inserted token are both non-whitespace and
+non-punctuation. This follows the existing token classes rather than treating
+digits as a special case: punctuation remains attached, while adjacent
+replacement tokens such as `25` / `30%` and `Figure 1` / `2` stay readable.
+Regression coverage:
+
+- unit tests for prose word boundaries, inserted punctuation, adjacent
+  replacement numbers, and deleted trailing spaces;
+- integration coverage for `07-paragraphs-reordered`,
+  `15-emph-content-changed`, `35-table-changed`, `48-state-context`, and
+  `100-figure-inserted-before-figure-reference`.
+
+Verification after the spacing fix:
+
+- `cargo test --all-targets`: 118 library/unit tests and 48 integration tests
+  passed.
+- `bash tests/run_corpus.sh --no-build`: 58 passed, 43 failed, 0 new, 0
+  skipped, 101 tests total, 116 seconds.
+- `48-state-context` now passes the corpus harness.
+- `100-figure-inserted-before-figure-reference` no longer shows the whitespace
+  issue: the modification log reports `deleted: 1` and `inserted: 2 | revised`,
+  and the rendered PNG comparison shows `Figure 1 2`, not `Figure 12`.
+- `103-repeated-macro-containers-with-one-edit` is semantically fixed but still
+  fails the current visual corpus reference because the reference has the old
+  glued rendering `dataapproval`; the current output has `data approval`.
+- The fail-flip overview was regenerated at
+  `output/pdf/corpus-flipped-to-fail-overview.pdf`. At this point it had 29
+  pages and its pass-to-fail set no longer included `48-state-context`.
+
+## 2026-06-28 Inherited-Style Follow-Up
+
+Corpus `10-heading-text-changed` exposed a separate rendering bug after the
+word-level heading diff became visible: changed heading words were larger than a
+normal heading. The cause was inherited style duplication. Word tokens extracted
+from a realized heading already carried the heading's outer `StyledElem`, and
+`replace_text_container` then grafted those styled tokens back into the same
+styled heading/block base. Typst therefore applied the heading style twice.
+
+The fix makes modified replacement content relative to the base container. When
+the renderer descends through a base `StyledElem`, it recursively removes that
+same inherited style sequence from the replacement content, even when the
+red/green diff styling has been wrapped outside it. This preserves any remaining
+inline styles and the diff styling while preventing inherited container styles
+from compounding.
+
+Regression coverage:
+
+- `modified_heading_does_not_apply_heading_style_twice` compares the laid-out
+  size of the deleted `Old`, inserted `New`, and unchanged `Heading` runs in
+  corpus `10` against the normal `new.typ` heading size.
+- Existing formatting guardrails still cover bold, emphasis, source
+  strikethrough, deleted headings, and the previous token-boundary cases.
+
+Verification after the inherited-style fix:
+
+- `cargo test --all-targets`: 118 library/unit tests and 49 integration tests
+  passed.
+- `bash tests/run_corpus.sh --no-build`: 68 passed, 33 failed, 0 new, 0
+  skipped, 101 tests total, 125 seconds.
+- Corpus `10-heading-text-changed` still fails the committed visual reference
+  because the reference expects whole-heading delete/insert output, but the
+  current output now uses the correct heading size for the word-level edit.
+- Corpus `100-figure-inserted-before-figure-reference` now passes the corpus
+  harness.
+- The current fail-flip overview was regenerated at
+  `output/pdf/corpus-flipped-to-fail-overview.pdf` and has 11 pages. Its
+  pass-to-fail set is now `25`, `30`, `38`, `49`, and `87`.

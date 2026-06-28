@@ -17,7 +17,7 @@
 //! started whenever the page styles change. This preserves `#set page(…)` boundaries
 //! (margins, headers, footers) across section breaks in the diff output.
 
-use typst::foundations::{Content, Smart, Styles};
+use typst::foundations::{Content, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel};
 use typst::math::{CancelElem, EquationElem};
@@ -61,9 +61,9 @@ fn flush_group(
 ///
 /// Deleted tokens become red `StrikeElem` (equations use `CancelElem`). Inserted tokens
 /// become green. In compact mode, inserted tokens that are adjacent to a delete are
-/// coloured blue and their delete sibling is dropped entirely. A thin space separator is
-/// inserted between a delete run and its following insert run when the boundary would
-/// otherwise join two non-whitespace tokens.
+/// coloured blue and their delete sibling is dropped entirely. A separator is inserted
+/// before an inserted run when the surrounding tokens would otherwise be glued into
+/// one word-like token.
 fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) -> Content {
     let mut inline: Vec<Content> = Vec::new();
     for (i, wop) in word_ops.iter().enumerate() {
@@ -85,7 +85,7 @@ fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) ->
                 };
                 let joined = changed_token_sequence(
                     tokens,
-                    prev.and_then(deleted_tokens),
+                    prev.and_then(tokens_before_insert),
                     compact_substitutions,
                 );
                 inline.push(joined.styled(TextElem::fill.set(color.into())));
@@ -105,20 +105,20 @@ fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) ->
     Content::sequence(inline)
 }
 
-fn deleted_tokens(op: &WordOp) -> Option<&[crate::diff::Token]> {
+fn tokens_before_insert(op: &WordOp) -> Option<&[crate::diff::Token]> {
     match op {
-        WordOp::Delete(tokens) => Some(tokens),
+        WordOp::Equal(tokens) | WordOp::Delete(tokens) => Some(tokens),
         _ => None,
     }
 }
 
 fn changed_token_sequence(
     tokens: &[crate::diff::Token],
-    previous_delete: Option<&[crate::diff::Token]>,
+    previous_tokens: Option<&[crate::diff::Token]>,
     compact_substitutions: bool,
 ) -> Content {
     let mut content: Vec<Content> = Vec::new();
-    if !compact_substitutions && previous_delete.is_some_and(|prev| needs_separator(prev, tokens)) {
+    if !compact_substitutions && previous_tokens.is_some_and(|prev| needs_separator(prev, tokens)) {
         content.push(SpaceElem::shared().clone());
     }
     content.extend(tokens.iter().map(|t| t.content.clone()));
@@ -132,14 +132,16 @@ fn needs_separator(left: &[crate::diff::Token], right: &[crate::diff::Token]) ->
     let Some(right_text) = right.first().map(|token| token.text.as_str()) else {
         return false;
     };
-    left_text
-        .chars()
-        .next_back()
-        .is_some_and(|ch| !ch.is_whitespace())
-        && right_text
-            .chars()
-            .next()
-            .is_some_and(|ch| !ch.is_whitespace())
+    let Some(left_char) = left_text.chars().next_back() else {
+        return false;
+    };
+    let Some(right_char) = right_text.chars().next() else {
+        return false;
+    };
+    !left_char.is_whitespace()
+        && !right_char.is_whitespace()
+        && !left_char.is_ascii_punctuation()
+        && !right_char.is_ascii_punctuation()
 }
 
 fn deleted_token_content(token: &crate::diff::Token) -> Content {
@@ -174,6 +176,16 @@ fn deleted_token_content(token: &crate::diff::Token) -> Content {
 fn replace_text_container(template: &Content, replacement: &Content) -> Option<Content> {
     let mut content = template.clone();
 
+    if let Some(styled) = content.to_packed_mut::<StyledElem>()
+        && let Some(child) = replace_text_container(
+            &styled.child,
+            &strip_inherited_styles(replacement, &styled.styles),
+        )
+    {
+        styled.child = child;
+        return Some(content);
+    }
+
     if let Some(par) = content.to_packed_mut::<ParElem>() {
         par.body = replacement.clone();
         return Some(content);
@@ -190,13 +202,6 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
         let body =
             replace_text_container(&body, replacement).unwrap_or_else(|| replacement.clone());
         block.body.set(Some(BlockBody::Content(body)));
-        return Some(content);
-    }
-
-    if let Some(styled) = content.to_packed_mut::<StyledElem>()
-        && let Some(child) = replace_text_container(&styled.child, replacement)
-    {
-        styled.child = child;
         return Some(content);
     }
 
@@ -218,6 +223,112 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
     }
 
     None
+}
+
+fn strip_inherited_styles(content: &Content, inherited: &Styles) -> Content {
+    if inherited.is_empty() {
+        return content.clone();
+    }
+
+    let mut content = content.clone();
+
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        seq.children = seq
+            .children
+            .iter()
+            .map(|child| strip_inherited_styles(child, inherited))
+            .collect();
+        return content;
+    }
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        let child = strip_inherited_styles(&styled.child, inherited);
+        let stripped = styles_without_inherited_sequence(&styled.styles, inherited);
+        if let Some(remaining_styles) = stripped {
+            if remaining_styles.is_empty() {
+                return child;
+            }
+            styled.styles = remaining_styles;
+        }
+        styled.child = child;
+        return content;
+    }
+
+    if let Some(par) = content.to_packed_mut::<ParElem>() {
+        par.body = strip_inherited_styles(&par.body, inherited);
+        return content;
+    }
+
+    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
+        heading.body = strip_inherited_styles(&heading.body, inherited);
+        return content;
+    }
+
+    if let Some(block) = content.to_packed_mut::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        block
+            .body
+            .set(Some(BlockBody::Content(strip_inherited_styles(
+                &body, inherited,
+            ))));
+        return content;
+    }
+
+    if let Some(strike) = content.to_packed_mut::<StrikeElem>() {
+        strike.body = strip_inherited_styles(&strike.body, inherited);
+        return content;
+    }
+
+    if let Some(list) = content.to_packed_mut::<ListElem>() {
+        for item in &mut list.children {
+            item.body = strip_inherited_styles(&item.body, inherited);
+        }
+        return content;
+    }
+
+    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
+        for item in &mut enm.children {
+            item.body = strip_inherited_styles(&item.body, inherited);
+        }
+        return content;
+    }
+
+    content
+}
+
+fn styles_without_inherited_sequence(styles: &Styles, inherited: &Styles) -> Option<Styles> {
+    let styles = styles.as_slice();
+    let inherited = inherited.as_slice();
+    let style_signatures: Vec<_> = styles
+        .iter()
+        .map(|style| style_signature_ignoring_provenance(style))
+        .collect();
+    let inherited_signatures: Vec<_> = inherited
+        .iter()
+        .map(|style| style_signature_ignoring_provenance(style))
+        .collect();
+    let start = styles
+        .windows(inherited.len())
+        .enumerate()
+        .find(|(index, _)| {
+            style_signatures[*index..*index + inherited.len()] == inherited_signatures
+        })
+        .map(|(index, _)| index)?;
+
+    let mut remaining = Styles::new();
+    for (index, style) in styles.iter().enumerate() {
+        if index < start || index >= start + inherited.len() {
+            remaining.push((**style).clone());
+        }
+    }
+    Some(remaining)
+}
+
+fn style_signature_ignoring_provenance(style: &Style) -> String {
+    // LazyHash equality includes realization provenance. For inherited-style
+    // removal we only want the visible property or recipe that Debug exposes.
+    format!("{style:?}")
 }
 
 fn is_inlineish(content: &Content) -> bool {
@@ -555,10 +666,12 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
                 } else {
                     "#00b400"
                 };
+                let text =
+                    changed_tokens_plain_text(tokens, prev.and_then(tokens_before_insert), compact);
                 out.push_str(&format!(
                     "#text(fill: rgb(\"{}\"))[{}]",
                     color,
-                    typst_escape_content(&tokens_plain_text(tokens))
+                    typst_escape_content(&text)
                 ));
             }
             WordOp::Delete(tokens) => {
@@ -584,6 +697,19 @@ fn tokens_plain_text(tokens: &[crate::diff::Token]) -> String {
     for token in tokens {
         text.push_str(token.content.plain_text().as_str());
     }
+    text
+}
+
+fn changed_tokens_plain_text(
+    tokens: &[crate::diff::Token],
+    previous_tokens: Option<&[crate::diff::Token]>,
+    compact_substitutions: bool,
+) -> String {
+    let mut text = String::new();
+    if !compact_substitutions && previous_tokens.is_some_and(|prev| needs_separator(prev, tokens)) {
+        text.push(' ');
+    }
+    text.push_str(&tokens_plain_text(tokens));
     text
 }
 
@@ -1185,6 +1311,109 @@ mod tests {
 
         assert_eq!(inline.plain_text(), "old new");
         assert_eq!(count_elem::<StrikeElem>(&inline), 1);
+    }
+
+    #[test]
+    fn annotated_inline_content_inserts_separator_after_equal_word() {
+        let inline = annotated_inline_content(
+            &[
+                WordOp::Equal(vec![
+                    word_token("subject"),
+                    word_token(" "),
+                    word_token("matter"),
+                ]),
+                WordOp::Insert(vec![
+                    word_token("entirely"),
+                    word_token(" "),
+                    word_token("different"),
+                ]),
+                WordOp::Equal(vec![word_token(".")]),
+            ],
+            false,
+        );
+        let plain = inline.plain_text();
+
+        assert!(
+            plain.contains("subject matter entirely different"),
+            "{plain}"
+        );
+        assert!(!plain.contains("matterentirely"), "{plain}");
+    }
+
+    #[test]
+    fn annotated_inline_content_does_not_insert_separator_before_punctuation() {
+        let inline = annotated_inline_content(
+            &[
+                WordOp::Equal(vec![word_token("and")]),
+                WordOp::Insert(vec![
+                    word_token("."),
+                    word_token("It"),
+                    word_token(" "),
+                    word_token("also"),
+                ]),
+            ],
+            false,
+        );
+
+        assert_eq!(inline.plain_text(), "and.It also");
+    }
+
+    #[test]
+    fn annotated_inline_content_inserts_separator_between_adjacent_numbers() {
+        let inline = annotated_inline_content(
+            &[
+                WordOp::Equal(vec![word_token("Page 1 of ")]),
+                WordOp::Delete(vec![word_token("2")]),
+                WordOp::Insert(vec![word_token("3")]),
+            ],
+            false,
+        );
+
+        assert_eq!(inline.plain_text(), "Page 1 of 2 3");
+    }
+
+    #[test]
+    fn annotated_inline_content_does_not_duplicate_deleted_trailing_space() {
+        let inline = annotated_inline_content(
+            &[
+                WordOp::Delete(vec![
+                    word_token("subject"),
+                    word_token(" "),
+                    word_token("matter"),
+                    word_token(" "),
+                ]),
+                WordOp::Insert(vec![
+                    word_token("entirely"),
+                    word_token(" "),
+                    word_token("different"),
+                ]),
+                WordOp::Equal(vec![word_token(" from Alpha.")]),
+            ],
+            false,
+        );
+        let plain = inline.plain_text();
+
+        assert!(
+            plain.contains("subject matter entirely different"),
+            "{plain}"
+        );
+        assert!(!plain.contains("matter  entirely"), "{plain}");
+        assert!(!plain.contains("matterentirely"), "{plain}");
+    }
+
+    #[test]
+    fn inherited_style_stripping_ignores_realization_metadata() {
+        let mut token_styles = Styles::new();
+        token_styles.push(TextElem::fill.set(red().into()));
+        let inherited = token_styles.clone().outside();
+        let styled = TextElem::packed("same").styled_with_map(token_styles);
+        let stripped = strip_inherited_styles(&styled, &inherited);
+
+        assert_eq!(stripped.plain_text(), "same");
+        assert!(
+            !stripped.is::<StyledElem>(),
+            "equivalent inherited styles should be removed even if realization metadata differs: {stripped:#?}"
+        );
     }
 
     #[test]

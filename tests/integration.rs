@@ -44,12 +44,13 @@ fn assert_valid_pdf(pdf: &[u8]) {
     assert!(pdf.len() > 1000, "PDF suspiciously small");
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TextRun {
     text: String,
     x: f64,
     y: f64,
     width: f64,
+    size: f64,
     fill: typst::visualize::Paint,
 }
 
@@ -63,6 +64,7 @@ fn rendered_text_runs(frame: &typst::layout::Frame) -> Vec<TextRun> {
                     x: absolute.x.to_pt(),
                     y: absolute.y.to_pt(),
                     width: text.width().to_pt(),
+                    size: text.size.to_pt(),
                     fill: text.fill.clone(),
                 }),
                 typst::layout::FrameItem::Group(group) => {
@@ -100,6 +102,10 @@ fn assert_contains_in_order(text: &str, needles: &[&str]) {
             .unwrap_or_else(|| panic!("{needle:?} not found after byte {start} in:\n{text}"));
         start += found + needle.len();
     }
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn assert_command_success(output: std::process::Output, label: &str) {
@@ -689,6 +695,65 @@ fn bold_changes_keep_strong_formatting() {
 }
 
 #[test]
+fn modified_heading_does_not_apply_heading_style_twice() {
+    let new_world = corpus_world("10-heading-text-changed/new.typ");
+    let normal = typst_diff::eval_to_realized_content(&new_world)
+        .unwrap()
+        .realized;
+    let annotated = annotated_corpus("10-heading-text-changed");
+
+    let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
+    let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+
+    let normal_heading_run = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Heading"))
+        .expect("normal heading text should render");
+
+    for needle in ["Old", "New", "Heading"] {
+        let annotated_run = annotated_runs
+            .iter()
+            .find(|run| run.text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} should render in annotated heading"));
+        assert!(
+            (annotated_run.size - normal_heading_run.size).abs() < 0.1,
+            "{needle} should use the normal heading size once; normal={normal_heading_run:?}, annotated={annotated_run:?}"
+        );
+    }
+}
+
+#[test]
+fn modified_numbered_headings_do_not_apply_heading_style_twice() {
+    let new_world = corpus_world("40-cross-references/new.typ");
+    let normal = typst_diff::eval_to_realized_content(&new_world)
+        .unwrap()
+        .realized;
+    let annotated = annotated_corpus("40-cross-references");
+
+    let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
+    let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+    let normal_heading_run = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Methods"))
+        .expect("normal numbered heading text should render");
+
+    let oversized_runs: Vec<_> = annotated_runs
+        .iter()
+        .filter(|run| run.size > normal_heading_run.size + 0.1)
+        .cloned()
+        .collect();
+
+    assert!(
+        oversized_runs.is_empty(),
+        "numbered heading diff should not apply heading size twice; normal={normal_heading_run:?}, oversized={oversized_runs:?}"
+    );
+}
+
+#[test]
 fn emphasis_changes_keep_emphasis_formatting() {
     let annotated = annotated_corpus("15-emph-content-changed");
     let plain = annotated.plain_text();
@@ -707,6 +772,63 @@ fn emphasis_changes_keep_emphasis_formatting() {
         max_style_count_for_text(&annotated, "catus")
     );
     assert!(count_nodes::<typst::text::StrikeElem>(&annotated) > 0);
+}
+
+#[test]
+fn adjacent_old_new_variants_keep_word_separator_in_corpus_rendering() {
+    let cases = [
+        (
+            "07-paragraphs-reordered",
+            "matterentirely",
+            "matter entirely",
+        ),
+        (
+            "15-emph-content-changed",
+            "literaturemodern",
+            "literature modern",
+        ),
+        ("35-table-changed", "metricsshows", "metrics shows"),
+    ];
+
+    for (name, forbidden, expected) in cases {
+        let annotated = annotated_corpus(name);
+        let plain = annotated.plain_text();
+
+        assert!(
+            !plain.contains(forbidden),
+            "{name} should not glue adjacent old/new variants:\n{plain}"
+        );
+        assert!(
+            plain.contains(expected),
+            "{name} should keep a separator between adjacent old/new variants:\n{plain}"
+        );
+    }
+}
+
+#[test]
+fn adjacent_replacement_tokens_keep_separator_in_corpus_rendering() {
+    let cases = [
+        ("48-state-context", "progress: 2530%", "progress: 25 30%"),
+        (
+            "100-figure-inserted-before-figure-reference",
+            "Figure 12 for",
+            "Figure 1 2 for",
+        ),
+    ];
+
+    for (name, forbidden, expected) in cases {
+        let annotated = annotated_corpus(name);
+        let plain = normalize_whitespace(annotated.plain_text().as_str());
+
+        assert!(
+            !plain.contains(forbidden),
+            "{name} should not glue adjacent replacement tokens:\n{plain}"
+        );
+        assert!(
+            plain.contains(expected),
+            "{name} should keep adjacent replacement tokens readable:\n{plain}"
+        );
+    }
 }
 
 #[test]
@@ -1180,6 +1302,61 @@ fn opaque_wrapper_changes_are_reported_once() {
 }
 
 #[test]
+fn opaque_wrapper_change_renders_only_the_annotated_replacement() {
+    let cases = [
+        (
+            "54-align-changed",
+            "New centered announcement for the review board.",
+        ),
+        ("55-pad-changed", "New padded note for readers."),
+        (
+            "57-columns-changed",
+            "New first column text for comparison.",
+        ),
+        ("58-stack-changed", "New stacked item"),
+        ("60-rect-changed", "New rectangle label"),
+        ("61-circle-changed", "New circle label"),
+        ("62-ellipse-changed", "New ellipse label"),
+        ("103-repeated-macro-containers-with-one-edit", "approval"),
+        ("105-paragraph-split-inside-wrapper", "It also has"),
+    ];
+
+    for (name, new_surface) in cases {
+        let annotated = annotated_tree_corpus(name);
+        let text = annotated.plain_text();
+
+        assert_eq!(
+            text.matches(new_surface).count(),
+            1,
+            "{name} should not render both a plain new copy and a diff copy:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn repeated_macro_container_edit_is_reported_on_the_changed_instance() {
+    let result = diff_annotated_corpus("103-repeated-macro-containers-with-one-edit");
+    let log = result.modification_log();
+    let modifications = log.lines().filter(|line| line.starts_with("## ")).count();
+
+    assert_eq!(modifications, 1, "{log}");
+    assert!(log.contains("deleted: data"), "{log}");
+    assert!(log.contains("inserted: approval"), "{log}");
+    assert!(!log.contains("Alpha"), "{log}");
+    assert!(!log.contains("Gamma"), "{log}");
+}
+
+#[test]
+fn paragraph_split_inside_wrapper_keeps_shared_prefix_localized() {
+    let log = diff_annotated_corpus("105-paragraph-split-inside-wrapper").modification_log();
+
+    assert!(log.contains("deleted: and"), "{log}");
+    assert!(log.contains("inserted: .It also has"), "{log}");
+    assert!(!log.contains("deleted: summary"), "{log}");
+    assert!(!log.contains("inserted: summary"), "{log}");
+}
+
+#[test]
 fn semantic_container_changes_are_word_localized() {
     let cases = [
         (
@@ -1312,7 +1489,7 @@ fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
         .iter()
         .map(|run| run.text.as_str())
         .collect::<String>();
-    assert!(footer_text.contains("Page 1 of 23"), "{footer_text}");
+    assert!(footer_text.contains("Page 1 of 2 3"), "{footer_text}");
     assert!(
         footer_runs.iter().any(|run| {
             run.text == "2" && run.fill == typst::visualize::Color::from_u8(220, 0, 0, 255).into()
@@ -1321,7 +1498,8 @@ fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
     );
     assert!(
         footer_runs.iter().any(|run| {
-            run.text == "3" && run.fill == typst::visualize::Color::from_u8(0, 180, 0, 255).into()
+            run.text.contains('3')
+                && run.fill == typst::visualize::Color::from_u8(0, 180, 0, 255).into()
         }),
         "expected inserted page total to render green in footer"
     );

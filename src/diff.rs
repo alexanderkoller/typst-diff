@@ -32,7 +32,7 @@ use typst::layout::{
     BlockBody, BlockElem, BoxElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel,
 };
 use typst::math::EquationElem;
-use typst::model::{HeadingElem, ParElem, ParbreakElem};
+use typst::model::{FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized};
@@ -526,9 +526,10 @@ fn collect_semantic_child_tokens(content: &Content, out: &mut Vec<Token>) -> boo
 
 fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
     let mut start = 0;
-    let mut in_space = s.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+    let mut kind = s.chars().next().map(text_token_kind);
     for (i, ch) in s.char_indices() {
-        if ch.is_whitespace() != in_space {
+        let next_kind = text_token_kind(ch);
+        if Some(next_kind) != kind {
             let slice = &s[start..i];
             if !slice.is_empty() {
                 out.push(Token {
@@ -537,7 +538,7 @@ fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
                 });
             }
             start = i;
-            in_space = ch.is_whitespace();
+            kind = Some(next_kind);
         }
     }
     let tail = &s[start..];
@@ -546,6 +547,23 @@ fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
             text: tail.to_string(),
             content: TextElem::packed(tail),
         });
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TextTokenKind {
+    Space,
+    Punctuation,
+    Word,
+}
+
+fn text_token_kind(ch: char) -> TextTokenKind {
+    if ch.is_whitespace() {
+        TextTokenKind::Space
+    } else if ch.is_ascii_punctuation() {
+        TextTokenKind::Punctuation
+    } else {
+        TextTokenKind::Word
     }
 }
 
@@ -1404,15 +1422,21 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
     let root_styles = sanitize_page_styles(root_page_styles_raw(&new.realized));
 
     let mut layout = LayoutCursor::new(&new_layout_blocks);
+    let mut old_owners = BlockOwnerCursor::new(old);
+    let mut new_owners = BlockOwnerCursor::new(new);
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
     for op in matched {
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
-                let old_ann = find_annotated_child(old, &old_block.content);
-                let new_ann = find_annotated_child(new, &new_block.content);
-                blocks.extend(layout.take_before(&new_block.content));
+                let old_ann = old_owners
+                    .take_owner_for(&old_block.content)
+                    .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
+                let new_ann = new_owners
+                    .take_owner_for(&new_block.content)
+                    .or_else(|| find_nonempty_annotated_child(new, &new_block.content));
+                blocks.extend(layout.take_before(&new_block.content, new_ann));
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
@@ -1444,6 +1468,16 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                         });
                         continue;
                     }
+                    if new_block.content.plain_text().is_empty()
+                        && let Some(edit) = owned_surface_modified_edit(old_ann, new_ann)
+                    {
+                        blocks.push(DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            edits: vec![edit],
+                            page_styles,
+                        });
+                        continue;
+                    }
                 }
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && (has_equation_origins(old_ann) || has_equation_origins(new_ann))
@@ -1470,7 +1504,9 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 });
             }
             BlockOp::Delete(old_block) => {
-                let old_ann = find_annotated_child(old, &old_block.content);
+                let old_ann = old_owners
+                    .take_owner_for(&old_block.content)
+                    .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&old_block.content, old_ann),
                     edits: vec![RealizedEdit::WholeBlock(deleted_edit(
@@ -1480,9 +1516,12 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                 });
             }
             BlockOp::Insert(new_block) => {
-                blocks.extend(layout.take_before(&new_block.content));
+                let new_ann = new_owners
+                    .take_owner_for(&new_block.content)
+                    .or_else(|| find_nonempty_annotated_child(new, &new_block.content));
+                blocks.extend(layout.take_before(&new_block.content, new_ann));
                 blocks.push(DiffBlockEdit {
-                    base: annotated_block_from(&new_block.content, None),
+                    base: annotated_block_from(&new_block.content, new_ann),
                     edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
                         new_block.content.clone(),
                     ))],
@@ -1491,8 +1530,12 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
             }
             BlockOp::Replace(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
-                let old_ann = find_annotated_block_owner(old, &old_block.content);
-                let new_ann = find_annotated_block_owner(new, &new_block.content);
+                let old_ann = old_owners
+                    .take_owner_for(&old_block.content)
+                    .or_else(|| find_nonempty_annotated_block_owner(old, &old_block.content));
+                let new_ann = new_owners
+                    .take_owner_for(&new_block.content)
+                    .or_else(|| find_nonempty_annotated_block_owner(new, &new_block.content));
                 let unique_changed_pair = match (old_ann, new_ann) {
                     (Some(old_ann), Some(new_ann)) if can_recurse_via_slots(old_ann, new_ann) => {
                         None
@@ -1502,7 +1545,7 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                     }
                     _ => find_unique_changed_slot_pair(old, new),
                 };
-                blocks.extend(layout.take_before(&new_block.content));
+                blocks.extend(layout.take_before(&new_block.content, new_ann));
 
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
@@ -1520,6 +1563,14 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
                             edits,
+                            page_styles,
+                        });
+                        continue;
+                    }
+                    if let Some(edit) = owned_surface_modified_edit(old_ann, new_ann) {
+                        blocks.push(DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            edits: vec![edit],
                             page_styles,
                         });
                         continue;
@@ -1564,6 +1615,7 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
     }
     blocks.extend(layout.take_trailing());
     prune_duplicate_empty_container_edits(&mut blocks);
+    append_footnote_body_edits(old, new, &mut blocks);
 
     DiffResult {
         blocks,
@@ -1574,6 +1626,33 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
 }
 
 fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
+    let mut owned_empty_signatures = HashSet::new();
+    for block in blocks.iter() {
+        if !is_owned_empty_edit_block(block) {
+            continue;
+        }
+        for edit in &block.edits {
+            collect_modified_signatures(edit, &mut owned_empty_signatures);
+        }
+    }
+
+    if !owned_empty_signatures.is_empty() {
+        for block in &mut *blocks {
+            if is_owned_empty_edit_block(block) {
+                continue;
+            }
+            let had_edits = !block.edits.is_empty();
+            block.edits.retain(|edit| {
+                !edit_modified_signatures(edit)
+                    .iter()
+                    .any(|sig| owned_empty_signatures.contains(sig))
+            });
+            if had_edits && block.edits.is_empty() {
+                suppress_block_surface(block);
+            }
+        }
+    }
+
     let mut nonempty_signatures = HashSet::new();
     for block in blocks.iter() {
         if block.base.realized.plain_text().is_empty() {
@@ -1584,24 +1663,22 @@ fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
         }
     }
 
-    if nonempty_signatures.is_empty() {
-        return;
-    }
-
-    for block in &mut *blocks {
-        if !block.base.realized.plain_text().is_empty() {
-            continue;
+    if !nonempty_signatures.is_empty() {
+        for block in &mut *blocks {
+            if !block.base.realized.plain_text().is_empty() {
+                continue;
+            }
+            retain_block_edits(block, |edit| {
+                !edit_modified_signatures(edit)
+                    .iter()
+                    .any(|sig| nonempty_signatures.contains(sig))
+            });
         }
-        block.edits.retain(|edit| {
-            !edit_modified_signatures(edit)
-                .iter()
-                .any(|sig| nonempty_signatures.contains(sig))
-        });
     }
 
     let mut seen_signatures = HashSet::new();
     for block in blocks {
-        block.edits.retain(|edit| {
+        retain_block_edits(block, |edit| {
             let signatures = edit_modified_signatures(edit);
             signatures.is_empty()
                 || signatures
@@ -1609,6 +1686,139 @@ fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
                     .all(|signature| seen_signatures.insert(signature.clone()))
         });
     }
+}
+
+fn is_owned_empty_edit_block(block: &DiffBlockEdit) -> bool {
+    block.base.realized.plain_text().is_empty() && !block.base.annotation.slots.is_empty()
+}
+
+fn suppress_block_surface(block: &mut DiffBlockEdit) {
+    block.base.realized = Content::sequence([]);
+    block.base.annotation.patch_surface = None;
+    block.base.children.clear();
+}
+
+fn retain_block_edits(block: &mut DiffBlockEdit, mut keep: impl FnMut(&RealizedEdit) -> bool) {
+    let had_edits = !block.edits.is_empty();
+    block.edits.retain(|edit| keep(edit));
+    if had_edits && block.edits.is_empty() && block.base.realized.plain_text().is_empty() {
+        block.base.annotation.patch_surface = None;
+    }
+}
+
+fn append_footnote_body_edits(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    blocks: &mut Vec<DiffBlockEdit>,
+) {
+    let old_bodies = footnote_body_contents(old);
+    let new_bodies = footnote_body_contents(new);
+    if old_bodies.is_empty() || new_bodies.is_empty() {
+        return;
+    }
+
+    let mut used_new = HashSet::new();
+    for old_body in old_bodies {
+        let Some((new_index, new_body)) =
+            best_matching_footnote_body(&old_body, &new_bodies, &used_new)
+        else {
+            continue;
+        };
+        used_new.insert(new_index);
+        if old_body == *new_body {
+            continue;
+        }
+
+        let old_tokens = extract_words(&old_body);
+        let new_tokens = extract_words(new_body);
+        let word_ops = diff_words(&old_tokens, &new_tokens);
+        if !has_textual_word_change(&word_ops) {
+            continue;
+        }
+
+        let edit = RealizedEdit::WholeBlock(EditContent::Modified {
+            base: new_body.clone(),
+            word_ops,
+        });
+        let signatures = edit_modified_signatures(&edit);
+        if blocks
+            .iter()
+            .flat_map(|block| &block.edits)
+            .any(|existing| {
+                let existing_signatures = edit_modified_signatures(existing);
+                signatures
+                    .iter()
+                    .any(|signature| existing_signatures.contains(signature))
+            })
+        {
+            continue;
+        }
+
+        blocks.push(DiffBlockEdit {
+            base: annotated_block_from(new_body, None),
+            edits: vec![edit],
+            page_styles: Styles::new(),
+        });
+    }
+}
+
+fn best_matching_footnote_body<'a>(
+    old_body: &Content,
+    new_bodies: &'a [Content],
+    used_new: &HashSet<usize>,
+) -> Option<(usize, &'a Content)> {
+    new_bodies
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_new.contains(index))
+        .map(|(index, new_body)| {
+            (
+                index,
+                similarity(
+                    old_body.plain_text().as_str(),
+                    new_body.plain_text().as_str(),
+                ),
+                new_body,
+            )
+        })
+        .filter(|(_, score, _)| *score >= 0.3)
+        .max_by(|(_, left_score, _), (_, right_score, _)| left_score.total_cmp(right_score))
+        .map(|(index, _, body)| (index, body))
+}
+
+fn footnote_body_contents(root: &AnnotatedContent) -> Vec<Content> {
+    let mut out = Vec::new();
+    collect_footnote_body_contents(root, &mut out);
+    out
+}
+
+fn collect_footnote_body_contents(node: &AnnotatedContent, out: &mut Vec<Content>) {
+    if matches!(node.annotation.semantic_kind, Some(SemanticKind::Footnote))
+        && let Some(slot) = node
+            .annotation
+            .slots
+            .iter()
+            .find(|slot| matches!(slot.label, SlotStep::FootnoteBody))
+        && let Some(body) = node.get_path(&slot.path)
+    {
+        out.push(effective_content(body));
+    }
+    if let Some(footnote) = &node.annotation.footnote
+        && let Some(body) = footnote_body_content(&footnote.body)
+    {
+        out.push(body);
+    }
+    for child in &node.children {
+        collect_footnote_body_contents(child, out);
+    }
+}
+
+fn footnote_body_content(content: &Content) -> Option<Content> {
+    let footnote = content.to_packed::<FootnoteElem>()?;
+    let FootnoteBody::Content(body) = &footnote.body else {
+        return None;
+    };
+    Some(body.clone())
 }
 
 fn edit_modified_signatures(edit: &RealizedEdit) -> Vec<String> {
@@ -2007,7 +2217,11 @@ impl<'a> LayoutCursor<'a> {
         Self { blocks, index: 0 }
     }
 
-    fn take_before(&mut self, target: &Content) -> Vec<DiffBlockEdit> {
+    fn take_before(
+        &mut self,
+        target: &Content,
+        owner: Option<&AnnotatedContent>,
+    ) -> Vec<DiffBlockEdit> {
         let mut out = Vec::new();
         while let Some(block) = self.blocks.get(self.index) {
             self.index += 1;
@@ -2015,7 +2229,7 @@ impl<'a> LayoutCursor<'a> {
                 out.push(layout_block_edit(block));
                 continue;
             }
-            if layout_content_matches(&block.content, target) {
+            if layout_content_matches(&block.content, target, owner) {
                 break;
             }
         }
@@ -2034,6 +2248,68 @@ impl<'a> LayoutCursor<'a> {
     }
 }
 
+struct BlockOwnerClaim<'a> {
+    content: Content,
+    owner: Option<&'a AnnotatedContent>,
+}
+
+struct BlockOwnerCursor<'a> {
+    claims: Vec<BlockOwnerClaim<'a>>,
+    index: usize,
+}
+
+impl<'a> BlockOwnerCursor<'a> {
+    fn new(root: &'a AnnotatedContent) -> Self {
+        let mut claims = Vec::new();
+        collect_block_owner_claims(root, &mut claims);
+        Self { claims, index: 0 }
+    }
+
+    fn take_owner_for(&mut self, target: &Content) -> Option<&'a AnnotatedContent> {
+        let claim = self.claims.get(self.index)?;
+        self.index += 1;
+        if owned_block_matches(&claim.content, target) {
+            claim.owner
+        } else {
+            None
+        }
+    }
+}
+
+fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<BlockOwnerClaim<'a>>) {
+    let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
+    if blocks.len() == 1 {
+        let owner = (is_owned_diff_region(node) || has_equation_origins(node)).then_some(node);
+        if owner.is_some() || node.children.is_empty() {
+            out.push(BlockOwnerClaim {
+                content: blocks[0].content.clone(),
+                owner,
+            });
+            return;
+        }
+    }
+
+    if node.children.is_empty() {
+        out.extend(blocks.into_iter().map(|block| BlockOwnerClaim {
+            content: block.content,
+            owner: None,
+        }));
+    } else {
+        for child in &node.children {
+            collect_block_owner_claims(child, out);
+        }
+    }
+}
+
+fn is_owned_diff_region(node: &AnnotatedContent) -> bool {
+    !node.annotation.slots.is_empty()
+        && !matches!(node.annotation.semantic_kind, Some(SemanticKind::Footnote))
+}
+
+fn owned_block_matches(owner_block: &Content, target: &Content) -> bool {
+    owner_block == target || normalized_visible_text_matches(owner_block, target)
+}
+
 fn layout_block_edit(block: &DiffBlock) -> DiffBlockEdit {
     DiffBlockEdit {
         base: annotated_block_from(&block.content, None),
@@ -2042,13 +2318,42 @@ fn layout_block_edit(block: &DiffBlock) -> DiffBlockEdit {
     }
 }
 
-fn layout_content_matches(layout: &Content, target: &Content) -> bool {
+fn layout_content_matches(
+    layout: &Content,
+    target: &Content,
+    owner: Option<&AnnotatedContent>,
+) -> bool {
     if layout == target {
         return true;
     }
     let layout_text = layout.plain_text();
     let target_text = target.plain_text();
-    !layout_text.is_empty() && layout_text == target_text
+    if !layout_text.is_empty() && layout_text == target_text {
+        return true;
+    }
+
+    let Some(owner) = owner else {
+        return false;
+    };
+    let owner_surface = effective_content(owner);
+    if layout == &owner_surface {
+        return true;
+    }
+    normalized_visible_text_matches(layout, &owner_surface)
+}
+
+fn normalized_visible_text_matches(left: &Content, right: &Content) -> bool {
+    let left = normalized_visible_text(left);
+    let right = normalized_visible_text(right);
+    !left.is_empty() && left == right
+}
+
+fn normalized_visible_text(content: &Content) -> String {
+    content
+        .plain_text()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) -> AnnotatedContent {
@@ -2072,6 +2377,13 @@ fn find_annotated_child<'a>(
     exact
         .into_iter()
         .max_by_key(|node| node.annotation.slots.len())
+}
+
+fn find_nonempty_annotated_child<'a>(
+    root: &'a AnnotatedContent,
+    target: &Content,
+) -> Option<&'a AnnotatedContent> {
+    (!target.plain_text().is_empty()).then(|| find_annotated_child(root, target))?
 }
 
 fn collect_annotated_matches<'a>(
@@ -2123,6 +2435,13 @@ fn find_annotated_block_owner<'a>(
         return exact;
     }
     find_single_block_semantic_owner(root, target).or(exact)
+}
+
+fn find_nonempty_annotated_block_owner<'a>(
+    root: &'a AnnotatedContent,
+    target: &Content,
+) -> Option<&'a AnnotatedContent> {
+    (!target.plain_text().is_empty()).then(|| find_annotated_block_owner(root, target))?
 }
 
 fn find_unique_changed_slot_pair<'a>(
@@ -2295,6 +2614,27 @@ fn collapse_single_modified_container(
             base: base.clone(),
             word_ops: word_ops.clone(),
         }
+    })
+}
+
+fn owned_surface_modified_edit(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+) -> Option<RealizedEdit> {
+    let old_effective = effective_content(old_ann);
+    let new_effective = effective_content(new_ann);
+    if old_effective == new_effective {
+        return None;
+    }
+
+    let old_tokens = extract_words(&old_effective);
+    let new_tokens = extract_words(&new_effective);
+    let word_ops = diff_words(&old_tokens, &new_tokens);
+    has_textual_word_change(&word_ops).then(|| {
+        RealizedEdit::WholeBlock(EditContent::Modified {
+            base: new_effective,
+            word_ops,
+        })
     })
 }
 
@@ -3509,9 +3849,11 @@ mod tests {
         let tokens = extract_words(&TextElem::packed("Hello, café 世界!"));
         let texts: Vec<_> = tokens.iter().map(|token| token.text.as_str()).collect();
 
-        assert!(texts.contains(&"Hello,"));
+        assert!(texts.contains(&"Hello"));
+        assert!(texts.contains(&","));
         assert!(texts.contains(&"café"));
-        assert!(texts.contains(&"世界!"));
+        assert!(texts.contains(&"世界"));
+        assert!(texts.contains(&"!"));
     }
 
     #[test]
