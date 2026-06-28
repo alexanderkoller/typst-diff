@@ -157,24 +157,24 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     // Root-level mismatch: pre is a bare SequenceElem but realized has been
     // wrapped with root page styles (StyledElem → SequenceElem). Peel the
     // wrapper and recurse with the same pre so the inner SequenceElem matches.
-    if pre.to_packed::<SequenceElem>().is_some() {
-        if let Some(styled) = realized.to_packed::<StyledElem>() {
-            let inner = annotate_realized(pre, &styled.child);
-            let patch_surface = inner
-                .annotation
-                .patch_surface
-                .clone()
-                .map(|surface| surface.styled_with_map(styled.styles.clone()));
-            return AnnotatedContent {
-                realized: realized.clone(),
-                annotation: Annotation {
-                    patch_surface: patch_surface.filter(|surface| surface != realized),
-                    span: pre.span(),
-                    ..Annotation::default()
-                },
-                children: inner.children,
-            };
-        }
+    if pre.to_packed::<SequenceElem>().is_some()
+        && let Some(styled) = realized.to_packed::<StyledElem>()
+    {
+        let inner = annotate_realized(pre, &styled.child);
+        let patch_surface = inner
+            .annotation
+            .patch_surface
+            .clone()
+            .map(|surface| surface.styled_with_map(styled.styles.clone()));
+        return AnnotatedContent {
+            realized: realized.clone(),
+            annotation: Annotation {
+                patch_surface: patch_surface.filter(|surface| surface != realized),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+            children: inner.children,
+        };
     }
 
     // --- Structural elements: semantic_kind + slot map ---

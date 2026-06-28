@@ -275,7 +275,7 @@ impl ContainerOps for TermsOps {
             .to_packed_mut::<TermsElem>()?
             .children
             .get_mut(index / 2)?;
-        if index % 2 == 0 {
+        if index & 1 == 0 {
             item.term = replacement;
         } else {
             item.description = replacement;

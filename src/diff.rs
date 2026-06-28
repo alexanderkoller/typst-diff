@@ -1883,13 +1883,12 @@ fn authored_align_wrapper(source: &str) -> Option<RenderedRegionWrapper> {
             rest = after;
             continue;
         }
-        if let Some(alignment) = parse_align_call_alignment(after) {
-            if found
+        if let Some(alignment) = parse_align_call_alignment(after)
+            && found
                 .replace(RenderedRegionWrapper::Align(alignment))
                 .is_some()
-            {
-                return None;
-            }
+        {
+            return None;
         }
         rest = after;
     }
@@ -2155,7 +2154,7 @@ fn find_unique_changed_slot_pair<'a>(
     pair
 }
 
-fn slot_bearing_nodes<'a>(root: &'a AnnotatedContent) -> Vec<&'a AnnotatedContent> {
+fn slot_bearing_nodes(root: &AnnotatedContent) -> Vec<&AnnotatedContent> {
     let mut out = Vec::new();
     collect_slot_bearing_nodes(root, &mut out);
     out
@@ -2218,9 +2217,7 @@ fn find_slot_bearing_descendant_pair<'a>(
     })
 }
 
-fn slot_bearing_descendants<'a>(
-    node: &'a AnnotatedContent,
-) -> Vec<(Vec<usize>, &'a AnnotatedContent)> {
+fn slot_bearing_descendants(node: &AnnotatedContent) -> Vec<(Vec<usize>, &AnnotatedContent)> {
     let mut out = Vec::new();
     for (index, child) in node.children.iter().enumerate() {
         let mut path = vec![index];
@@ -2330,7 +2327,7 @@ fn semantic_edit_claim_key(node: &AnnotatedContent) -> String {
     )
 }
 
-fn resolved_slots<'a>(node: &'a AnnotatedContent) -> Vec<(&'a SemanticSlot, &'a AnnotatedContent)> {
+fn resolved_slots(node: &AnnotatedContent) -> Vec<(&SemanticSlot, &AnnotatedContent)> {
     node.annotation
         .slots
         .iter()
@@ -2439,13 +2436,13 @@ fn diff_slot_edits_lcs(
                 for i in 0..len {
                     let old_child = old_slots[old_index + i].1;
                     let new_child = new_slots[new_index + i].1;
-                    if !annotated_subtree_equal(old_child, new_child) {
-                        if let Some(content) = recursive_slot_edit_content(old_child, new_child) {
-                            edits.push(RealizedEdit::ReplaceAt {
-                                path: new_slots[new_index + i].0.path.clone(),
-                                content,
-                            });
-                        }
+                    if !annotated_subtree_equal(old_child, new_child)
+                        && let Some(content) = recursive_slot_edit_content(old_child, new_child)
+                    {
+                        edits.push(RealizedEdit::ReplaceAt {
+                            path: new_slots[new_index + i].0.path.clone(),
+                            content,
+                        });
                     }
                 }
             }
