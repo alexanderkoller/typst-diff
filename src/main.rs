@@ -49,50 +49,103 @@ fn main() -> Result<()> {
     let new_world = world::SystemWorld::new(&inputs.new)
         .with_context(|| format!("failed to load new document {:?}", inputs.new))?;
 
+    if args.debug {
+        run_with_debug(&args, &inputs, &old_world, &new_world)
+    } else {
+        run_normal(&args, &old_world, &new_world)
+    }
+}
+
+fn run_normal(
+    args: &Args,
+    old_world: &world::SystemWorld,
+    new_world: &world::SystemWorld,
+) -> Result<()> {
     eprintln!("Evaluating old document...");
-    let old_eval = eval::eval_with_debug(&old_world).context("failed to evaluate old document")?;
+    let old_content =
+        eval::eval_to_realized_content(old_world).context("failed to evaluate old document")?;
 
     eprintln!("Evaluating new document...");
-    let new_eval = eval::eval_with_debug(&new_world).context("failed to evaluate new document")?;
+    let new_content =
+        eval::eval_to_realized_content(new_world).context("failed to evaluate new document")?;
 
     eprintln!("Diffing...");
-    let (diff_result, block_debug) = diff::diff_annotated_with_rendered_regions_and_debug(
+    let diff_result = diff::diff_annotated_with_rendered_regions(
+        &old_content,
+        &new_content,
+        old_world,
+        new_world,
+    )?;
+
+    eprintln!("Annotating...");
+    let annotated =
+        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
+
+    write_log_and_pdf(args, new_world, &diff_result, &annotated)
+}
+
+fn run_with_debug(
+    args: &Args,
+    inputs: &ResolvedInputs,
+    old_world: &world::SystemWorld,
+    new_world: &world::SystemWorld,
+) -> Result<()> {
+    eprintln!("Evaluating old document...");
+    let old_eval = eval::eval_with_debug(old_world).context("failed to evaluate old document")?;
+
+    eprintln!("Evaluating new document...");
+    let new_eval = eval::eval_with_debug(new_world).context("failed to evaluate new document")?;
+
+    let debug_dir = debug::default_debug_dir(&args.output);
+
+    eprintln!("Diffing...");
+    let mut debug_events = debug::JsonlDebugEventWriter::create(&debug_dir)?;
+    let (diff_result, block_debug) = diff::diff_annotated_with_rendered_regions_and_debug_events(
         &old_eval.annotated,
         &new_eval.annotated,
-        &old_world,
-        &new_world,
+        old_world,
+        new_world,
+        &mut debug_events,
     )?;
+    debug_events.finish()?;
+
+    eprintln!("Annotating...");
+    let annotated =
+        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
+
+    eprintln!("Writing debug bundle to {}...", debug_dir.display());
+    let build_line = build_info::build_report_line();
+    debug::write_debug_bundle(&debug::DebugBundle {
+        build_line: &build_line,
+        args: debug_args(args),
+        old_input: &inputs.old,
+        new_input: &inputs.new,
+        output: &args.output,
+        debug_dir: &debug_dir,
+        old_eval: &old_eval,
+        new_eval: &new_eval,
+        block_debug: &block_debug,
+        diff_result: &diff_result,
+        annotated_output: &annotated,
+    })?;
+
+    write_log_and_pdf(args, new_world, &diff_result, &annotated)
+}
+
+fn write_log_and_pdf(
+    args: &Args,
+    new_world: &world::SystemWorld,
+    diff_result: &diff::DiffResult,
+    annotated: &typst::foundations::Content,
+) -> Result<()> {
     if let Some(path) = &args.log_modifications {
         std::fs::write(path, diff_result.modification_log())
             .with_context(|| format!("failed to write modification log {:?}", path))?;
         eprintln!("Wrote modification log to {}", path.display());
     }
 
-    eprintln!("Annotating...");
-    let annotated =
-        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
-
-    let debug_dir = args.debug.then(|| debug::default_debug_dir(&args.output));
-    if let Some(debug_dir) = &debug_dir {
-        eprintln!("Writing debug bundle to {}...", debug_dir.display());
-        let build_line = build_info::build_report_line();
-        debug::write_debug_bundle(&debug::DebugBundle {
-            build_line: &build_line,
-            args: debug_args(&args),
-            old_input: &inputs.old,
-            new_input: &inputs.new,
-            output: &args.output,
-            debug_dir,
-            old_eval: &old_eval,
-            new_eval: &new_eval,
-            block_debug: &block_debug,
-            diff_result: &diff_result,
-            annotated_output: &annotated,
-        })?;
-    }
-
     eprintln!("Rendering to PDF...");
-    let pdf_bytes = render_to_pdf(&annotated, &new_world).context("failed to render PDF")?;
+    let pdf_bytes = render_to_pdf(annotated, new_world).context("failed to render PDF")?;
 
     std::fs::write(&args.output, &pdf_bytes)
         .with_context(|| format!("failed to write {:?}", args.output))?;

@@ -990,6 +990,7 @@ fn cli_writes_debug_bundle_when_requested() {
     for rel in yaml_files {
         assert_yaml_file(&debug_dir.join(rel));
     }
+    assert_jsonl_file(&debug_dir.join("diff/rendered-region-frame-traces.jsonl"));
 
     let manifest = std::fs::read_to_string(debug_dir.join("manifest.yml")).unwrap();
     assert!(manifest.contains("schema_version: 1"), "{manifest}");
@@ -1009,6 +1010,76 @@ fn cli_writes_debug_bundle_when_requested() {
     let standalone_log = std::fs::read_to_string(log_path).unwrap();
     let debug_log = std::fs::read_to_string(debug_dir.join("output/modification-log.txt")).unwrap();
     assert_eq!(debug_log, standalone_log);
+}
+
+#[test]
+fn cli_debug_records_rendered_region_frame_trace_events() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pdf_path = dir.path().join("headers.pdf");
+    let debug_dir = pdf_path.with_extension("debug");
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .arg(corpus("43-alternating-headers/old.typ"))
+        .arg(corpus("43-alternating-headers/new.typ"))
+        .args(["-o"])
+        .arg(&pdf_path)
+        .arg("--debug")
+        .output()
+        .unwrap();
+
+    assert_command_success(cli, "typst-diff --debug rendered-region trace");
+    assert_valid_pdf(&std::fs::read(&pdf_path).unwrap());
+    let trace_path = debug_dir.join("diff/rendered-region-frame-traces.jsonl");
+    assert_jsonl_file(&trace_path);
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert!(trace.contains(r#""region_kind":"header""#), "{trace}");
+    assert!(trace.contains(r#""side":"new""#), "{trace}");
+    assert!(trace.contains(r#""text":"Final Version""#), "{trace}");
+    assert!(trace.contains(r#""text":"New Report""#), "{trace}");
+    assert!(trace.contains(r#""tag_element":"artifact""#), "{trace}");
+    assert!(trace.contains(r#""tag_element":"context""#), "{trace}");
+    assert!(trace.contains(r#""tag_element":"emph""#), "{trace}");
+    assert!(trace.contains(r#""artifact_depth_before":"#), "{trace}");
+    assert!(trace.contains(r#""artifact_depth_after":"#), "{trace}");
+    assert!(trace.contains(r#""included":true"#), "{trace}");
+}
+
+#[test]
+fn rendered_region_debug_events_do_not_change_diff_result() {
+    struct CountingSink {
+        events: usize,
+    }
+
+    impl typst_diff::diff::DebugEventSink for CountingSink {
+        fn rendered_region_trace_event(
+            &mut self,
+            _event: &typst_diff::diff::FrameTraceEvent,
+        ) -> anyhow::Result<()> {
+            self.events += 1;
+            Ok(())
+        }
+    }
+
+    let old_world = corpus_world("43-alternating-headers/old.typ");
+    let new_world = corpus_world("43-alternating-headers/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+
+    let normal =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+    let mut sink = CountingSink { events: 0 };
+    let (with_debug, _) = typst_diff::diff::diff_annotated_with_rendered_regions_and_debug_events(
+        &old, &new, &old_world, &new_world, &mut sink,
+    )
+    .unwrap();
+
+    assert!(
+        sink.events > 0,
+        "expected debug sink to observe frame events"
+    );
+    assert_eq!(normal.modification_log(), with_debug.modification_log());
 }
 
 #[test]
@@ -1082,6 +1153,26 @@ fn assert_yaml_file(path: &std::path::Path) {
             path.display()
         );
     });
+}
+
+fn assert_jsonl_file(path: &std::path::Path) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("failed to read JSONL file {}: {err}", path.display());
+    });
+    assert!(
+        !text.trim().is_empty(),
+        "JSONL file is empty: {}",
+        path.display()
+    );
+    for (line_index, line) in text.lines().enumerate() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|err| {
+            panic!(
+                "failed to parse JSONL file {} line {}: {err}\n{line}",
+                path.display(),
+                line_index + 1
+            );
+        });
+    }
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) {

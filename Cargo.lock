@@ -2619,6 +2619,7 @@ dependencies = [
  "anyhow",
  "clap",
  "serde",
+ "serde_json",
  "serde_yaml",
  "similar",
  "tempfile",

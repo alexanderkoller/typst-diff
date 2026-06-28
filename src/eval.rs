@@ -134,7 +134,8 @@ impl World for SnippetWorld {
 /// The returned `AnnotatedContent` wraps the realized `Content` with semantic
 /// annotations built by walking the pre- and post-realization trees together.
 pub fn eval_to_realized_content(world: &dyn World) -> Result<crate::annotated::AnnotatedContent> {
-    Ok(eval_with_debug(world)?.annotated)
+    let pre_content = normalize_list_item_runs(eval_to_content(world)?);
+    Ok(realize_and_annotate(world, &pre_content)?)
 }
 
 /// Intermediate results from the realized evaluation pipeline.
@@ -148,18 +149,26 @@ pub struct EvalDebug {
 pub fn eval_with_debug(world: &dyn World) -> Result<EvalDebug> {
     let raw = eval_to_content(world)?;
     let normalized = normalize_list_item_runs(raw.clone());
-    let introspector = layout_introspector(world, &normalized)?;
-    let realized_content = realize_to_content(world, &normalized, introspector)?;
-    let mut annotated = crate::annotated::annotate_realized(&normalized, &realized_content);
-    crate::annotated::annotate_equation_origins(&normalized, &mut annotated);
-    let footnotes = collect_footnotes(&normalized);
-    let mut next = 0;
-    crate::annotated::annotate_footnote_markers(&mut annotated, &footnotes, &mut next);
+    let annotated = realize_and_annotate(world, &normalized)?;
     Ok(EvalDebug {
         raw,
         normalized,
         annotated,
     })
+}
+
+fn realize_and_annotate(
+    world: &dyn World,
+    pre_content: &Content,
+) -> Result<crate::annotated::AnnotatedContent> {
+    let introspector = layout_introspector(world, pre_content)?;
+    let realized_content = realize_to_content(world, pre_content, introspector)?;
+    let mut annotated = crate::annotated::annotate_realized(pre_content, &realized_content);
+    crate::annotated::annotate_equation_origins(pre_content, &mut annotated);
+    let footnotes = collect_footnotes(pre_content);
+    let mut next = 0;
+    crate::annotated::annotate_footnote_markers(&mut annotated, &footnotes, &mut next);
+    Ok(annotated)
 }
 
 /// Layout content to a finished paged document using Typst's normal convergence loop.

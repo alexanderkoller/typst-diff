@@ -1227,7 +1227,8 @@ struct PreparedDiffInputs {
     new_layout_blocks: Vec<DiffBlock>,
     old_realized_blocks: Vec<DiffBlock>,
     new_realized_blocks: Vec<DiffBlock>,
-    debug: DiffBlockDebug,
+    matched_ops: Vec<BlockOp>,
+    debug: Option<DiffBlockDebug>,
 }
 
 pub struct DiffRegionEdit {
@@ -1263,6 +1264,76 @@ pub struct RenderedRegionPageEdit {
     pub base: Content,
     pub word_ops: Vec<WordOp>,
     pub changed: bool,
+}
+
+pub trait DebugEventSink {
+    fn rendered_region_trace_start(
+        &mut self,
+        _trace: &RenderedRegionTraceStart,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn rendered_region_trace_event(&mut self, _event: &FrameTraceEvent) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn rendered_region_trace_end(&mut self, _trace: &RenderedRegionTraceEnd) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct RenderedRegionTraceStart {
+    pub trace_id: String,
+    pub side: String,
+    pub kind: PageRegionKind,
+    pub page: usize,
+    pub page_width_pt: f64,
+    pub page_height_pt: f64,
+    pub semantic_region_exists: bool,
+}
+
+#[derive(Clone)]
+pub struct RenderedRegionTraceEnd {
+    pub trace_id: String,
+    pub side: String,
+    pub kind: PageRegionKind,
+    pub page: usize,
+    pub extracted_text: String,
+    pub event_count: usize,
+}
+
+#[derive(Clone)]
+pub struct FrameTraceEvent {
+    pub trace_id: String,
+    pub side: String,
+    pub kind: PageRegionKind,
+    pub page: usize,
+    pub event_index: usize,
+    pub frame_path: Vec<usize>,
+    pub group_depth: usize,
+    pub local_x_pt: f64,
+    pub local_y_pt: f64,
+    pub absolute_x_pt: f64,
+    pub absolute_y_pt: f64,
+    pub item_kind: &'static str,
+    pub text: Option<String>,
+    pub text_len: Option<usize>,
+    pub tag_direction: Option<&'static str>,
+    pub tag_element: Option<String>,
+    pub artifact_depth_before: usize,
+    pub artifact_depth_after: usize,
+    pub changed_artifact_state: bool,
+    pub in_region_band: Option<bool>,
+    pub included: Option<bool>,
+    pub excluded_reason: Option<&'static str>,
+    pub group_origin_before_x_pt: Option<f64>,
+    pub group_origin_before_y_pt: Option<f64>,
+    pub group_origin_after_x_pt: Option<f64>,
+    pub group_origin_after_y_pt: Option<f64>,
+    pub group_offset_x_pt: Option<f64>,
+    pub group_offset_y_pt: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1421,7 +1492,11 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
     }
 }
 
-fn prepare_diff_inputs(old: &AnnotatedContent, new: &AnnotatedContent) -> PreparedDiffInputs {
+fn prepare_diff_inputs(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    capture_debug: bool,
+) -> PreparedDiffInputs {
     let new_surface = effective_content(new);
     let new_layout_blocks = extract_block_units(&new_surface);
     let old_realized_blocks = extract_block_units(&old.realized);
@@ -1429,29 +1504,45 @@ fn prepare_diff_inputs(old: &AnnotatedContent, new: &AnnotatedContent) -> Prepar
     let old_blocks = non_parbreak_blocks(&old_realized_blocks);
     let new_blocks = non_parbreak_blocks(&new_realized_blocks);
     let raw = diff_block_units_raw(&old_blocks, &new_blocks);
-    let matched = match_edit_zones(raw.clone());
+    let (matched, debug) = if capture_debug {
+        let matched = match_edit_zones(raw.clone());
+        let debug = DiffBlockDebug {
+            old_blocks,
+            new_blocks,
+            raw_ops: raw,
+            matched_ops: matched.clone(),
+        };
+        (matched, Some(debug))
+    } else {
+        (match_edit_zones(raw), None)
+    };
     PreparedDiffInputs {
         new_layout_blocks,
         old_realized_blocks,
         new_realized_blocks,
-        debug: DiffBlockDebug {
-            old_blocks,
-            new_blocks,
-            raw_ops: raw,
-            matched_ops: matched,
-        },
+        matched_ops: matched,
+        debug,
     }
 }
 
 pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
-    diff_annotated_with_block_debug(old, new).0
+    diff_annotated_inner(old, new, false).0
 }
 
 pub fn diff_annotated_with_block_debug(
     old: &AnnotatedContent,
     new: &AnnotatedContent,
 ) -> (DiffResult, DiffBlockDebug) {
-    let prepared = prepare_diff_inputs(old, new);
+    let (result, debug) = diff_annotated_inner(old, new, true);
+    (result, debug.expect("debug capture requested"))
+}
+
+fn diff_annotated_inner(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    capture_debug: bool,
+) -> (DiffResult, Option<DiffBlockDebug>) {
+    let prepared = prepare_diff_inputs(old, new, capture_debug);
     let old_region_styles = document_page_styles_raw(&old.realized, &prepared.old_realized_blocks);
     let new_region_styles = document_page_styles_raw(&new.realized, &prepared.new_realized_blocks);
     let regions = diff_root_page_regions(&old_region_styles, &new_region_styles);
@@ -1462,7 +1553,7 @@ pub fn diff_annotated_with_block_debug(
     let mut new_owners = BlockOwnerCursor::new(new);
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
-    for op in prepared.debug.matched_ops.clone() {
+    for op in prepared.matched_ops {
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
@@ -1905,7 +1996,7 @@ pub fn diff_annotated_with_rendered_regions(
     old_world: &dyn World,
     new_world: &dyn World,
 ) -> anyhow::Result<DiffResult> {
-    Ok(diff_annotated_with_rendered_regions_and_debug(old, new, old_world, new_world)?.0)
+    Ok(diff_annotated_with_rendered_regions_inner(old, new, old_world, new_world, None, false)?.0)
 }
 
 pub fn diff_annotated_with_rendered_regions_and_debug(
@@ -1914,7 +2005,38 @@ pub fn diff_annotated_with_rendered_regions_and_debug(
     old_world: &dyn World,
     new_world: &dyn World,
 ) -> anyhow::Result<(DiffResult, DiffBlockDebug)> {
-    let (mut result, debug) = diff_annotated_with_block_debug(old, new);
+    let (result, debug) =
+        diff_annotated_with_rendered_regions_inner(old, new, old_world, new_world, None, true)?;
+    Ok((result, debug.expect("debug capture requested")))
+}
+
+pub fn diff_annotated_with_rendered_regions_and_debug_events(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    old_world: &dyn World,
+    new_world: &dyn World,
+    debug_events: &mut dyn DebugEventSink,
+) -> anyhow::Result<(DiffResult, DiffBlockDebug)> {
+    let (result, debug) = diff_annotated_with_rendered_regions_inner(
+        old,
+        new,
+        old_world,
+        new_world,
+        Some(debug_events),
+        true,
+    )?;
+    Ok((result, debug.expect("debug capture requested")))
+}
+
+fn diff_annotated_with_rendered_regions_inner(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    old_world: &dyn World,
+    new_world: &dyn World,
+    debug_events: Option<&mut dyn DebugEventSink>,
+    capture_debug: bool,
+) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
+    let (mut result, debug) = diff_annotated_inner(old, new, capture_debug);
     let old_source = crate::eval::eval_to_content(old_world)?;
     let new_source = crate::eval::eval_to_content(new_world)?;
     let old_doc = crate::eval::layout_document(old_world, &old_source)?;
@@ -1931,7 +2053,8 @@ pub fn diff_annotated_with_rendered_regions_and_debug(
         &new_doc,
         new_world,
         &result.regions,
-    );
+        debug_events,
+    )?;
     Ok((result, debug))
 }
 
@@ -2046,24 +2169,31 @@ fn diff_rendered_root_page_regions(
     new_doc: &PagedDocument,
     new_world: &dyn World,
     semantic_regions: &[DiffRegionEdit],
-) -> Vec<RenderedRegionEdit> {
-    [
+    mut debug_events: Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<Vec<RenderedRegionEdit>> {
+    let mut rendered_regions = Vec::new();
+
+    for kind in [
         PageRegionKind::Header,
         PageRegionKind::Footer,
         PageRegionKind::Background,
         PageRegionKind::Foreground,
     ]
     .into_iter()
-    .filter(|kind| {
-        !semantic_regions
+    {
+        if semantic_regions
             .iter()
-            .any(|region| region.path == RegionPath::RootPage(*kind))
-    })
-    .filter_map(|kind| {
+            .any(|region| region.path == RegionPath::RootPage(kind))
+        {
+            continue;
+        }
         let old_content = page_region_content(old_styles, kind);
         let new_content = page_region_content(new_styles, kind);
+        if old_content.is_none() && new_content.is_none() {
+            continue;
+        }
         if old_content != new_content {
-            return None;
+            continue;
         }
         let wrapper = new_content
             .as_ref()
@@ -2071,11 +2201,14 @@ fn diff_rendered_root_page_regions(
             .as_ref()
             .map(|content| rendered_region_wrapper(new_world, content))
             .unwrap_or_default();
-        let old_pages = rendered_region_texts(old_styles, old_doc, kind);
-        let new_pages = rendered_region_texts(new_styles, new_doc, kind);
-        diff_rendered_region_texts(kind, wrapper, &old_pages, &new_pages)
-    })
-    .collect()
+        let old_pages = rendered_region_texts("old", old_styles, old_doc, kind, &mut debug_events)?;
+        let new_pages = rendered_region_texts("new", new_styles, new_doc, kind, &mut debug_events)?;
+        if let Some(region) = diff_rendered_region_texts(kind, wrapper, &old_pages, &new_pages) {
+            rendered_regions.push(region);
+        }
+    }
+
+    Ok(rendered_regions)
 }
 
 fn diff_rendered_region_texts(
@@ -2171,69 +2304,503 @@ fn parse_align_call_alignment(after_align: &str) -> Option<RenderedRegionAlignme
 }
 
 fn rendered_region_texts(
+    side: &str,
     styles: &Styles,
     document: &PagedDocument,
     kind: PageRegionKind,
-) -> Vec<String> {
-    if page_region_content(styles, kind).is_none() {
-        return vec![];
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<Vec<String>> {
+    let semantic_region_exists = page_region_content(styles, kind).is_some();
+    let mut out = Vec::new();
+    for (index, page) in document.pages.iter().enumerate() {
+        out.push(rendered_region_text(
+            side,
+            index + 1,
+            &page.frame,
+            kind,
+            semantic_region_exists,
+            debug_events,
+        )?);
     }
-    document
-        .pages
-        .iter()
-        .map(|page| rendered_region_text(&page.frame, kind))
-        .collect()
+    Ok(out)
 }
 
-fn rendered_region_text(page_frame: &Frame, kind: PageRegionKind) -> String {
+fn rendered_region_text(
+    side: &str,
+    page: usize,
+    page_frame: &Frame,
+    kind: PageRegionKind,
+    semantic_region_exists: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<String> {
+    let trace_id = debug_events
+        .is_some()
+        .then(|| frame_trace_id(side, kind, page));
+    if let Some(sink) = debug_events.as_deref_mut() {
+        sink.rendered_region_trace_start(&RenderedRegionTraceStart {
+            trace_id: trace_id.clone().unwrap(),
+            side: side.to_string(),
+            kind,
+            page,
+            page_width_pt: page_frame.width().to_pt(),
+            page_height_pt: page_frame.height().to_pt(),
+            semantic_region_exists,
+        })?;
+    }
     let mut text = String::new();
-    collect_positioned_region_text(
+    let mut event_index = 0;
+    collect_positioned_region_trace(
+        trace_id.as_deref(),
+        side,
+        page,
         page_frame,
         Point::zero(),
         page_frame.height().to_pt(),
         kind,
         0,
+        0,
+        &mut Vec::new(),
         &mut text,
-    );
-    text
+        &mut event_index,
+        debug_events,
+    )?;
+    if let Some(sink) = debug_events.as_deref_mut() {
+        sink.rendered_region_trace_end(&RenderedRegionTraceEnd {
+            trace_id: trace_id.unwrap(),
+            side: side.to_string(),
+            kind,
+            page,
+            extracted_text: text.clone(),
+            event_count: event_index,
+        })?;
+    }
+    Ok(text)
 }
 
-fn collect_positioned_region_text(
+fn collect_positioned_region_trace(
+    trace_id: Option<&str>,
+    side: &str,
+    page: usize,
     frame: &Frame,
     origin: Point,
     page_height_pt: f64,
     kind: PageRegionKind,
     mut artifact_depth: usize,
+    group_depth: usize,
+    frame_path: &mut Vec<usize>,
     out: &mut String,
-) {
-    for (pos, item) in frame.items() {
+    event_index: &mut usize,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<()> {
+    let tracing = debug_events.is_some();
+    for (item_index, (pos, item)) in frame.items().enumerate() {
+        if tracing {
+            frame_path.push(item_index);
+        }
         let absolute = origin + *pos;
         match item {
             FrameItem::Tag(Tag::Start(content, _)) if content.elem().name() == "artifact" => {
+                let before = artifact_depth;
                 artifact_depth += 1;
+                emit_frame_trace_event(
+                    debug_events,
+                    trace_id,
+                    side,
+                    kind,
+                    page,
+                    event_index,
+                    frame_path,
+                    group_depth,
+                    *pos,
+                    absolute,
+                    "tag_start",
+                    None,
+                    None,
+                    Some("start"),
+                    Some(content.elem().name()),
+                    before,
+                    artifact_depth,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
             }
             FrameItem::Tag(Tag::End(_, _, _)) if artifact_depth > 0 => {
+                let before = artifact_depth;
                 artifact_depth -= 1;
+                emit_frame_trace_event(
+                    debug_events,
+                    trace_id,
+                    side,
+                    kind,
+                    page,
+                    event_index,
+                    frame_path,
+                    group_depth,
+                    *pos,
+                    absolute,
+                    "tag_end",
+                    None,
+                    None,
+                    Some("end"),
+                    None,
+                    before,
+                    artifact_depth,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
             }
+            FrameItem::Tag(Tag::Start(content, _)) => emit_frame_trace_event(
+                debug_events,
+                trace_id,
+                side,
+                kind,
+                page,
+                event_index,
+                frame_path,
+                group_depth,
+                *pos,
+                absolute,
+                "tag_start",
+                None,
+                None,
+                Some("start"),
+                Some(content.elem().name()),
+                artifact_depth,
+                artifact_depth,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?,
+            FrameItem::Tag(Tag::End(_, _, _)) => emit_frame_trace_event(
+                debug_events,
+                trace_id,
+                side,
+                kind,
+                page,
+                event_index,
+                frame_path,
+                group_depth,
+                *pos,
+                absolute,
+                "tag_end",
+                None,
+                None,
+                Some("end"),
+                None,
+                artifact_depth,
+                artifact_depth,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?,
             FrameItem::Text(text) => {
-                if artifact_depth > 0 && point_belongs_to_region(absolute, page_height_pt, kind) {
+                let in_region_band = point_belongs_to_region(absolute, page_height_pt, kind);
+                let included = artifact_depth > 0 && in_region_band;
+                let excluded_reason = if included {
+                    None
+                } else if artifact_depth == 0 {
+                    Some("not_artifact")
+                } else {
+                    Some("outside_region")
+                };
+                if included {
                     out.push_str(text.text.as_str());
                 }
+                emit_frame_trace_event(
+                    debug_events,
+                    trace_id,
+                    side,
+                    kind,
+                    page,
+                    event_index,
+                    frame_path,
+                    group_depth,
+                    *pos,
+                    absolute,
+                    "text",
+                    Some(text.text.as_str()),
+                    Some(text.text.chars().count()),
+                    None,
+                    None,
+                    artifact_depth,
+                    artifact_depth,
+                    false,
+                    Some(in_region_band),
+                    Some(included),
+                    excluded_reason,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
             }
-            FrameItem::Group(group) => collect_positioned_region_text(
-                &group.frame,
-                absolute,
-                page_height_pt,
+            FrameItem::Group(group) => {
+                emit_frame_trace_event(
+                    debug_events,
+                    trace_id,
+                    side,
+                    kind,
+                    page,
+                    event_index,
+                    frame_path,
+                    group_depth,
+                    *pos,
+                    absolute,
+                    "group_start",
+                    None,
+                    None,
+                    None,
+                    None,
+                    artifact_depth,
+                    artifact_depth,
+                    false,
+                    None,
+                    None,
+                    None,
+                    Some(origin.x.to_pt()),
+                    Some(origin.y.to_pt()),
+                    Some(absolute.x.to_pt()),
+                    Some(absolute.y.to_pt()),
+                    Some(pos.x.to_pt()),
+                    Some(pos.y.to_pt()),
+                )?;
+                collect_positioned_region_trace(
+                    trace_id,
+                    side,
+                    page,
+                    &group.frame,
+                    absolute,
+                    page_height_pt,
+                    kind,
+                    artifact_depth,
+                    group_depth + 1,
+                    frame_path,
+                    out,
+                    event_index,
+                    debug_events,
+                )?;
+                emit_frame_trace_event(
+                    debug_events,
+                    trace_id,
+                    side,
+                    kind,
+                    page,
+                    event_index,
+                    frame_path,
+                    group_depth,
+                    *pos,
+                    absolute,
+                    "group_end",
+                    None,
+                    None,
+                    None,
+                    None,
+                    artifact_depth,
+                    artifact_depth,
+                    false,
+                    None,
+                    None,
+                    None,
+                    Some(absolute.x.to_pt()),
+                    Some(absolute.y.to_pt()),
+                    Some(origin.x.to_pt()),
+                    Some(origin.y.to_pt()),
+                    Some(pos.x.to_pt()),
+                    Some(pos.y.to_pt()),
+                )?;
+            }
+            FrameItem::Shape(_, _) => emit_frame_trace_event(
+                debug_events,
+                trace_id,
+                side,
                 kind,
+                page,
+                event_index,
+                frame_path,
+                group_depth,
+                *pos,
+                absolute,
+                "shape",
+                None,
+                None,
+                None,
+                None,
                 artifact_depth,
-                out,
-            ),
-            FrameItem::Shape(_, _)
-            | FrameItem::Image(_, _, _)
-            | FrameItem::Link(_, _)
-            | FrameItem::Tag(_) => {}
+                artifact_depth,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?,
+            FrameItem::Image(_, _, _) => emit_frame_trace_event(
+                debug_events,
+                trace_id,
+                side,
+                kind,
+                page,
+                event_index,
+                frame_path,
+                group_depth,
+                *pos,
+                absolute,
+                "image",
+                None,
+                None,
+                None,
+                None,
+                artifact_depth,
+                artifact_depth,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?,
+            FrameItem::Link(_, _) => emit_frame_trace_event(
+                debug_events,
+                trace_id,
+                side,
+                kind,
+                page,
+                event_index,
+                frame_path,
+                group_depth,
+                *pos,
+                absolute,
+                "link",
+                None,
+                None,
+                None,
+                None,
+                artifact_depth,
+                artifact_depth,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?,
+        }
+        if tracing {
+            frame_path.pop();
         }
     }
+    Ok(())
+}
+
+fn emit_frame_trace_event(
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+    trace_id: Option<&str>,
+    side: &str,
+    kind: PageRegionKind,
+    page: usize,
+    event_index: &mut usize,
+    frame_path: &[usize],
+    group_depth: usize,
+    local: Point,
+    absolute: Point,
+    item_kind: &'static str,
+    text: Option<&str>,
+    text_len: Option<usize>,
+    tag_direction: Option<&'static str>,
+    tag_element: Option<&str>,
+    artifact_depth_before: usize,
+    artifact_depth_after: usize,
+    changed_artifact_state: bool,
+    in_region_band: Option<bool>,
+    included: Option<bool>,
+    excluded_reason: Option<&'static str>,
+    group_origin_before_x_pt: Option<f64>,
+    group_origin_before_y_pt: Option<f64>,
+    group_origin_after_x_pt: Option<f64>,
+    group_origin_after_y_pt: Option<f64>,
+    group_offset_x_pt: Option<f64>,
+    group_offset_y_pt: Option<f64>,
+) -> anyhow::Result<()> {
+    if let Some(sink) = debug_events.as_deref_mut() {
+        sink.rendered_region_trace_event(&FrameTraceEvent {
+            trace_id: trace_id
+                .expect("trace id is present when tracing")
+                .to_string(),
+            side: side.to_string(),
+            kind,
+            page,
+            event_index: *event_index,
+            frame_path: frame_path.to_vec(),
+            group_depth,
+            local_x_pt: local.x.to_pt(),
+            local_y_pt: local.y.to_pt(),
+            absolute_x_pt: absolute.x.to_pt(),
+            absolute_y_pt: absolute.y.to_pt(),
+            item_kind,
+            text: text.map(str::to_string),
+            text_len,
+            tag_direction,
+            tag_element: tag_element.map(str::to_string),
+            artifact_depth_before,
+            artifact_depth_after,
+            changed_artifact_state,
+            in_region_band,
+            included,
+            excluded_reason,
+            group_origin_before_x_pt,
+            group_origin_before_y_pt,
+            group_origin_after_x_pt,
+            group_origin_after_y_pt,
+            group_offset_x_pt,
+            group_offset_y_pt,
+        })?;
+    }
+    *event_index += 1;
+    Ok(())
 }
 
 fn point_belongs_to_region(point: Point, page_height_pt: f64, kind: PageRegionKind) -> bool {
@@ -2242,6 +2809,19 @@ fn point_belongs_to_region(point: Point, page_height_pt: f64, kind: PageRegionKi
         PageRegionKind::Header => y < page_height_pt * 0.2,
         PageRegionKind::Footer => y > page_height_pt * 0.8,
         PageRegionKind::Background | PageRegionKind::Foreground => true,
+    }
+}
+
+fn frame_trace_id(side: &str, kind: PageRegionKind, page: usize) -> String {
+    format!("{side}/{}/page-{page}", page_region_name(kind))
+}
+
+fn page_region_name(kind: PageRegionKind) -> &'static str {
+    match kind {
+        PageRegionKind::Header => "header",
+        PageRegionKind::Footer => "footer",
+        PageRegionKind::Background => "background",
+        PageRegionKind::Foreground => "foreground",
     }
 }
 

@@ -1,5 +1,6 @@
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,8 +12,9 @@ use typst::syntax::Span;
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind};
 use crate::diff::{
-    BlockOp, DiffBlock, DiffBlockDebug, DiffResult, EditContent, PageRegionKind, RealizedEdit,
-    RegionPath, RenderedRegionAlignment, RenderedRegionWrapper, WordOp,
+    BlockOp, DebugEventSink, DiffBlock, DiffBlockDebug, DiffResult, EditContent, FrameTraceEvent,
+    PageRegionKind, RealizedEdit, RegionPath, RenderedRegionAlignment, RenderedRegionTraceEnd,
+    RenderedRegionTraceStart, RenderedRegionWrapper, WordOp,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -46,6 +48,10 @@ pub struct DebugArgs {
 
 pub fn default_debug_dir(output: &Path) -> PathBuf {
     output.with_extension("debug")
+}
+
+pub fn rendered_region_frame_traces_path(debug_dir: &Path) -> PathBuf {
+    debug_dir.join("diff/rendered-region-frame-traces.jsonl")
 }
 
 pub fn write_debug_bundle(bundle: &DebugBundle<'_>) -> Result<()> {
@@ -115,6 +121,128 @@ pub fn write_debug_bundle(bundle: &DebugBundle<'_>) -> Result<()> {
     )
     .with_context(|| "failed to write debug modification log")?;
     Ok(())
+}
+
+pub struct JsonlDebugEventWriter {
+    writer: BufWriter<fs::File>,
+}
+
+impl JsonlDebugEventWriter {
+    pub fn create(debug_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(debug_dir.join("diff"))
+            .with_context(|| format!("failed to create debug diff directory {:?}", debug_dir))?;
+        let path = rendered_region_frame_traces_path(debug_dir);
+        let file = fs::File::create(&path)
+            .with_context(|| format!("failed to create debug JSONL trace {:?}", path))?;
+        let mut writer = Self {
+            writer: BufWriter::new(file),
+        };
+        writer.write_jsonl(&JsonlSchemaRecord {
+            schema_version: SCHEMA_VERSION,
+            record: "schema",
+            format: "typst-diff-rendered-region-frame-trace",
+        })?;
+        Ok(writer)
+    }
+
+    fn write_jsonl(&mut self, value: &impl Serialize) -> Result<()> {
+        serde_json::to_writer(&mut self.writer, value)
+            .context("failed to serialize debug JSONL trace record")?;
+        self.writer
+            .write_all(b"\n")
+            .context("failed to write debug JSONL trace newline")?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .context("failed to flush debug JSONL trace")
+    }
+}
+
+impl DebugEventSink for JsonlDebugEventWriter {
+    fn rendered_region_trace_start(&mut self, trace: &RenderedRegionTraceStart) -> Result<()> {
+        self.write_jsonl(&TraceStartRecord {
+            schema_version: SCHEMA_VERSION,
+            record: "rendered_region_trace_start",
+            trace_id: trace.trace_id.clone(),
+            side: trace.side.clone(),
+            region_kind: page_region_label(trace.kind),
+            page: trace.page,
+            page_width_pt: trace.page_width_pt,
+            page_height_pt: trace.page_height_pt,
+            semantic_region_exists: trace.semantic_region_exists,
+        })
+    }
+
+    fn rendered_region_trace_event(&mut self, event: &FrameTraceEvent) -> Result<()> {
+        self.write_jsonl(&TraceEventRecord {
+            schema_version: SCHEMA_VERSION,
+            record: "rendered_region_trace_event",
+            trace_id: event.trace_id.clone(),
+            side: event.side.clone(),
+            region_kind: page_region_label(event.kind),
+            page: event.page,
+            event: summarize_frame_trace_event(event),
+        })
+    }
+
+    fn rendered_region_trace_end(&mut self, trace: &RenderedRegionTraceEnd) -> Result<()> {
+        self.write_jsonl(&TraceEndRecord {
+            schema_version: SCHEMA_VERSION,
+            record: "rendered_region_trace_end",
+            trace_id: trace.trace_id.clone(),
+            side: trace.side.clone(),
+            region_kind: page_region_label(trace.kind),
+            page: trace.page,
+            extracted_text: trace.extracted_text.clone(),
+            event_count: trace.event_count,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct JsonlSchemaRecord {
+    schema_version: u32,
+    record: &'static str,
+    format: &'static str,
+}
+
+#[derive(Serialize)]
+struct TraceStartRecord {
+    schema_version: u32,
+    record: &'static str,
+    trace_id: String,
+    side: String,
+    region_kind: String,
+    page: usize,
+    page_width_pt: f64,
+    page_height_pt: f64,
+    semantic_region_exists: bool,
+}
+
+#[derive(Serialize)]
+struct TraceEventRecord {
+    schema_version: u32,
+    record: &'static str,
+    trace_id: String,
+    side: String,
+    region_kind: String,
+    page: usize,
+    event: FrameTraceEventSummary,
+}
+
+#[derive(Serialize)]
+struct TraceEndRecord {
+    schema_version: u32,
+    record: &'static str,
+    trace_id: String,
+    side: String,
+    region_kind: String,
+    page: usize,
+    extracted_text: String,
+    event_count: usize,
 }
 
 fn write_yaml(path: PathBuf, value: &impl Serialize) -> Result<()> {
@@ -317,6 +445,63 @@ fn rendered_regions_document(result: &DiffResult) -> RenderedRegionsDocument {
             .iter()
             .map(summarize_rendered_region)
             .collect(),
+    }
+}
+
+#[derive(Serialize)]
+struct FrameTraceEventSummary {
+    event_index: usize,
+    frame_path: Vec<usize>,
+    group_depth: usize,
+    local_x_pt: f64,
+    local_y_pt: f64,
+    absolute_x_pt: f64,
+    absolute_y_pt: f64,
+    item_kind: String,
+    text: Option<String>,
+    text_len: Option<usize>,
+    tag_direction: Option<String>,
+    tag_element: Option<String>,
+    artifact_depth_before: usize,
+    artifact_depth_after: usize,
+    changed_artifact_state: bool,
+    in_region_band: Option<bool>,
+    included: Option<bool>,
+    excluded_reason: Option<String>,
+    group_origin_before_x_pt: Option<f64>,
+    group_origin_before_y_pt: Option<f64>,
+    group_origin_after_x_pt: Option<f64>,
+    group_origin_after_y_pt: Option<f64>,
+    group_offset_x_pt: Option<f64>,
+    group_offset_y_pt: Option<f64>,
+}
+
+fn summarize_frame_trace_event(event: &FrameTraceEvent) -> FrameTraceEventSummary {
+    FrameTraceEventSummary {
+        event_index: event.event_index,
+        frame_path: event.frame_path.clone(),
+        group_depth: event.group_depth,
+        local_x_pt: event.local_x_pt,
+        local_y_pt: event.local_y_pt,
+        absolute_x_pt: event.absolute_x_pt,
+        absolute_y_pt: event.absolute_y_pt,
+        item_kind: event.item_kind.to_string(),
+        text: event.text.clone(),
+        text_len: event.text_len,
+        tag_direction: event.tag_direction.map(str::to_string),
+        tag_element: event.tag_element.clone(),
+        artifact_depth_before: event.artifact_depth_before,
+        artifact_depth_after: event.artifact_depth_after,
+        changed_artifact_state: event.changed_artifact_state,
+        in_region_band: event.in_region_band,
+        included: event.included,
+        excluded_reason: event.excluded_reason.map(str::to_string),
+        group_origin_before_x_pt: event.group_origin_before_x_pt,
+        group_origin_before_y_pt: event.group_origin_before_y_pt,
+        group_origin_after_x_pt: event.group_origin_after_x_pt,
+        group_origin_after_y_pt: event.group_origin_after_y_pt,
+        group_offset_x_pt: event.group_offset_x_pt,
+        group_offset_y_pt: event.group_offset_y_pt,
     }
 }
 
@@ -573,6 +758,8 @@ struct RenderedRegionSummary {
 #[derive(Serialize)]
 struct RenderedRegionPageSummary {
     page: usize,
+    old_frame_trace_ref: String,
+    new_frame_trace_ref: String,
     changed: bool,
     base: ContentSummary,
     word_ops: Vec<WordOpSummary>,
@@ -589,6 +776,8 @@ fn summarize_rendered_region(region: &crate::diff::RenderedRegionEdit) -> Render
             .iter()
             .map(|page| RenderedRegionPageSummary {
                 page: page.page,
+                old_frame_trace_ref: frame_trace_id("old", region.kind, page.page),
+                new_frame_trace_ref: frame_trace_id("new", region.kind, page.page),
                 changed: page.changed,
                 base: summarize_content(&page.base, 0),
                 word_ops: page.word_ops.iter().map(summarize_word_op).collect(),
@@ -800,6 +989,10 @@ fn page_region_label(kind: PageRegionKind) -> String {
         PageRegionKind::Foreground => "foreground",
     }
     .to_string()
+}
+
+fn frame_trace_id(side: &str, kind: PageRegionKind, page: usize) -> String {
+    format!("{side}/{}/page-{page}", page_region_label(kind))
 }
 
 fn rendered_wrapper_label(wrapper: RenderedRegionWrapper) -> String {
