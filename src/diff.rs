@@ -2567,53 +2567,70 @@ fn recursive_slot_edit_content(
 ) -> Option<EditContent> {
     if can_recurse_via_slots(old_child, new_child) {
         let edits = diff_slot_edits(old_child, new_child);
-        if let Some(content) = collapse_single_modified_container(new_child, &edits) {
-            return Some(content);
-        }
         return (!edits.is_empty()).then(|| EditContent::Nested {
             base: new_child.clone(),
             edits,
         });
     }
 
-    let pair = find_slot_bearing_descendant_pair(old_child, new_child)?;
-    let edits = diff_slot_edits(pair.old, pair.new);
-    if edits.is_empty() {
+    if let Some(pair) = find_slot_bearing_descendant_pair(old_child, new_child) {
+        let edits = diff_slot_edits(pair.old, pair.new);
+        if !edits.is_empty() {
+            let content = EditContent::Nested {
+                base: pair.new.clone(),
+                edits,
+            };
+            return Some(EditContent::Nested {
+                base: new_child.clone(),
+                edits: vec![RealizedEdit::ReplaceAt {
+                    path: pair.new_path,
+                    content,
+                }],
+            });
+        }
+    }
+
+    unique_changed_child_edit_content(old_child, new_child)
+}
+
+fn unique_changed_child_edit_content(
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+) -> Option<EditContent> {
+    if old_child.children.is_empty() || old_child.children.len() != new_child.children.len() {
         return None;
     }
-    let content = collapse_single_modified_container(pair.new, &edits).unwrap_or_else(|| {
-        EditContent::Nested {
-            base: pair.new.clone(),
-            edits,
+    if slot_bearing_descendants(old_child).is_empty()
+        && slot_bearing_descendants(new_child).is_empty()
+    {
+        return None;
+    }
+
+    let mut changed = None;
+    for (index, (old_grandchild, new_grandchild)) in old_child
+        .children
+        .iter()
+        .zip(new_child.children.iter())
+        .enumerate()
+    {
+        if annotated_subtree_equal(old_grandchild, new_grandchild) {
+            continue;
         }
-    });
+        if changed.is_some() {
+            return None;
+        }
+        changed = Some((index, old_grandchild, new_grandchild));
+    }
+
+    let (index, old_grandchild, new_grandchild) = changed?;
+    let content = recursive_slot_edit_content(old_grandchild, new_grandchild)
+        .or_else(|| modified_edit_content(old_grandchild, new_grandchild))?;
     Some(EditContent::Nested {
         base: new_child.clone(),
         edits: vec![RealizedEdit::ReplaceAt {
-            path: pair.new_path,
+            path: vec![index],
             content,
         }],
-    })
-}
-
-fn collapse_single_modified_container(
-    container: &AnnotatedContent,
-    edits: &[RealizedEdit],
-) -> Option<EditContent> {
-    let [
-        RealizedEdit::ReplaceAt {
-            content: EditContent::Modified { base, word_ops },
-            ..
-        },
-    ] = edits
-    else {
-        return None;
-    };
-    (base.plain_text() == effective_content(container).plain_text()).then(|| {
-        EditContent::Modified {
-            base: base.clone(),
-            word_ops: word_ops.clone(),
-        }
     })
 }
 
@@ -2719,20 +2736,27 @@ fn push_modified_slot_edit(
     new_child: &AnnotatedContent,
     path: &[usize],
 ) {
+    if let Some(content) = modified_edit_content(old_child, new_child) {
+        edits.push(RealizedEdit::ReplaceAt {
+            path: path.to_vec(),
+            content,
+        });
+    }
+}
+
+fn modified_edit_content(
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+) -> Option<EditContent> {
     let old_effective = effective_content(old_child);
     let new_effective = effective_content(new_child);
     let old_tokens = extract_words_for_annotated(&old_effective, Some(old_child));
     let new_tokens = extract_words_for_annotated(&new_effective, Some(new_child));
     let word_ops = diff_words(&old_tokens, &new_tokens);
-    if has_textual_word_change(&word_ops) {
-        edits.push(RealizedEdit::ReplaceAt {
-            path: path.to_vec(),
-            content: EditContent::Modified {
-                base: new_effective,
-                word_ops,
-            },
-        });
-    }
+    has_textual_word_change(&word_ops).then_some(EditContent::Modified {
+        base: new_effective,
+        word_ops,
+    })
 }
 
 fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {
@@ -3247,12 +3271,21 @@ mod tests {
 
         let RealizedEdit::ReplaceAt {
             path: inner_container_path,
-            content: EditContent::Modified { .. },
+            content: EditContent::Nested {
+                edits: inner_edits, ..
+            },
         } = &edits[0]
         else {
-            panic!("expected nested slot-bearing descendant modification");
+            panic!("expected nested slot-bearing descendant edit");
         };
         assert_eq!(inner_container_path, &vec![1]);
+        assert!(matches!(
+            inner_edits[0],
+            RealizedEdit::ReplaceAt {
+                path: ref p,
+                content: EditContent::Modified { .. }
+            } if p == &vec![0]
+        ));
     }
 
     #[test]
@@ -3308,13 +3341,22 @@ mod tests {
         };
         let RealizedEdit::ReplaceAt {
             path,
-            content: EditContent::Modified { .. },
+            content: EditContent::Nested {
+                edits: inner_edits, ..
+            },
         } = &edits[0]
         else {
-            panic!("expected nested slot-bearing descendant modification");
+            panic!("expected nested slot-bearing descendant edit");
         };
 
         assert_eq!(path, &vec![0, 0]);
+        assert!(matches!(
+            inner_edits[0],
+            RealizedEdit::ReplaceAt {
+                path: ref p,
+                content: EditContent::Modified { .. }
+            } if p == &vec![0]
+        ));
     }
 
     #[test]
@@ -3365,12 +3407,173 @@ mod tests {
         };
 
         assert_eq!(path, &vec![0]);
+        let RealizedEdit::ReplaceAt {
+            path: nested_path,
+            content: EditContent::Nested {
+                edits: inner_edits, ..
+            },
+        } = &edits[0]
+        else {
+            panic!("expected table cell nested list edit");
+        };
+        assert_eq!(nested_path, &vec![0]);
         assert!(matches!(
-            edits[0],
+            inner_edits[0],
             RealizedEdit::ReplaceAt {
                 path: ref p,
                 content: EditContent::Modified { .. }
             } if p == &vec![0]
+        ));
+    }
+
+    #[test]
+    fn diff_slot_edits_same_shape_preserves_nested_enum_container() {
+        use crate::annotated::SlotStep;
+        use crate::annotated::{
+            AnnotatedContent, Annotation, SemanticKind, SemanticSlot, WrapperKind,
+        };
+
+        let make_enum = |text: &str| AnnotatedContent {
+            realized: TextElem::packed(text),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Enum),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::EnumItem(0),
+                    path: vec![0],
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed(text),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+        let make_wrapper = |text: &str| AnnotatedContent {
+            realized: TextElem::packed("wrapper"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Wrapper(WrapperKind::Block)),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::WrapperBody,
+                    path: vec![0],
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("body"),
+                annotation: Annotation::default(),
+                children: vec![make_enum(text)],
+            }],
+        };
+
+        let result =
+            diff_slot_edits_same_shape(&make_wrapper("Old step"), &make_wrapper("New step"));
+        let RealizedEdit::ReplaceAt {
+            path,
+            content: EditContent::Nested { edits, .. },
+        } = &result[0]
+        else {
+            panic!("expected wrapper body nested edit");
+        };
+        assert_eq!(path, &vec![0]);
+        let RealizedEdit::ReplaceAt {
+            path: enum_path,
+            content: EditContent::Nested {
+                edits: enum_edits, ..
+            },
+        } = &edits[0]
+        else {
+            panic!("expected nested enum container edit");
+        };
+        assert_eq!(enum_path, &vec![0]);
+        assert!(matches!(
+            enum_edits[0],
+            RealizedEdit::ReplaceAt {
+                path: ref p,
+                content: EditContent::Modified { .. }
+            } if p == &vec![0]
+        ));
+    }
+
+    #[test]
+    fn diff_slot_edits_same_shape_preserves_nested_terms_container() {
+        use crate::annotated::SlotStep;
+        use crate::annotated::{AnnotatedContent, Annotation, SemanticKind, SemanticSlot};
+
+        let make_terms = |description: &str| AnnotatedContent {
+            realized: TextElem::packed(description),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Terms),
+                slots: vec![
+                    SemanticSlot {
+                        label: SlotStep::Term(0),
+                        path: vec![0],
+                    },
+                    SemanticSlot {
+                        label: SlotStep::TermDescription(0),
+                        path: vec![1],
+                    },
+                ],
+                ..Annotation::default()
+            },
+            children: vec![
+                AnnotatedContent {
+                    realized: TextElem::packed("Habitat"),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+                AnnotatedContent {
+                    realized: TextElem::packed(description),
+                    annotation: Annotation::default(),
+                    children: vec![],
+                },
+            ],
+        };
+        let make_table = |description: &str| AnnotatedContent {
+            realized: TextElem::packed("table"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Table),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::TableCell(0),
+                    path: vec![0],
+                }],
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: TextElem::packed("cell"),
+                annotation: Annotation::default(),
+                children: vec![make_terms(description)],
+            }],
+        };
+
+        let result = diff_slot_edits_same_shape(
+            &make_table("Old forest range"),
+            &make_table("New wetland range"),
+        );
+        let RealizedEdit::ReplaceAt {
+            path,
+            content: EditContent::Nested { edits, .. },
+        } = &result[0]
+        else {
+            panic!("expected table cell nested edit");
+        };
+        assert_eq!(path, &vec![0]);
+        let RealizedEdit::ReplaceAt {
+            path: terms_path,
+            content: EditContent::Nested {
+                edits: terms_edits, ..
+            },
+        } = &edits[0]
+        else {
+            panic!("expected nested terms container edit");
+        };
+        assert_eq!(terms_path, &vec![0]);
+        assert!(matches!(
+            terms_edits[0],
+            RealizedEdit::ReplaceAt {
+                path: ref p,
+                content: EditContent::Modified { .. }
+            } if p == &vec![1]
         ));
     }
 

@@ -1192,6 +1192,64 @@ fn nested_list_item_change_tree_render_styles_old_and_new_text() {
 }
 
 #[test]
+fn nested_list_item_change_preserves_nested_list_layout() {
+    let result = diff_annotated_corpus("20-nested-list-changed");
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+
+    assert_eq!(
+        count_nodes::<typst::model::ListElem>(&annotated),
+        3,
+        "outer kingdom list, phylum sublist, and class sublist should all survive"
+    );
+
+    let new_world = corpus_world("20-nested-list-changed/new.typ");
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let runs = rendered_text_runs(&document.pages[0].frame);
+    let phylum = runs
+        .iter()
+        .find(|run| run.text.contains("Phylum: Chordata"))
+        .expect("Phylum item should render");
+    let class = runs
+        .iter()
+        .find(|run| run.text.contains("Class: Mammalia"))
+        .expect("Class item should render");
+    let arthropoda = runs
+        .iter()
+        .find(|run| run.text.contains("Phylum: Arthropoda"))
+        .expect("following Phylum item should render");
+
+    assert!(
+        class.y > phylum.y + phylum.size * 0.5,
+        "Class item should render below Phylum item; phylum={phylum:?}, class={class:?}"
+    );
+    assert!(
+        class.x > phylum.x + 5.0,
+        "Class item should be indented under Phylum item; phylum={phylum:?}, class={class:?}"
+    );
+
+    let normal = typst_diff::eval_to_realized_content(&new_world)
+        .unwrap()
+        .realized;
+    let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
+    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let normal_class = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Class: Mammalia"))
+        .expect("normal Class item should render");
+    let normal_arthropoda = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Phylum: Arthropoda"))
+        .expect("normal following Phylum item should render");
+    let annotated_gap = arthropoda.y - class.y;
+    let normal_gap = normal_arthropoda.y - normal_class.y;
+
+    assert!(
+        annotated_gap <= normal_gap + 0.5,
+        "modified class item should keep tight nested-list spacing; annotated_gap={annotated_gap}, normal_gap={normal_gap}, class={class:?}, arthropoda={arthropoda:?}, normal_class={normal_class:?}, normal_arthropoda={normal_arthropoda:?}"
+    );
+}
+
+#[test]
 fn edit_contract_guarantees_rendering_for_corpus_18() {
     assert_edit_contract_matches_render("18-list-item-changed");
 }

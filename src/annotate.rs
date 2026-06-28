@@ -478,7 +478,9 @@ pub fn build_annotated_content_from_tree(
         &result.rendered_regions,
         compact_substitutions,
     );
-    Content::sequence(groups).styled_with_map(root_styles)
+    crate::normalize::normalize_list_item_runs(
+        Content::sequence(groups).styled_with_map(root_styles),
+    )
 }
 
 fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
@@ -1263,6 +1265,91 @@ mod tests {
     }
 
     #[test]
+    fn nested_enum_child_preserves_enum_container_and_annotates_leaf() {
+        use typst::model::{EnumElem, EnumItem};
+
+        let enm = Content::new(EnumElem::new(vec![Packed::new(EnumItem::new(
+            TextElem::packed("Better"),
+        ))]));
+        let outer_list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(enm.clone())),
+            Packed::new(ListItem::new(TextElem::packed("Stable"))),
+        ]));
+
+        let annotated = render(
+            outer_list,
+            replace_at(
+                vec![0],
+                EditContent::Nested {
+                    base: annotated(enm),
+                    edits: replace_at(
+                        vec![0],
+                        modified(
+                            TextElem::packed("Better"),
+                            vec![
+                                WordOp::Delete(vec![word_token("Beta")]),
+                                WordOp::Insert(vec![word_token("Better")]),
+                            ],
+                        ),
+                    ),
+                },
+            ),
+            false,
+        );
+        let plain = annotated.plain_text();
+
+        assert_eq!(count_elem::<ListElem>(&annotated), 1);
+        assert_eq!(count_elem::<EnumElem>(&annotated), 1);
+        assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
+        assert!(plain.contains("Beta"), "{plain}");
+        assert!(plain.contains("Better"), "{plain}");
+        assert!(plain.contains("Stable"), "{plain}");
+    }
+
+    #[test]
+    fn nested_terms_child_preserves_terms_container_and_annotates_description() {
+        use typst::model::{TableCell, TableChild, TableElem, TableItem, TermItem, TermsElem};
+
+        let terms = Content::new(TermsElem::new(vec![Packed::new(TermItem::new(
+            TextElem::packed("Habitat"),
+            TextElem::packed("New range"),
+        ))]));
+        let table = Content::new(TableElem::new(vec![TableChild::Item(TableItem::Cell(
+            Packed::new(TableCell::new(terms.clone())),
+        ))]));
+
+        let annotated = render(
+            table,
+            replace_at(
+                vec![0],
+                EditContent::Nested {
+                    base: annotated(terms),
+                    edits: replace_at(
+                        vec![1],
+                        modified(
+                            TextElem::packed("New range"),
+                            vec![
+                                WordOp::Delete(vec![word_token("Old")]),
+                                WordOp::Insert(vec![word_token("New")]),
+                                WordOp::Equal(vec![word_token(" range")]),
+                            ],
+                        ),
+                    ),
+                },
+            ),
+            false,
+        );
+        let plain = annotated.plain_text();
+
+        assert_eq!(count_elem::<TableElem>(&annotated), 1);
+        assert_eq!(count_elem::<TermsElem>(&annotated), 1);
+        assert_eq!(count_elem::<StrikeElem>(&annotated), 1);
+        assert!(plain.contains("Habitat"), "{plain}");
+        assert!(plain.contains("Old"), "{plain}");
+        assert!(plain.contains("New"), "{plain}");
+    }
+
+    #[test]
     fn mixed_body_inline_change_detected_and_nested_structure_preserved() {
         use crate::diff::diff_annotated;
         use typst::model::ParbreakElem;
@@ -1290,9 +1377,10 @@ mod tests {
         let annotated = build_annotated_content_from_tree(&result, false);
         let plain = annotated.plain_text();
 
-        assert!(
-            count_elem::<ListElem>(&annotated) >= 1,
-            "nested list preserved"
+        assert_eq!(
+            count_elem::<ListElem>(&annotated),
+            2,
+            "both outer and nested list levels preserved"
         );
         assert!(plain.contains("old"), "{plain}");
         assert!(plain.contains("new"), "{plain}");

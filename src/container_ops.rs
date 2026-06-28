@@ -774,10 +774,10 @@ fn map_unique_partial_item_container(
     }
 
     let index = matches[0];
-    let patch_surface = single_item_patch_surface(pre_container, &parts[index])?;
+    let patch = single_item_patch_surface(pre_container, &parts[index])?;
     let part = parts.remove(index);
-    let mut tree = anonymous_realized_tree(&patch_surface);
-    let path = vec![0];
+    let mut tree = anonymous_realized_tree(&patch.surface);
+    let path = patch.path;
     let pre_content = normalize_list_item_runs(part.pre_content);
     let replacement = annotate_realized(&pre_content, realized);
     replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
@@ -790,20 +790,53 @@ fn map_unique_partial_item_container(
     })
 }
 
-fn single_item_patch_surface(pre_container: &Content, part: &SlotPart) -> Option<Content> {
-    match part.label {
-        SlotStep::ListItem(_) if pre_container.is::<ListElem>() => Some(
-            Content::new(ListElem::new(vec![Packed::new(ListItem::new(
-                part.pre_content.clone(),
-            ))]))
-            .spanned(pre_container.span()),
-        ),
-        SlotStep::EnumItem(_) if pre_container.is::<EnumElem>() => Some(
-            Content::new(EnumElem::new(vec![Packed::new(EnumItem::new(
-                part.pre_content.clone(),
-            ))]))
-            .spanned(pre_container.span()),
-        ),
+struct SingleItemPatch {
+    surface: Content,
+    path: Vec<usize>,
+}
+
+fn single_item_patch_surface(pre_container: &Content, part: &SlotPart) -> Option<SingleItemPatch> {
+    match &part.label {
+        SlotStep::ListItem(index) => {
+            let mut list = pre_container.to_packed::<ListElem>()?.clone();
+            let mut item = list.children.get(*index)?.clone();
+            item.body = part.pre_content.clone();
+            list.children = vec![item];
+            Some(SingleItemPatch {
+                surface: list.pack(),
+                path: vec![0],
+            })
+        }
+        SlotStep::EnumItem(index) => {
+            let mut enm = pre_container.to_packed::<EnumElem>()?.clone();
+            let mut item = enm.children.get(*index)?.clone();
+            item.body = part.pre_content.clone();
+            enm.children = vec![item];
+            Some(SingleItemPatch {
+                surface: enm.pack(),
+                path: vec![0],
+            })
+        }
+        SlotStep::Term(index) => {
+            let mut terms = pre_container.to_packed::<TermsElem>()?.clone();
+            let mut item = terms.children.get(*index)?.clone();
+            item.term = part.pre_content.clone();
+            terms.children = vec![item];
+            Some(SingleItemPatch {
+                surface: terms.pack(),
+                path: vec![0],
+            })
+        }
+        SlotStep::TermDescription(index) => {
+            let mut terms = pre_container.to_packed::<TermsElem>()?.clone();
+            let mut item = terms.children.get(*index)?.clone();
+            item.description = part.pre_content.clone();
+            terms.children = vec![item];
+            Some(SingleItemPatch {
+                surface: terms.pack(),
+                path: vec![1],
+            })
+        }
         _ => None,
     }
 }
@@ -1248,4 +1281,86 @@ fn ordinary_grid_insert_index(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typst::foundations::{Packed, StyleChain};
+    use typst::model::TermItem;
+    use typst::text::TextElem;
+
+    fn text(value: &str) -> Content {
+        TextElem::packed(value)
+    }
+
+    #[test]
+    fn single_item_patch_surface_preserves_list_tightness() {
+        let pre = Content::new(
+            ListElem::new(vec![
+                Packed::new(ListItem::new(text("Alpha"))),
+                Packed::new(ListItem::new(text("Beta"))),
+            ])
+            .with_tight(false),
+        );
+        let part = SlotPart {
+            label: SlotStep::ListItem(1),
+            pre_content: text("Beta"),
+        };
+
+        let patch = single_item_patch_surface(&pre, &part).unwrap();
+        let list = patch.surface.to_packed::<ListElem>().unwrap();
+
+        assert_eq!(patch.path, vec![0]);
+        assert_eq!(list.children.len(), 1);
+        assert_eq!(list.children[0].body.plain_text(), "Beta");
+        assert!(!list.tight.get(StyleChain::default()));
+    }
+
+    #[test]
+    fn single_item_patch_surface_preserves_enum_tightness() {
+        let pre = Content::new(
+            EnumElem::new(vec![
+                Packed::new(EnumItem::new(text("One"))),
+                Packed::new(EnumItem::new(text("Two"))),
+            ])
+            .with_tight(false),
+        );
+        let part = SlotPart {
+            label: SlotStep::EnumItem(0),
+            pre_content: text("One"),
+        };
+
+        let patch = single_item_patch_surface(&pre, &part).unwrap();
+        let enm = patch.surface.to_packed::<EnumElem>().unwrap();
+
+        assert_eq!(patch.path, vec![0]);
+        assert_eq!(enm.children.len(), 1);
+        assert_eq!(enm.children[0].body.plain_text(), "One");
+        assert!(!enm.tight.get(StyleChain::default()));
+    }
+
+    #[test]
+    fn single_item_patch_surface_preserves_terms_tightness_and_slot_path() {
+        let pre = Content::new(
+            TermsElem::new(vec![
+                Packed::new(TermItem::new(text("API"), text("Definition"))),
+                Packed::new(TermItem::new(text("SDK"), text("Toolkit"))),
+            ])
+            .with_tight(false),
+        );
+        let part = SlotPart {
+            label: SlotStep::TermDescription(1),
+            pre_content: text("Toolkit"),
+        };
+
+        let patch = single_item_patch_surface(&pre, &part).unwrap();
+        let terms = patch.surface.to_packed::<TermsElem>().unwrap();
+
+        assert_eq!(patch.path, vec![1]);
+        assert_eq!(terms.children.len(), 1);
+        assert_eq!(terms.children[0].term.plain_text(), "SDK");
+        assert_eq!(terms.children[0].description.plain_text(), "Toolkit");
+        assert!(!terms.tight.get(StyleChain::default()));
+    }
 }
