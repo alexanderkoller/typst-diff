@@ -21,7 +21,7 @@ use typst::foundations::{Content, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel};
 use typst::math::{CancelElem, EquationElem};
-use typst::model::{EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
+use typst::model::{EmphElem, EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
@@ -609,7 +609,7 @@ fn rendered_region_context_content(region: &RenderedRegionEdit, compact: bool) -
             page.page
         ));
         push_rendered_region_wrapper_start(&mut source, region.wrapper);
-        source.push_str(&word_ops_typst_markup(&page.word_ops, compact));
+        source.push_str(&rendered_region_page_markup(page, compact));
         push_rendered_region_wrapper_end(&mut source, region.wrapper);
         source.push_str(" }\n");
     }
@@ -622,6 +622,21 @@ fn rendered_region_context_content(region: &RenderedRegionEdit, compact: bool) -
     }
     source.push_str("}\n");
     crate::eval::eval_snippet_to_content(&source).expect("generated rendered region Typst is valid")
+}
+
+fn rendered_region_page_markup(
+    page: &crate::diff::RenderedRegionPageEdit,
+    compact: bool,
+) -> String {
+    if page.segments.len() <= 1 {
+        return word_ops_typst_markup(&page.word_ops, compact);
+    }
+
+    page.segments
+        .iter()
+        .map(|segment| word_ops_typst_markup(&segment.word_ops, compact))
+        .collect::<Vec<_>>()
+        .join(" #h(1fr) ")
 }
 
 fn push_rendered_region_wrapper_start(source: &mut String, wrapper: RenderedRegionWrapper) {
@@ -655,7 +670,7 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
         match op {
             WordOp::Equal(tokens) => {
                 for token in tokens {
-                    out.push_str(&typst_escape_content(token.content.plain_text().as_str()));
+                    out.push_str(&content_typst_markup(&token.content));
                 }
             }
             WordOp::Insert(tokens) => {
@@ -668,12 +683,14 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
                 } else {
                     "#00b400"
                 };
-                let text =
-                    changed_tokens_plain_text(tokens, prev.and_then(tokens_before_insert), compact);
                 out.push_str(&format!(
                     "#text(fill: rgb(\"{}\"))[{}]",
                     color,
-                    typst_escape_content(&text)
+                    changed_tokens_typst_markup(
+                        tokens,
+                        prev.and_then(tokens_before_insert),
+                        compact
+                    )
                 ));
             }
             WordOp::Delete(tokens) => {
@@ -685,7 +702,7 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
                 if !is_substitution {
                     out.push_str(&format!(
                         "#strike[#text(fill: rgb(\"#dc0000\"))[{}]]",
-                        typst_escape_content(&tokens_plain_text(tokens))
+                        tokens_typst_markup(tokens)
                     ));
                 }
             }
@@ -694,15 +711,7 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
     out
 }
 
-fn tokens_plain_text(tokens: &[crate::diff::Token]) -> String {
-    let mut text = String::new();
-    for token in tokens {
-        text.push_str(token.content.plain_text().as_str());
-    }
-    text
-}
-
-fn changed_tokens_plain_text(
+fn changed_tokens_typst_markup(
     tokens: &[crate::diff::Token],
     previous_tokens: Option<&[crate::diff::Token]>,
     compact_substitutions: bool,
@@ -711,8 +720,29 @@ fn changed_tokens_plain_text(
     if !compact_substitutions && previous_tokens.is_some_and(|prev| needs_separator(prev, tokens)) {
         text.push(' ');
     }
-    text.push_str(&tokens_plain_text(tokens));
+    text.push_str(&tokens_typst_markup(tokens));
     text
+}
+
+fn tokens_typst_markup(tokens: &[crate::diff::Token]) -> String {
+    tokens
+        .iter()
+        .map(|token| content_typst_markup(&token.content))
+        .collect()
+}
+
+fn content_typst_markup(content: &Content) -> String {
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .map(content_typst_markup)
+            .collect::<String>();
+    }
+    if let Some(emph) = content.to_packed::<EmphElem>() {
+        return format!("#emph[{}]", content_typst_markup(&emph.body));
+    }
+    typst_escape_content(content.plain_text().as_str())
 }
 
 fn typst_escape_content(text: &str) -> String {

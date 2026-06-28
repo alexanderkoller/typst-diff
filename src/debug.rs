@@ -13,8 +13,8 @@ use typst::syntax::Span;
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind};
 use crate::diff::{
     BlockOp, DebugEventSink, DiffBlock, DiffBlockDebug, DiffResult, EditContent, FrameTraceEvent,
-    PageRegionKind, RealizedEdit, RegionPath, RenderedRegionAlignment, RenderedRegionTraceEnd,
-    RenderedRegionTraceStart, RenderedRegionWrapper, WordOp,
+    PageRegionKind, RealizedEdit, RegionPath, RenderedRegionAlignment, RenderedRegionSegmentEdit,
+    RenderedRegionTraceEnd, RenderedRegionTraceStart, RenderedRegionWrapper, WordOp,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -763,6 +763,13 @@ struct RenderedRegionPageSummary {
     changed: bool,
     base: ContentSummary,
     word_ops: Vec<WordOpSummary>,
+    segments: Vec<RenderedRegionSegmentSummary>,
+}
+
+#[derive(Serialize)]
+struct RenderedRegionSegmentSummary {
+    base: ContentSummary,
+    word_ops: Vec<WordOpSummary>,
 }
 
 fn summarize_rendered_region(region: &crate::diff::RenderedRegionEdit) -> RenderedRegionSummary {
@@ -781,8 +788,22 @@ fn summarize_rendered_region(region: &crate::diff::RenderedRegionEdit) -> Render
                 changed: page.changed,
                 base: summarize_content(&page.base, 0),
                 word_ops: page.word_ops.iter().map(summarize_word_op).collect(),
+                segments: page
+                    .segments
+                    .iter()
+                    .map(summarize_rendered_region_segment)
+                    .collect(),
             })
             .collect(),
+    }
+}
+
+fn summarize_rendered_region_segment(
+    segment: &RenderedRegionSegmentEdit,
+) -> RenderedRegionSegmentSummary {
+    RenderedRegionSegmentSummary {
+        base: summarize_content(&segment.base, 0),
+        word_ops: segment.word_ops.iter().map(summarize_word_op).collect(),
     }
 }
 

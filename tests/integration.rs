@@ -1037,6 +1037,16 @@ fn cli_debug_records_rendered_region_frame_trace_events() {
     assert!(trace.contains(r#""side":"new""#), "{trace}");
     assert!(trace.contains(r#""text":"Final Version""#), "{trace}");
     assert!(trace.contains(r#""text":"New Report""#), "{trace}");
+    assert!(
+        trace.lines().any(|line| {
+            line.contains(r#""trace_id":"new/header/page-1""#)
+                && line.contains(r#""text":"Final Version""#)
+                && line.contains(r#""included":true"#)
+                && line.contains(r#""artifact_depth_before":1"#)
+                && line.contains(r#""artifact_depth_after":1"#)
+        }),
+        "{trace}"
+    );
     assert!(trace.contains(r#""tag_element":"artifact""#), "{trace}");
     assert!(trace.contains(r#""tag_element":"context""#), "{trace}");
     assert!(trace.contains(r#""tag_element":"emph""#), "{trace}");
@@ -1794,6 +1804,36 @@ fn corpus_43_contextual_alternating_headers_are_rendered_region_edits() {
             .any(|region| region.kind == PageRegionKind::Header),
         "expected contextual header rendered region edit"
     );
+    let header = result
+        .rendered_regions
+        .iter()
+        .find(|region| region.kind == PageRegionKind::Header)
+        .unwrap();
+    assert_eq!(header.pages.len(), 3);
+    for page in &header.pages {
+        assert_eq!(
+            page.segments.len(),
+            2,
+            "expected split left/right header segments on page {}",
+            page.page
+        );
+    }
+    assert_eq!(
+        header.pages[0].segments[0].base.plain_text().as_str(),
+        "New Report"
+    );
+    assert_eq!(
+        header.pages[0].segments[1].base.plain_text().as_str(),
+        "Final Version"
+    );
+    assert_eq!(
+        header.pages[1].segments[0].base.plain_text().as_str(),
+        "Final Version"
+    );
+    assert_eq!(
+        header.pages[1].segments[1].base.plain_text().as_str(),
+        "New Report"
+    );
 
     let log = result.modification_log();
     assert!(log.contains("Old"), "{log}");
@@ -1806,8 +1846,86 @@ fn corpus_43_contextual_alternating_headers_are_rendered_region_edits() {
     );
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    assert_alternating_header_page_layout(&document.pages[0].frame, true);
+    assert_alternating_header_page_layout(&document.pages[1].frame, false);
+    assert_alternating_header_page_layout(&document.pages[2].frame, true);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
+}
+
+fn assert_alternating_header_page_layout(frame: &typst::layout::Frame, odd_page: bool) {
+    let page_width = frame.width().to_pt();
+    let page_height = frame.height().to_pt();
+    let header_runs = rendered_text_runs(frame)
+        .into_iter()
+        .filter(|run| run.y < page_height * 0.2)
+        .collect::<Vec<_>>();
+    let header_text = header_runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    for expected in ["Old", "New", "Report", "Draft", "Final", "Version"] {
+        assert!(
+            header_text.contains(expected),
+            "missing {expected:?} in header text {header_text:?}"
+        );
+    }
+    assert!(
+        header_runs.iter().any(|run| run.x < page_width * 0.25),
+        "expected left-side header runs: {header_runs:?}"
+    );
+    assert!(
+        header_runs
+            .iter()
+            .any(|run| run.x + run.width > page_width * 0.75),
+        "expected right-side header runs: {header_runs:?}"
+    );
+
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let green = typst::visualize::Color::from_u8(0, 180, 0, 255).into();
+    assert!(
+        header_runs
+            .iter()
+            .any(|run| run.text.contains("Old") && run.fill == red),
+        "expected deleted Old in red: {header_runs:?}"
+    );
+    assert!(
+        header_runs
+            .iter()
+            .any(|run| run.text.contains("Draft") && run.fill == red),
+        "expected deleted Draft in red: {header_runs:?}"
+    );
+    assert!(
+        header_runs
+            .iter()
+            .any(|run| run.text.contains("New") && run.fill == green),
+        "expected inserted New in green: {header_runs:?}"
+    );
+    assert!(
+        header_runs
+            .iter()
+            .any(|run| run.text.contains("Final") && run.fill == green),
+        "expected inserted Final in green: {header_runs:?}"
+    );
+
+    let left_text = header_runs
+        .iter()
+        .filter(|run| run.x < page_width / 2.0)
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    let right_text = header_runs
+        .iter()
+        .filter(|run| run.x >= page_width / 2.0)
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    if odd_page {
+        assert!(left_text.contains("Report"), "{left_text}");
+        assert!(right_text.contains("Version"), "{right_text}");
+    } else {
+        assert!(left_text.contains("Version"), "{left_text}");
+        assert!(right_text.contains("Report"), "{right_text}");
+    }
 }
 
 #[test]

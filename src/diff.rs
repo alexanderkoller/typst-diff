@@ -32,7 +32,7 @@ use typst::layout::{
     BlockBody, BlockElem, BoxElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel,
 };
 use typst::math::EquationElem;
-use typst::model::{FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
+use typst::model::{EmphElem, FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized};
@@ -439,6 +439,12 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
         collect_tokens(&styled.child, out);
         for token in &mut out[before..] {
             token.content = token.content.clone().styled_with_map(styled.styles.clone());
+        }
+    } else if let Some(emph) = content.to_packed::<EmphElem>() {
+        let before = out.len();
+        collect_tokens(&emph.body, out);
+        for token in &mut out[before..] {
+            token.content = token.content.clone().emph();
         }
     } else if let Some(par) = content.to_packed::<ParElem>() {
         collect_tokens(&par.body, out);
@@ -1263,7 +1269,13 @@ pub struct RenderedRegionPageEdit {
     pub page: usize,
     pub base: Content,
     pub word_ops: Vec<WordOp>,
+    pub segments: Vec<RenderedRegionSegmentEdit>,
     pub changed: bool,
+}
+
+pub struct RenderedRegionSegmentEdit {
+    pub base: Content,
+    pub word_ops: Vec<WordOp>,
 }
 
 pub trait DebugEventSink {
@@ -2214,26 +2226,29 @@ fn diff_rendered_root_page_regions(
 fn diff_rendered_region_texts(
     kind: PageRegionKind,
     wrapper: RenderedRegionWrapper,
-    old_pages: &[String],
-    new_pages: &[String],
+    old_pages: &[RenderedRegionText],
+    new_pages: &[RenderedRegionText],
 ) -> Option<RenderedRegionEdit> {
     let mut has_change = false;
     let pages = new_pages
         .iter()
         .enumerate()
-        .map(|(index, new_text)| {
-            let old_text = old_pages.get(index).map(String::as_str).unwrap_or("");
+        .map(|(index, new_page)| {
+            let old_page = old_pages.get(index);
+            let old_text = old_page.map(|page| page.text.as_str()).unwrap_or("");
+            let new_content = TextElem::packed(new_page.text.as_str());
             let old_content = TextElem::packed(old_text);
-            let new_content = TextElem::packed(new_text.as_str());
             let old_tokens = extract_words(&old_content);
             let new_tokens = extract_words(&new_content);
             let word_ops = diff_words(&old_tokens, &new_tokens);
+            let segments = diff_rendered_region_segments(old_page, new_page);
             let changed = old_pages.get(index).is_some() && has_textual_word_change(&word_ops);
             has_change |= changed;
             RenderedRegionPageEdit {
                 page: index + 1,
                 base: new_content,
                 word_ops,
+                segments,
                 changed,
             }
         })
@@ -2244,6 +2259,35 @@ fn diff_rendered_region_texts(
         wrapper,
         pages,
     })
+}
+
+fn diff_rendered_region_segments(
+    old_page: Option<&RenderedRegionText>,
+    new_page: &RenderedRegionText,
+) -> Vec<RenderedRegionSegmentEdit> {
+    if new_page.clusters.len() <= 1 {
+        return vec![];
+    }
+    let Some(old_page) = old_page else {
+        return vec![];
+    };
+    if old_page.clusters.len() != new_page.clusters.len() {
+        return vec![];
+    }
+
+    old_page
+        .clusters
+        .iter()
+        .zip(new_page.clusters.iter())
+        .map(|(old_cluster, new_cluster)| {
+            let old_tokens = extract_words(&old_cluster.content);
+            let new_tokens = extract_words(&new_cluster.content);
+            RenderedRegionSegmentEdit {
+                base: new_cluster.content.clone(),
+                word_ops: diff_words(&old_tokens, &new_tokens),
+            }
+        })
+        .collect()
 }
 
 fn rendered_region_wrapper(world: &dyn World, content: &Content) -> RenderedRegionWrapper {
@@ -2309,7 +2353,7 @@ fn rendered_region_texts(
     document: &PagedDocument,
     kind: PageRegionKind,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<RenderedRegionText>> {
     let semantic_region_exists = page_region_content(styles, kind).is_some();
     let mut out = Vec::new();
     for (index, page) in document.pages.iter().enumerate() {
@@ -2332,7 +2376,7 @@ fn rendered_region_text(
     kind: PageRegionKind,
     semantic_region_exists: bool,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RenderedRegionText> {
     let trace_id = debug_events
         .is_some()
         .then(|| frame_trace_id(side, kind, page));
@@ -2347,34 +2391,133 @@ fn rendered_region_text(
             semantic_region_exists,
         })?;
     }
-    let mut text = String::new();
+    let mut runs = Vec::new();
     let mut event_index = 0;
+    let mut tag_stack = Vec::new();
     collect_positioned_region_trace(
         trace_id.as_deref(),
         side,
         page,
         page_frame,
         Point::zero(),
+        page_frame.width().to_pt(),
         page_frame.height().to_pt(),
         kind,
-        0,
+        &mut tag_stack,
         0,
         &mut Vec::new(),
-        &mut text,
+        &mut runs,
         &mut event_index,
         debug_events,
     )?;
+    let extracted = RenderedRegionText::from_runs(runs, page_frame.width().to_pt());
     if let Some(sink) = debug_events.as_deref_mut() {
         sink.rendered_region_trace_end(&RenderedRegionTraceEnd {
             trace_id: trace_id.unwrap(),
             side: side.to_string(),
             kind,
             page,
-            extracted_text: text.clone(),
+            extracted_text: extracted.text.clone(),
             event_count: event_index,
         })?;
     }
-    Ok(text)
+    Ok(extracted)
+}
+
+#[derive(Clone)]
+struct RenderedRegionText {
+    text: String,
+    clusters: Vec<RenderedRegionCluster>,
+}
+
+#[derive(Clone)]
+struct RenderedRegionCluster {
+    text: String,
+    content: Content,
+}
+
+#[derive(Clone)]
+struct RenderedRegionRun {
+    x: f64,
+    y: f64,
+    width: f64,
+    text: String,
+    content: Content,
+}
+
+impl RenderedRegionText {
+    fn from_runs(mut runs: Vec<RenderedRegionRun>, page_width_pt: f64) -> Self {
+        if runs.is_empty() {
+            return Self {
+                text: String::new(),
+                clusters: Vec::new(),
+            };
+        }
+
+        runs.sort_by(|a, b| {
+            a.y.partial_cmp(&b.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        let mut clusters = Vec::new();
+        let line_y_tolerance = 2.0;
+        let gap_threshold = (page_width_pt * 0.10).max(36.0);
+        let mut line = Vec::new();
+        let mut line_y = runs[0].y;
+
+        for run in runs {
+            if (run.y - line_y).abs() > line_y_tolerance {
+                push_line_clusters(&mut clusters, &mut line, gap_threshold);
+                line_y = run.y;
+            }
+            line.push(run);
+        }
+        push_line_clusters(&mut clusters, &mut line, gap_threshold);
+
+        Self {
+            text: clusters
+                .iter()
+                .map(|cluster| cluster.text.as_str())
+                .collect(),
+            clusters,
+        }
+    }
+}
+
+fn push_line_clusters(
+    clusters: &mut Vec<RenderedRegionCluster>,
+    line: &mut Vec<RenderedRegionRun>,
+    gap_threshold: f64,
+) {
+    if line.is_empty() {
+        return;
+    }
+    line.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut current = String::new();
+    let mut current_content = Vec::new();
+    let mut previous_end = None;
+    for run in line.drain(..) {
+        if let Some(end) = previous_end {
+            let gap = run.x - end;
+            if gap > gap_threshold && !current.is_empty() {
+                clusters.push(RenderedRegionCluster {
+                    text: std::mem::take(&mut current),
+                    content: Content::sequence(current_content.drain(..)),
+                });
+            }
+        }
+        current.push_str(&run.text);
+        current_content.push(run.content);
+        previous_end = Some(run.x + run.width);
+    }
+    if !current.is_empty() {
+        clusters.push(RenderedRegionCluster {
+            text: current,
+            content: Content::sequence(current_content),
+        });
+    }
 }
 
 fn collect_positioned_region_trace(
@@ -2383,12 +2526,13 @@ fn collect_positioned_region_trace(
     page: usize,
     frame: &Frame,
     origin: Point,
+    page_width_pt: f64,
     page_height_pt: f64,
     kind: PageRegionKind,
-    mut artifact_depth: usize,
+    tag_stack: &mut Vec<FrameTag>,
     group_depth: usize,
     frame_path: &mut Vec<usize>,
-    out: &mut String,
+    out: &mut Vec<RenderedRegionRun>,
     event_index: &mut usize,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
 ) -> anyhow::Result<()> {
@@ -2399,9 +2543,14 @@ fn collect_positioned_region_trace(
         }
         let absolute = origin + *pos;
         match item {
-            FrameItem::Tag(Tag::Start(content, _)) if content.elem().name() == "artifact" => {
-                let before = artifact_depth;
-                artifact_depth += 1;
+            FrameItem::Tag(Tag::Start(content, _)) => {
+                let is_artifact = content.elem().name() == "artifact";
+                let before = artifact_depth(tag_stack);
+                tag_stack.push(FrameTag {
+                    is_artifact,
+                    elem_name: content.elem().name().to_string(),
+                });
+                let after = artifact_depth(tag_stack);
                 emit_frame_trace_event(
                     debug_events,
                     trace_id,
@@ -2419,8 +2568,8 @@ fn collect_positioned_region_trace(
                     Some("start"),
                     Some(content.elem().name()),
                     before,
-                    artifact_depth,
-                    true,
+                    after,
+                    before != after,
                     None,
                     None,
                     None,
@@ -2432,9 +2581,10 @@ fn collect_positioned_region_trace(
                     None,
                 )?;
             }
-            FrameItem::Tag(Tag::End(_, _, _)) if artifact_depth > 0 => {
-                let before = artifact_depth;
-                artifact_depth -= 1;
+            FrameItem::Tag(Tag::End(_, _, _)) => {
+                let before = artifact_depth(tag_stack);
+                tag_stack.pop();
+                let after = artifact_depth(tag_stack);
                 emit_frame_trace_event(
                     debug_events,
                     trace_id,
@@ -2452,8 +2602,8 @@ fn collect_positioned_region_trace(
                     Some("end"),
                     None,
                     before,
-                    artifact_depth,
-                    true,
+                    after,
+                    before != after,
                     None,
                     None,
                     None,
@@ -2465,65 +2615,8 @@ fn collect_positioned_region_trace(
                     None,
                 )?;
             }
-            FrameItem::Tag(Tag::Start(content, _)) => emit_frame_trace_event(
-                debug_events,
-                trace_id,
-                side,
-                kind,
-                page,
-                event_index,
-                frame_path,
-                group_depth,
-                *pos,
-                absolute,
-                "tag_start",
-                None,
-                None,
-                Some("start"),
-                Some(content.elem().name()),
-                artifact_depth,
-                artifact_depth,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )?,
-            FrameItem::Tag(Tag::End(_, _, _)) => emit_frame_trace_event(
-                debug_events,
-                trace_id,
-                side,
-                kind,
-                page,
-                event_index,
-                frame_path,
-                group_depth,
-                *pos,
-                absolute,
-                "tag_end",
-                None,
-                None,
-                Some("end"),
-                None,
-                artifact_depth,
-                artifact_depth,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )?,
             FrameItem::Text(text) => {
+                let artifact_depth = artifact_depth(tag_stack);
                 let in_region_band = point_belongs_to_region(absolute, page_height_pt, kind);
                 let included = artifact_depth > 0 && in_region_band;
                 let excluded_reason = if included {
@@ -2534,7 +2627,13 @@ fn collect_positioned_region_trace(
                     Some("outside_region")
                 };
                 if included {
-                    out.push_str(text.text.as_str());
+                    out.push(RenderedRegionRun {
+                        x: absolute.x.to_pt(),
+                        y: absolute.y.to_pt(),
+                        width: text.width().to_pt(),
+                        text: text.text.to_string(),
+                        content: rendered_region_run_content(text.text.as_str(), tag_stack),
+                    });
                 }
                 emit_frame_trace_event(
                     debug_events,
@@ -2567,6 +2666,7 @@ fn collect_positioned_region_trace(
                 )?;
             }
             FrameItem::Group(group) => {
+                let artifact_depth = artifact_depth(tag_stack);
                 emit_frame_trace_event(
                     debug_events,
                     trace_id,
@@ -2602,9 +2702,10 @@ fn collect_positioned_region_trace(
                     page,
                     &group.frame,
                     absolute,
+                    page_width_pt,
                     page_height_pt,
                     kind,
-                    artifact_depth,
+                    tag_stack,
                     group_depth + 1,
                     frame_path,
                     out,
@@ -2657,8 +2758,8 @@ fn collect_positioned_region_trace(
                 None,
                 None,
                 None,
-                artifact_depth,
-                artifact_depth,
+                artifact_depth(tag_stack),
+                artifact_depth(tag_stack),
                 false,
                 None,
                 None,
@@ -2686,8 +2787,8 @@ fn collect_positioned_region_trace(
                 None,
                 None,
                 None,
-                artifact_depth,
-                artifact_depth,
+                artifact_depth(tag_stack),
+                artifact_depth(tag_stack),
                 false,
                 None,
                 None,
@@ -2715,8 +2816,8 @@ fn collect_positioned_region_trace(
                 None,
                 None,
                 None,
-                artifact_depth,
-                artifact_depth,
+                artifact_depth(tag_stack),
+                artifact_depth(tag_stack),
                 false,
                 None,
                 None,
@@ -2734,6 +2835,25 @@ fn collect_positioned_region_trace(
         }
     }
     Ok(())
+}
+
+struct FrameTag {
+    is_artifact: bool,
+    elem_name: String,
+}
+
+fn artifact_depth(tag_stack: &[FrameTag]) -> usize {
+    tag_stack.iter().filter(|tag| tag.is_artifact).count()
+}
+
+fn rendered_region_run_content(text: &str, tag_stack: &[FrameTag]) -> Content {
+    let mut content = TextElem::packed(text);
+    for tag in tag_stack.iter().rev() {
+        if tag.elem_name == "emph" {
+            content = content.emph();
+        }
+    }
+    content
 }
 
 fn emit_frame_trace_event(
