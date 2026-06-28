@@ -931,56 +931,6 @@ fn replace_annotated_at_path(
     replace_annotated_at_path(child, rest, replacement)
 }
 
-fn table_cell_bodies(children: &[TableChild]) -> Vec<Content> {
-    let mut cells = Vec::new();
-    for child in children {
-        match child {
-            TableChild::Item(TableItem::Cell(cell)) => cells.push(cell.body.clone()),
-            TableChild::Header(header) => {
-                for item in &header.children {
-                    if let TableItem::Cell(cell) = item {
-                        cells.push(cell.body.clone());
-                    }
-                }
-            }
-            TableChild::Footer(footer) => {
-                for item in &footer.children {
-                    if let TableItem::Cell(cell) = item {
-                        cells.push(cell.body.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    cells
-}
-
-fn grid_cell_bodies(children: &[GridChild]) -> Vec<Content> {
-    let mut cells = Vec::new();
-    for child in children {
-        match child {
-            GridChild::Item(GridItem::Cell(cell)) => cells.push(cell.body.clone()),
-            GridChild::Header(header) => {
-                for item in &header.children {
-                    if let GridItem::Cell(cell) = item {
-                        cells.push(cell.body.clone());
-                    }
-                }
-            }
-            GridChild::Footer(footer) => {
-                for item in &footer.children {
-                    if let GridItem::Cell(cell) = item {
-                        cells.push(cell.body.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    cells
-}
-
 fn prepend_path_index(index: usize, mut paths: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
     for path in &mut paths {
         path.insert(0, index);
@@ -1093,59 +1043,138 @@ fn wrapper_body_of(content: &Content) -> Option<Content> {
     None
 }
 
+trait IndexedCellItem {
+    fn cell_body(&self) -> Option<Content>;
+    fn replace_cell_body(&mut self, replacement: Content) -> Option<()>;
+}
+
+impl IndexedCellItem for TableItem {
+    fn cell_body(&self) -> Option<Content> {
+        match self {
+            TableItem::Cell(cell) => Some(cell.body.clone()),
+            _ => None,
+        }
+    }
+
+    fn replace_cell_body(&mut self, replacement: Content) -> Option<()> {
+        match self {
+            TableItem::Cell(cell) => {
+                cell.body = replacement;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+}
+
+impl IndexedCellItem for GridItem {
+    fn cell_body(&self) -> Option<Content> {
+        match self {
+            GridItem::Cell(cell) => Some(cell.body.clone()),
+            _ => None,
+        }
+    }
+
+    fn replace_cell_body(&mut self, replacement: Content) -> Option<()> {
+        match self {
+            GridItem::Cell(cell) => {
+                cell.body = replacement;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+}
+
+enum IndexedCellItems<'a, Item> {
+    Ordinary(&'a Item),
+    Group(&'a [Item]),
+}
+
+enum IndexedCellItemsMut<'a, Item> {
+    Ordinary(&'a mut Item),
+    Group(&'a mut [Item]),
+}
+
+trait IndexedCellChild {
+    type Item: IndexedCellItem;
+
+    fn cell_items(&self) -> IndexedCellItems<'_, <Self as IndexedCellChild>::Item>;
+    fn cell_items_mut(&mut self) -> IndexedCellItemsMut<'_, <Self as IndexedCellChild>::Item>;
+}
+
+impl IndexedCellChild for TableChild {
+    type Item = TableItem;
+
+    fn cell_items(&self) -> IndexedCellItems<'_, <Self as IndexedCellChild>::Item> {
+        match self {
+            TableChild::Item(item) => IndexedCellItems::Ordinary(item),
+            TableChild::Header(header) => IndexedCellItems::Group(&header.children),
+            TableChild::Footer(footer) => IndexedCellItems::Group(&footer.children),
+        }
+    }
+
+    fn cell_items_mut(&mut self) -> IndexedCellItemsMut<'_, <Self as IndexedCellChild>::Item> {
+        match self {
+            TableChild::Item(item) => IndexedCellItemsMut::Ordinary(item),
+            TableChild::Header(header) => IndexedCellItemsMut::Group(&mut header.children),
+            TableChild::Footer(footer) => IndexedCellItemsMut::Group(&mut footer.children),
+        }
+    }
+}
+
+impl IndexedCellChild for GridChild {
+    type Item = GridItem;
+
+    fn cell_items(&self) -> IndexedCellItems<'_, <Self as IndexedCellChild>::Item> {
+        match self {
+            GridChild::Item(item) => IndexedCellItems::Ordinary(item),
+            GridChild::Header(header) => IndexedCellItems::Group(&header.children),
+            GridChild::Footer(footer) => IndexedCellItems::Group(&footer.children),
+        }
+    }
+
+    fn cell_items_mut(&mut self) -> IndexedCellItemsMut<'_, <Self as IndexedCellChild>::Item> {
+        match self {
+            GridChild::Item(item) => IndexedCellItemsMut::Ordinary(item),
+            GridChild::Header(header) => IndexedCellItemsMut::Group(&mut header.children),
+            GridChild::Footer(footer) => IndexedCellItemsMut::Group(&mut footer.children),
+        }
+    }
+}
+
+fn table_cell_bodies(children: &[TableChild]) -> Vec<Content> {
+    indexed_cell_bodies(children)
+}
+
+fn grid_cell_bodies(children: &[GridChild]) -> Vec<Content> {
+    indexed_cell_bodies(children)
+}
+
+fn indexed_cell_bodies<Child: IndexedCellChild>(children: &[Child]) -> Vec<Content> {
+    let mut cells = Vec::new();
+    for child in children {
+        match child.cell_items() {
+            IndexedCellItems::Ordinary(item) => {
+                if let Some(body) = item.cell_body() {
+                    cells.push(body);
+                }
+            }
+            IndexedCellItems::Group(items) => {
+                cells.extend(items.iter().filter_map(IndexedCellItem::cell_body));
+            }
+        }
+    }
+    cells
+}
+
 fn replace_table_child_cell(
     children: &mut [TableChild],
     target: usize,
     replacement: Content,
     index: &mut usize,
 ) -> Option<()> {
-    for child in children {
-        let found = match child {
-            TableChild::Header(header) => {
-                replace_table_item_cell(&mut header.children, target, replacement.clone(), index)
-            }
-            TableChild::Footer(footer) => {
-                replace_table_item_cell(&mut footer.children, target, replacement.clone(), index)
-            }
-            TableChild::Item(item) => {
-                replace_one_table_item_cell(item, target, replacement.clone(), index)
-            }
-        };
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
-}
-
-fn replace_table_item_cell(
-    items: &mut [TableItem],
-    target: usize,
-    replacement: Content,
-    index: &mut usize,
-) -> Option<()> {
-    for item in items {
-        if replace_one_table_item_cell(item, target, replacement.clone(), index).is_some() {
-            return Some(());
-        }
-    }
-    None
-}
-
-fn replace_one_table_item_cell(
-    item: &mut TableItem,
-    target: usize,
-    replacement: Content,
-    index: &mut usize,
-) -> Option<()> {
-    if let TableItem::Cell(cell) = item {
-        if *index == target {
-            cell.body = replacement;
-            return Some(());
-        }
-        *index += 1;
-    }
-    None
+    replace_indexed_child_cell(children, target, replacement, index)
 }
 
 fn replace_grid_child_cell(
@@ -1154,16 +1183,22 @@ fn replace_grid_child_cell(
     replacement: Content,
     index: &mut usize,
 ) -> Option<()> {
+    replace_indexed_child_cell(children, target, replacement, index)
+}
+
+fn replace_indexed_child_cell<Child: IndexedCellChild>(
+    children: &mut [Child],
+    target: usize,
+    replacement: Content,
+    index: &mut usize,
+) -> Option<()> {
     for child in children {
-        let found = match child {
-            GridChild::Header(header) => {
-                replace_grid_item_cell(&mut header.children, target, replacement.clone(), index)
+        let found = match child.cell_items_mut() {
+            IndexedCellItemsMut::Ordinary(item) => {
+                replace_one_indexed_cell(item, target, replacement.clone(), index)
             }
-            GridChild::Footer(footer) => {
-                replace_grid_item_cell(&mut footer.children, target, replacement.clone(), index)
-            }
-            GridChild::Item(item) => {
-                replace_one_grid_item_cell(item, target, replacement.clone(), index)
+            IndexedCellItemsMut::Group(items) => {
+                replace_indexed_item_cell(items, target, replacement.clone(), index)
             }
         };
         if found.is_some() {
@@ -1173,33 +1208,31 @@ fn replace_grid_child_cell(
     None
 }
 
-fn replace_grid_item_cell(
-    items: &mut [GridItem],
+fn replace_indexed_item_cell<Item: IndexedCellItem>(
+    items: &mut [Item],
     target: usize,
     replacement: Content,
     index: &mut usize,
 ) -> Option<()> {
     for item in items {
-        if replace_one_grid_item_cell(item, target, replacement.clone(), index).is_some() {
+        if replace_one_indexed_cell(item, target, replacement.clone(), index).is_some() {
             return Some(());
         }
     }
     None
 }
 
-fn replace_one_grid_item_cell(
-    item: &mut GridItem,
+fn replace_one_indexed_cell<Item: IndexedCellItem>(
+    item: &mut Item,
     target: usize,
     replacement: Content,
     index: &mut usize,
 ) -> Option<()> {
-    if let GridItem::Cell(cell) = item {
-        if *index == target {
-            cell.body = replacement;
-            return Some(());
-        }
-        *index += 1;
+    item.cell_body()?;
+    if *index == target {
+        return item.replace_cell_body(replacement);
     }
+    *index += 1;
     None
 }
 
@@ -1208,39 +1241,7 @@ fn ordinary_table_insert_index(
     target: usize,
     before: bool,
 ) -> Option<usize> {
-    let mut seen = 0usize;
-    for (child_index, child) in children.iter().enumerate() {
-        match child {
-            TableChild::Item(TableItem::Cell(_)) => {
-                if seen == target {
-                    return Some(if before { child_index } else { child_index + 1 });
-                }
-                seen += 1;
-            }
-            TableChild::Header(header) => {
-                for item in &header.children {
-                    if matches!(item, TableItem::Cell(_)) {
-                        if seen == target {
-                            return None;
-                        }
-                        seen += 1;
-                    }
-                }
-            }
-            TableChild::Footer(footer) => {
-                for item in &footer.children {
-                    if matches!(item, TableItem::Cell(_)) {
-                        if seen == target {
-                            return None;
-                        }
-                        seen += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    ordinary_cell_insert_index(children, target, before)
 }
 
 fn ordinary_grid_insert_index(
@@ -1248,18 +1249,26 @@ fn ordinary_grid_insert_index(
     target: usize,
     before: bool,
 ) -> Option<usize> {
+    ordinary_cell_insert_index(children, target, before)
+}
+
+fn ordinary_cell_insert_index<Child: IndexedCellChild>(
+    children: &[Child],
+    target: usize,
+    before: bool,
+) -> Option<usize> {
     let mut seen = 0usize;
     for (child_index, child) in children.iter().enumerate() {
-        match child {
-            GridChild::Item(GridItem::Cell(_)) => {
+        match child.cell_items() {
+            IndexedCellItems::Ordinary(item) if item.cell_body().is_some() => {
                 if seen == target {
                     return Some(if before { child_index } else { child_index + 1 });
                 }
                 seen += 1;
             }
-            GridChild::Header(header) => {
-                for item in &header.children {
-                    if matches!(item, GridItem::Cell(_)) {
+            IndexedCellItems::Group(items) => {
+                for item in items {
+                    if item.cell_body().is_some() {
                         if seen == target {
                             return None;
                         }
@@ -1267,17 +1276,7 @@ fn ordinary_grid_insert_index(
                     }
                 }
             }
-            GridChild::Footer(footer) => {
-                for item in &footer.children {
-                    if matches!(item, GridItem::Cell(_)) {
-                        if seen == target {
-                            return None;
-                        }
-                        seen += 1;
-                    }
-                }
-            }
-            _ => {}
+            IndexedCellItems::Ordinary(_) => {}
         }
     }
     None
@@ -1287,11 +1286,68 @@ fn ordinary_grid_insert_index(
 mod tests {
     use super::*;
     use typst::foundations::{Packed, StyleChain};
-    use typst::model::TermItem;
+    use typst::layout::{GridFooter, GridHeader};
+    use typst::model::{TableFooter, TableHeader, TermItem};
     use typst::text::TextElem;
 
     fn text(value: &str) -> Content {
         TextElem::packed(value)
+    }
+
+    fn table_cell(value: &str) -> TableItem {
+        TableItem::Cell(Packed::new(TableCell::new(text(value))))
+    }
+
+    fn grid_cell(value: &str) -> GridItem {
+        GridItem::Cell(Packed::new(GridCell::new(text(value))))
+    }
+
+    #[test]
+    fn indexed_table_cells_include_header_body_and_footer() {
+        let mut children = vec![
+            TableChild::Header(Packed::new(TableHeader::new(vec![table_cell("Header")]))),
+            TableChild::Item(table_cell("Body")),
+            TableChild::Footer(Packed::new(TableFooter::new(vec![table_cell("Footer")]))),
+        ];
+
+        let bodies = table_cell_bodies(&children);
+        assert_eq!(
+            bodies
+                .iter()
+                .map(|body| body.plain_text().to_string())
+                .collect::<Vec<_>>(),
+            ["Header", "Body", "Footer"]
+        );
+
+        replace_table_child_cell(&mut children, 2, text("New footer"), &mut 0).unwrap();
+        let bodies = table_cell_bodies(&children);
+        assert_eq!(bodies[2].plain_text(), "New footer");
+        assert_eq!(ordinary_table_insert_index(&children, 0, true), None);
+        assert_eq!(ordinary_table_insert_index(&children, 1, false), Some(2));
+    }
+
+    #[test]
+    fn indexed_grid_cells_include_header_body_and_footer() {
+        let mut children = vec![
+            GridChild::Header(Packed::new(GridHeader::new(vec![grid_cell("Header")]))),
+            GridChild::Item(grid_cell("Body")),
+            GridChild::Footer(Packed::new(GridFooter::new(vec![grid_cell("Footer")]))),
+        ];
+
+        let bodies = grid_cell_bodies(&children);
+        assert_eq!(
+            bodies
+                .iter()
+                .map(|body| body.plain_text().to_string())
+                .collect::<Vec<_>>(),
+            ["Header", "Body", "Footer"]
+        );
+
+        replace_grid_child_cell(&mut children, 2, text("New footer"), &mut 0).unwrap();
+        let bodies = grid_cell_bodies(&children);
+        assert_eq!(bodies[2].plain_text(), "New footer");
+        assert_eq!(ordinary_grid_insert_index(&children, 0, true), None);
+        assert_eq!(ordinary_grid_insert_index(&children, 1, false), Some(2));
     }
 
     #[test]

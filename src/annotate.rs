@@ -25,10 +25,11 @@ use typst::model::{EmphElem, EnumElem, HeadingElem, ListElem, ParElem, ParbreakE
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
+use crate::annotated::effective_render_content;
 use crate::container_ops;
 use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
-    RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, WordOp,
+    RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, Token, WordOp,
 };
 
 fn green() -> Color {
@@ -39,6 +40,28 @@ fn red() -> Color {
 }
 fn blue() -> Color {
     Color::from_u8(0, 100, 220, 255)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangeColor {
+    Green,
+    Blue,
+}
+
+impl ChangeColor {
+    fn color(self) -> Color {
+        match self {
+            Self::Green => green(),
+            Self::Blue => blue(),
+        }
+    }
+
+    fn typst_hex(self) -> &'static str {
+        match self {
+            Self::Green => "#00b400",
+            Self::Blue => "#0064dc",
+        }
+    }
 }
 
 fn flush_group(
@@ -66,43 +89,81 @@ fn flush_group(
 /// one word-like token.
 fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) -> Content {
     let mut inline: Vec<Content> = Vec::new();
-    for (i, wop) in word_ops.iter().enumerate() {
-        match wop {
-            WordOp::Equal(tokens) => {
+    for run in word_render_runs(word_ops, compact_substitutions) {
+        match run {
+            WordRenderRun::Equal(tokens) => {
                 for t in tokens {
                     inline.push(t.content.clone());
                 }
             }
-            WordOp::Insert(tokens) => {
-                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
-                let next = word_ops.get(i + 1);
-                let adjacent_delete = prev.is_some_and(|op| matches!(op, WordOp::Delete(_)))
-                    || next.is_some_and(|op| matches!(op, WordOp::Delete(_)));
-                let color = if compact_substitutions && adjacent_delete {
-                    blue()
-                } else {
-                    green()
-                };
-                let joined = changed_token_sequence(
-                    tokens,
-                    prev.and_then(tokens_before_insert),
-                    compact_substitutions,
-                );
-                inline.push(joined.styled(TextElem::fill.set(color.into())));
+            WordRenderRun::Insert {
+                tokens,
+                color,
+                needs_separator,
+            } => {
+                let joined = changed_token_sequence(tokens, needs_separator);
+                inline.push(joined.styled(TextElem::fill.set(color.color().into())));
             }
-            WordOp::Delete(tokens) => {
-                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
-                let next = word_ops.get(i + 1);
-                let is_substitution = compact_substitutions
-                    && (prev.is_some_and(|op| matches!(op, WordOp::Insert(_)))
-                        || next.is_some_and(|op| matches!(op, WordOp::Insert(_))));
-                if !is_substitution {
+            WordRenderRun::Delete { tokens, visible } => {
+                if visible {
                     inline.push(Content::sequence(tokens.iter().map(deleted_token_content)));
                 }
             }
         }
     }
     Content::sequence(inline)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WordRenderRun<'a> {
+    Equal(&'a [Token]),
+    Insert {
+        tokens: &'a [Token],
+        color: ChangeColor,
+        needs_separator: bool,
+    },
+    Delete {
+        tokens: &'a [Token],
+        visible: bool,
+    },
+}
+
+fn word_render_runs(word_ops: &[WordOp], compact: bool) -> Vec<WordRenderRun<'_>> {
+    word_ops
+        .iter()
+        .enumerate()
+        .map(|(index, op)| {
+            let prev = index.checked_sub(1).and_then(|i| word_ops.get(i));
+            let next = word_ops.get(index + 1);
+            match op {
+                WordOp::Equal(tokens) => WordRenderRun::Equal(tokens),
+                WordOp::Insert(tokens) => {
+                    let adjacent_delete = prev.is_some_and(|op| matches!(op, WordOp::Delete(_)))
+                        || next.is_some_and(|op| matches!(op, WordOp::Delete(_)));
+                    WordRenderRun::Insert {
+                        tokens,
+                        color: if compact && adjacent_delete {
+                            ChangeColor::Blue
+                        } else {
+                            ChangeColor::Green
+                        },
+                        needs_separator: !compact
+                            && prev
+                                .and_then(tokens_before_insert)
+                                .is_some_and(|prev| needs_separator(prev, tokens)),
+                    }
+                }
+                WordOp::Delete(tokens) => {
+                    let adjacent_insert = prev.is_some_and(|op| matches!(op, WordOp::Insert(_)))
+                        || next.is_some_and(|op| matches!(op, WordOp::Insert(_)));
+                    WordRenderRun::Delete {
+                        tokens,
+                        visible: !(compact && adjacent_insert),
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 fn tokens_before_insert(op: &WordOp) -> Option<&[crate::diff::Token]> {
@@ -112,13 +173,9 @@ fn tokens_before_insert(op: &WordOp) -> Option<&[crate::diff::Token]> {
     }
 }
 
-fn changed_token_sequence(
-    tokens: &[crate::diff::Token],
-    previous_tokens: Option<&[crate::diff::Token]>,
-    compact_substitutions: bool,
-) -> Content {
+fn changed_token_sequence(tokens: &[Token], needs_separator: bool) -> Content {
     let mut content: Vec<Content> = Vec::new();
-    if !compact_substitutions && previous_tokens.is_some_and(|prev| needs_separator(prev, tokens)) {
+    if needs_separator {
         content.push(SpaceElem::shared().clone());
     }
     content.extend(tokens.iter().map(|t| t.content.clone()));
@@ -232,15 +289,6 @@ fn strip_inherited_styles(content: &Content, inherited: &Styles) -> Content {
 
     let mut content = content.clone();
 
-    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
-        seq.children = seq
-            .children
-            .iter()
-            .map(|child| strip_inherited_styles(child, inherited))
-            .collect();
-        return content;
-    }
-
     if let Some(styled) = content.to_packed_mut::<StyledElem>() {
         let child = strip_inherited_styles(&styled.child, inherited);
         let stripped = styles_without_inherited_sequence(&styled.styles, inherited);
@@ -254,44 +302,10 @@ fn strip_inherited_styles(content: &Content, inherited: &Styles) -> Content {
         return content;
     }
 
-    if let Some(par) = content.to_packed_mut::<ParElem>() {
-        par.body = strip_inherited_styles(&par.body, inherited);
-        return content;
-    }
-
-    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
-        heading.body = strip_inherited_styles(&heading.body, inherited);
-        return content;
-    }
-
-    if let Some(block) = content.to_packed_mut::<BlockElem>()
-        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    if let Some(mapped) =
+        map_transparent_children(&content, |child| strip_inherited_styles(child, inherited))
     {
-        block
-            .body
-            .set(Some(BlockBody::Content(strip_inherited_styles(
-                &body, inherited,
-            ))));
-        return content;
-    }
-
-    if let Some(strike) = content.to_packed_mut::<StrikeElem>() {
-        strike.body = strip_inherited_styles(&strike.body, inherited);
-        return content;
-    }
-
-    if let Some(list) = content.to_packed_mut::<ListElem>() {
-        for item in &mut list.children {
-            item.body = strip_inherited_styles(&item.body, inherited);
-        }
-        return content;
-    }
-
-    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
-        for item in &mut enm.children {
-            item.body = strip_inherited_styles(&item.body, inherited);
-        }
-        return content;
+        return mapped;
     }
 
     content
@@ -335,105 +349,84 @@ fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
 }
 
-/// Apply `fill` to the text content of `content` at the outer block level.
-///
-/// The realized-edit pipeline uses this for inserted edit payloads so structural
-/// whitespace nodes remain bare.
-fn apply_fill_inside(content: &Content, fill: Color) -> Content {
+fn map_transparent_children(
+    content: &Content,
+    mut map_child: impl FnMut(&Content) -> Content,
+) -> Option<Content> {
     let mut content = content.clone();
 
     if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
-        seq.children = seq
-            .children
-            .iter()
-            .map(|child| apply_fill_inside(child, fill))
-            .collect();
-        return content;
+        seq.children = seq.children.iter().map(map_child).collect();
+        return Some(content);
     }
 
     if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        styled.child = apply_fill_inside(&styled.child, fill);
-        return content;
+        styled.child = map_child(&styled.child);
+        return Some(content);
     }
 
     if let Some(par) = content.to_packed_mut::<ParElem>() {
-        par.body = apply_fill_inside(&par.body, fill);
-        return content;
+        par.body = map_child(&par.body);
+        return Some(content);
     }
 
     if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
-        heading.body = apply_fill_inside(&heading.body, fill);
-        return content;
-    }
-
-    if let Some(list) = content.to_packed_mut::<ListElem>() {
-        for item in &mut list.children {
-            item.body = apply_fill_inside(&item.body, fill);
-        }
-        return content;
-    }
-
-    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
-        for item in &mut enm.children {
-            item.body = apply_fill_inside(&item.body, fill);
-        }
-        return content;
-    }
-
-    content.styled(TextElem::fill.set(fill.into()))
-}
-
-fn apply_delete_inside(content: &Content) -> Content {
-    let mut content = content.clone();
-
-    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
-        seq.children = seq.children.iter().map(apply_delete_inside).collect();
-        return content;
-    }
-
-    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        styled.child = apply_delete_inside(&styled.child);
-        return content;
-    }
-
-    if let Some(par) = content.to_packed_mut::<ParElem>() {
-        par.body = apply_delete_inside(&par.body);
-        return content;
-    }
-
-    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
-        heading.body = apply_delete_inside(&heading.body);
-        return content;
+        heading.body = map_child(&heading.body);
+        return Some(content);
     }
 
     if let Some(block) = content.to_packed_mut::<BlockElem>()
         && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
     {
-        block
-            .body
-            .set(Some(BlockBody::Content(apply_delete_inside(&body))));
-        return content;
+        block.body.set(Some(BlockBody::Content(map_child(&body))));
+        return Some(content);
+    }
+
+    if let Some(strike) = content.to_packed_mut::<StrikeElem>() {
+        strike.body = map_child(&strike.body);
+        return Some(content);
     }
 
     if let Some(list) = content.to_packed_mut::<ListElem>() {
         for item in &mut list.children {
-            item.body = apply_delete_inside(&item.body);
+            item.body = map_child(&item.body);
         }
-        return content;
+        return Some(content);
     }
 
     if let Some(enm) = content.to_packed_mut::<EnumElem>() {
         for item in &mut enm.children {
-            item.body = apply_delete_inside(&item.body);
+            item.body = map_child(&item.body);
         }
-        return content;
+        return Some(content);
+    }
+
+    None
+}
+
+/// Apply `fill` to the text content of `content` at the outer block level.
+///
+/// The realized-edit pipeline uses this for inserted edit payloads so structural
+/// whitespace nodes remain bare.
+fn apply_fill_inside(content: &Content, fill: Color) -> Content {
+    if let Some(mapped) = map_transparent_children(content, |child| apply_fill_inside(child, fill))
+    {
+        return mapped;
+    }
+
+    content.clone().styled(TextElem::fill.set(fill.into()))
+}
+
+fn apply_delete_inside(content: &Content) -> Content {
+    if let Some(mapped) = map_transparent_children(content, apply_delete_inside) {
+        return mapped;
     }
 
     if content.plain_text().is_empty() {
-        return content;
+        return content.clone();
     }
 
-    let colored = content.styled(TextElem::fill.set(red().into()));
+    let colored = content.clone().styled(TextElem::fill.set(red().into()));
     Content::new(StrikeElem::new(colored))
 }
 
@@ -445,21 +438,21 @@ pub fn build_annotated_content_from_tree(
     let mut groups: Vec<Content> = Vec::new();
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles: Option<typst::foundations::Styles> = None;
+    let page_region_updates = page_region_updates(
+        &result.regions,
+        &result.rendered_regions,
+        compact_substitutions,
+    );
 
     for mut annotated_block in result
         .blocks
         .iter()
         .map(|block| annotate_block_edit(block, compact_substitutions))
     {
-        apply_region_edits_to_page_styles(
+        apply_page_region_updates(
             &mut annotated_block.page_styles,
-            &result.regions,
-            compact_substitutions,
-        );
-        apply_rendered_region_edits_to_page_styles(
-            &mut annotated_block.page_styles,
-            &result.rendered_regions,
-            compact_substitutions,
+            &page_region_updates,
+            PageRegionUpdateScope::ExistingOnly,
         );
         if current_page_styles
             .as_ref()
@@ -472,11 +465,10 @@ pub fn build_annotated_content_from_tree(
     }
     flush_group(&mut groups, &mut current_blocks, current_page_styles);
     let mut root_styles = result.root_styles.clone();
-    apply_region_edits_to_root_styles(&mut root_styles, &result.regions, compact_substitutions);
-    apply_rendered_region_edits_to_root_styles(
+    apply_page_region_updates(
         &mut root_styles,
-        &result.rendered_regions,
-        compact_substitutions,
+        &page_region_updates,
+        PageRegionUpdateScope::All,
     );
     crate::normalize::normalize_list_item_runs(
         Content::sequence(groups).styled_with_map(root_styles),
@@ -516,37 +508,54 @@ pub(crate) fn apply_edits_to_base(
             index += 1;
         }
     }
-    effective_realized_content(&node)
+    effective_render_content(&node)
 }
 
-fn apply_region_edits_to_root_styles(
-    root_styles: &mut Styles,
+struct PageRegionUpdate {
+    kind: PageRegionKind,
+    content: Content,
+}
+
+#[derive(Clone, Copy)]
+enum PageRegionUpdateScope {
+    All,
+    ExistingOnly,
+}
+
+fn page_region_updates(
     regions: &[DiffRegionEdit],
+    rendered_regions: &[RenderedRegionEdit],
     compact: bool,
-) {
+) -> Vec<PageRegionUpdate> {
+    let mut updates = Vec::new();
     for region in regions {
         let content = apply_edits_to_base(&region.base, &region.edits, compact);
         match region.path {
-            RegionPath::RootPage(kind) => set_root_page_region(root_styles, kind, content),
+            RegionPath::RootPage(kind) => updates.push(PageRegionUpdate { kind, content }),
         }
     }
+    updates.extend(rendered_regions.iter().map(|region| PageRegionUpdate {
+        kind: region.kind,
+        content: rendered_region_context_content(region, compact),
+    }));
+    updates
 }
 
-fn apply_region_edits_to_page_styles(
-    page_styles: &mut Styles,
-    regions: &[DiffRegionEdit],
-    compact: bool,
+fn apply_page_region_updates(
+    styles: &mut Styles,
+    updates: &[PageRegionUpdate],
+    scope: PageRegionUpdateScope,
 ) {
-    if page_styles.is_empty() {
+    if styles.is_empty() && matches!(scope, PageRegionUpdateScope::ExistingOnly) {
         return;
     }
-    for region in regions {
-        let RegionPath::RootPage(kind) = region.path;
-        if !page_styles_has_region(page_styles, kind) {
+    for update in updates {
+        if matches!(scope, PageRegionUpdateScope::ExistingOnly)
+            && !page_styles_has_region(styles, update.kind)
+        {
             continue;
         }
-        let content = apply_edits_to_base(&region.base, &region.edits, compact);
-        set_root_page_region(page_styles, kind, content);
+        set_page_region(styles, update.kind, update.content.clone());
     }
 }
 
@@ -559,44 +568,16 @@ fn page_styles_has_region(page_styles: &Styles, kind: PageRegionKind) -> bool {
     }
 }
 
-fn set_root_page_region(root_styles: &mut Styles, kind: PageRegionKind, content: Content) {
+fn set_page_region(styles: &mut Styles, kind: PageRegionKind, content: Content) {
     match kind {
         PageRegionKind::Header => {
-            root_styles.push(PageElem::header.set(Smart::Custom(Some(marginal_content(content)))))
+            styles.push(PageElem::header.set(Smart::Custom(Some(marginal_content(content)))))
         }
         PageRegionKind::Footer => {
-            root_styles.push(PageElem::footer.set(Smart::Custom(Some(marginal_content(content)))))
+            styles.push(PageElem::footer.set(Smart::Custom(Some(marginal_content(content)))))
         }
-        PageRegionKind::Background => root_styles.push(PageElem::background.set(Some(content))),
-        PageRegionKind::Foreground => root_styles.push(PageElem::foreground.set(Some(content))),
-    }
-}
-
-fn apply_rendered_region_edits_to_root_styles(
-    root_styles: &mut Styles,
-    regions: &[RenderedRegionEdit],
-    compact: bool,
-) {
-    for region in regions {
-        let content = rendered_region_context_content(region, compact);
-        set_root_page_region(root_styles, region.kind, content);
-    }
-}
-
-fn apply_rendered_region_edits_to_page_styles(
-    page_styles: &mut Styles,
-    regions: &[RenderedRegionEdit],
-    compact: bool,
-) {
-    if page_styles.is_empty() {
-        return;
-    }
-    for region in regions {
-        if !page_styles_has_region(page_styles, region.kind) {
-            continue;
-        }
-        let content = rendered_region_context_content(region, compact);
-        set_root_page_region(page_styles, region.kind, content);
+        PageRegionKind::Background => styles.push(PageElem::background.set(Some(content))),
+        PageRegionKind::Foreground => styles.push(PageElem::foreground.set(Some(content))),
     }
 }
 
@@ -666,40 +647,26 @@ fn rendered_region_alignment_name(alignment: RenderedRegionAlignment) -> &'stati
 
 fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
     let mut out = String::new();
-    for (i, op) in word_ops.iter().enumerate() {
-        match op {
-            WordOp::Equal(tokens) => {
+    for run in word_render_runs(word_ops, compact) {
+        match run {
+            WordRenderRun::Equal(tokens) => {
                 for token in tokens {
                     out.push_str(&content_typst_markup(&token.content));
                 }
             }
-            WordOp::Insert(tokens) => {
-                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
-                let next = word_ops.get(i + 1);
-                let adjacent_delete = prev.is_some_and(|op| matches!(op, WordOp::Delete(_)))
-                    || next.is_some_and(|op| matches!(op, WordOp::Delete(_)));
-                let color = if compact && adjacent_delete {
-                    "#0064dc"
-                } else {
-                    "#00b400"
-                };
+            WordRenderRun::Insert {
+                tokens,
+                color,
+                needs_separator,
+            } => {
                 out.push_str(&format!(
                     "#text(fill: rgb(\"{}\"))[{}]",
-                    color,
-                    changed_tokens_typst_markup(
-                        tokens,
-                        prev.and_then(tokens_before_insert),
-                        compact
-                    )
+                    color.typst_hex(),
+                    changed_tokens_typst_markup(tokens, needs_separator)
                 ));
             }
-            WordOp::Delete(tokens) => {
-                let prev = i.checked_sub(1).and_then(|j| word_ops.get(j));
-                let next = word_ops.get(i + 1);
-                let is_substitution = compact
-                    && (prev.is_some_and(|op| matches!(op, WordOp::Insert(_)))
-                        || next.is_some_and(|op| matches!(op, WordOp::Insert(_))));
-                if !is_substitution {
+            WordRenderRun::Delete { tokens, visible } => {
+                if visible {
                     out.push_str(&format!(
                         "#strike[#text(fill: rgb(\"#dc0000\"))[{}]]",
                         tokens_typst_markup(tokens)
@@ -711,20 +678,16 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
     out
 }
 
-fn changed_tokens_typst_markup(
-    tokens: &[crate::diff::Token],
-    previous_tokens: Option<&[crate::diff::Token]>,
-    compact_substitutions: bool,
-) -> String {
+fn changed_tokens_typst_markup(tokens: &[Token], needs_separator: bool) -> String {
     let mut text = String::new();
-    if !compact_substitutions && previous_tokens.is_some_and(|prev| needs_separator(prev, tokens)) {
+    if needs_separator {
         text.push(' ');
     }
     text.push_str(&tokens_typst_markup(tokens));
     text
 }
 
-fn tokens_typst_markup(tokens: &[crate::diff::Token]) -> String {
+fn tokens_typst_markup(tokens: &[Token]) -> String {
     tokens
         .iter()
         .map(|token| content_typst_markup(&token.content))
@@ -772,16 +735,9 @@ fn insertion_anchor(edit: &RealizedEdit) -> Option<(bool, &[usize])> {
     }
 }
 
-fn effective_realized_content(node: &crate::annotated::AnnotatedContent) -> Content {
-    let surface = node
-        .annotation
-        .patch_surface
-        .as_ref()
-        .unwrap_or(&node.realized);
-    if !surface.is_empty() || node.children.is_empty() {
-        return surface.clone();
-    }
-    Content::sequence(node.children.iter().map(effective_realized_content))
+enum PathEdit {
+    Replace(Content),
+    Insert { content: Content, before: bool },
 }
 
 fn apply_realized_edit(
@@ -820,7 +776,7 @@ fn apply_realized_edit(
         }
         RealizedEdit::Append { content } => {
             let rendered = render_edit_content(content, compact);
-            let base = effective_realized_content(node);
+            let base = effective_render_content(node);
             node.annotation.patch_surface = Some(Content::sequence([base, rendered]));
         }
         RealizedEdit::WholeBlock(content) => {
@@ -944,30 +900,11 @@ fn replace_annotated_path_content(
     path: &[usize],
     replacement: Content,
 ) -> Option<Content> {
-    let Some((index, rest)) = path.split_first() else {
-        return Some(replacement);
+    let Some((index, _)) = path.split_first() else {
+        return apply_path_edit(render_surface(node), path, PathEdit::Replace(replacement));
     };
     let surface = patchable_surface_for_index(node, *index)?;
-    let surface_child = container_ops::realized_child_contents(&surface)
-        .get(*index)
-        .cloned()?;
-    let replaced_child = replace_content_path(&surface_child, rest, replacement)?;
-    container_ops::replace_realized_child(&surface, *index, replaced_child)
-}
-
-fn replace_content_path(
-    surface: &Content,
-    path: &[usize],
-    replacement: Content,
-) -> Option<Content> {
-    let Some((index, rest)) = path.split_first() else {
-        return Some(replacement);
-    };
-    let surface_child = container_ops::realized_child_contents(surface)
-        .get(*index)
-        .cloned()?;
-    let replaced_child = replace_content_path(&surface_child, rest, replacement)?;
-    container_ops::replace_realized_child(surface, *index, replaced_child)
+    apply_path_edit(&surface, path, PathEdit::Replace(replacement))
 }
 
 fn insert_annotated_path_content(
@@ -976,37 +913,37 @@ fn insert_annotated_path_content(
     insertion: Content,
     before: bool,
 ) -> Option<Content> {
-    let (index, rest) = path.split_first()?;
-    if rest.is_empty() {
-        return container_ops::insert_realized_child(
-            render_surface(node),
-            *index,
-            insertion,
+    apply_path_edit(
+        render_surface(node),
+        path,
+        PathEdit::Insert {
+            content: insertion,
             before,
-        );
-    }
-    let surface = render_surface(node);
-    let surface_child = container_ops::realized_child_contents(surface)
-        .get(*index)
-        .cloned()?;
-    let patched_child = insert_content_path(&surface_child, rest, insertion, before)?;
-    container_ops::replace_realized_child(surface, *index, patched_child)
+        },
+    )
 }
 
-fn insert_content_path(
-    surface: &Content,
-    path: &[usize],
-    insertion: Content,
-    before: bool,
-) -> Option<Content> {
-    let (index, rest) = path.split_first()?;
+fn apply_path_edit(surface: &Content, path: &[usize], edit: PathEdit) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return match edit {
+            PathEdit::Replace(content) => Some(content),
+            PathEdit::Insert { .. } => None,
+        };
+    };
     if rest.is_empty() {
-        return container_ops::insert_realized_child(surface, *index, insertion, before);
+        return match edit {
+            PathEdit::Replace(content) => {
+                container_ops::replace_realized_child(surface, *index, content)
+            }
+            PathEdit::Insert { content, before } => {
+                container_ops::insert_realized_child(surface, *index, content, before)
+            }
+        };
     }
     let surface_child = container_ops::realized_child_contents(surface)
         .get(*index)
         .cloned()?;
-    let patched_child = insert_content_path(&surface_child, rest, insertion, before)?;
+    let patched_child = apply_path_edit(&surface_child, rest, edit)?;
     container_ops::replace_realized_child(surface, *index, patched_child)
 }
 
@@ -1029,7 +966,7 @@ fn patchable_surface_for_index(
         return Some(surface.clone());
     }
     (index < node.children.len())
-        .then(|| Content::sequence(node.children.iter().map(effective_realized_content)))
+        .then(|| Content::sequence(node.children.iter().map(effective_render_content)))
 }
 
 #[cfg(test)]
@@ -1092,6 +1029,138 @@ mod tests {
             std::ops::ControlFlow::Continue(())
         });
         count
+    }
+
+    #[test]
+    fn word_render_runs_share_compact_substitution_policy() {
+        let old = word_token("old");
+        let new = word_token("new");
+        let ops = vec![
+            WordOp::Delete(vec![old.clone()]),
+            WordOp::Insert(vec![new.clone()]),
+        ];
+        let runs = word_render_runs(&ops, true);
+
+        assert!(matches!(
+            runs.as_slice(),
+            [
+                WordRenderRun::Delete { visible: false, .. },
+                WordRenderRun::Insert {
+                    color: ChangeColor::Blue,
+                    needs_separator: false,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn word_render_runs_share_separator_policy() {
+        let ops = vec![
+            WordOp::Equal(vec![word_token("matter")]),
+            WordOp::Insert(vec![word_token("entirely")]),
+        ];
+        let runs = word_render_runs(&ops, false);
+
+        assert!(matches!(
+            runs.as_slice(),
+            [
+                WordRenderRun::Equal(_),
+                WordRenderRun::Insert {
+                    color: ChangeColor::Green,
+                    needs_separator: true,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn apply_path_edit_replaces_and_inserts_list_children() {
+        let list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
+        ]));
+
+        let replaced =
+            apply_path_edit(&list, &[1], PathEdit::Replace(TextElem::packed("Beta"))).unwrap();
+        let replaced_list = replaced.to_packed::<ListElem>().unwrap();
+        assert_eq!(replaced_list.children[1].body.plain_text(), "Beta");
+
+        let inserted = apply_path_edit(
+            &list,
+            &[1],
+            PathEdit::Insert {
+                content: TextElem::packed("Beta"),
+                before: true,
+            },
+        )
+        .unwrap();
+        let inserted_list = inserted.to_packed::<ListElem>().unwrap();
+        assert_eq!(inserted_list.children.len(), 3);
+        assert_eq!(inserted_list.children[1].body.plain_text(), "Beta");
+        assert_eq!(inserted_list.children[2].body.plain_text(), "Gamma");
+    }
+
+    #[test]
+    fn page_region_updates_apply_to_root_and_existing_page_styles() {
+        let updates = vec![
+            PageRegionUpdate {
+                kind: PageRegionKind::Header,
+                content: TextElem::packed("New header"),
+            },
+            PageRegionUpdate {
+                kind: PageRegionKind::Footer,
+                content: TextElem::packed("New footer"),
+            },
+        ];
+
+        let mut page_styles = Styles::new();
+        page_styles.push(PageElem::header.set(Smart::Custom(Some(TextElem::packed("Old")))));
+        apply_page_region_updates(
+            &mut page_styles,
+            &updates,
+            PageRegionUpdateScope::ExistingOnly,
+        );
+        let chain = StyleChain::new(&page_styles);
+        assert_eq!(
+            chain
+                .get_cloned(PageElem::header)
+                .custom()
+                .flatten()
+                .unwrap()
+                .plain_text(),
+            "New header"
+        );
+        assert!(
+            chain
+                .get_cloned(PageElem::footer)
+                .custom()
+                .flatten()
+                .is_none()
+        );
+
+        let mut root_styles = Styles::new();
+        apply_page_region_updates(&mut root_styles, &updates, PageRegionUpdateScope::All);
+        let chain = StyleChain::new(&root_styles);
+        assert_eq!(
+            chain
+                .get_cloned(PageElem::header)
+                .custom()
+                .flatten()
+                .unwrap()
+                .plain_text(),
+            "New header"
+        );
+        assert_eq!(
+            chain
+                .get_cloned(PageElem::footer)
+                .custom()
+                .flatten()
+                .unwrap()
+                .plain_text(),
+            "New footer"
+        );
     }
 
     #[test]

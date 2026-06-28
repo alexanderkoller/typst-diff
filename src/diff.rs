@@ -35,7 +35,10 @@ use typst::math::EquationElem;
 use typst::model::{EmphElem, FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
 use typst::text::{RawElem, SpaceElem, TextElem};
 
-use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized};
+use crate::annotated::{
+    AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized,
+    effective_text_content,
+};
 use crate::container_ops;
 
 /// A block-level unit of content together with the page styles active at its position.
@@ -1509,7 +1512,7 @@ fn prepare_diff_inputs(
     new: &AnnotatedContent,
     capture_debug: bool,
 ) -> PreparedDiffInputs {
-    let new_surface = effective_content(new);
+    let new_surface = effective_text_content(new);
     let new_layout_blocks = extract_block_units(&new_surface);
     let old_realized_blocks = extract_block_units(&old.realized);
     let new_realized_blocks = extract_block_units(&new.realized);
@@ -1941,7 +1944,7 @@ fn collect_footnote_body_contents(node: &AnnotatedContent, out: &mut Vec<Content
             .find(|slot| matches!(slot.label, SlotStep::FootnoteBody))
         && let Some(body) = node.get_path(&slot.path)
     {
-        out.push(effective_content(body));
+        out.push(effective_text_content(body));
     }
     if let Some(footnote) = &node.annotation.footnote
         && let Some(body) = footnote_body_content(&footnote.body)
@@ -2158,8 +2161,8 @@ fn diff_region_edits(old: &AnnotatedContent, new: &AnnotatedContent) -> Vec<Real
         return vec![RealizedEdit::WholeBlock(content)];
     }
 
-    let old_effective = effective_content(old);
-    let new_effective = effective_content(new);
+    let old_effective = effective_text_content(old);
+    let new_effective = effective_text_content(new);
     let old_tokens = extract_words_for_annotated(&old_effective, Some(old));
     let new_tokens = extract_words_for_annotated(&new_effective, Some(new));
     let word_ops = diff_words(&old_tokens, &new_tokens);
@@ -3081,7 +3084,7 @@ fn layout_content_matches(
     let Some(owner) = owner else {
         return false;
     };
-    let owner_surface = effective_content(owner);
+    let owner_surface = effective_text_content(owner);
     if layout == &owner_surface {
         return true;
     }
@@ -3384,8 +3387,8 @@ fn owned_surface_modified_edit(
     old_ann: &AnnotatedContent,
     new_ann: &AnnotatedContent,
 ) -> Option<RealizedEdit> {
-    let old_effective = effective_content(old_ann);
-    let new_effective = effective_content(new_ann);
+    let old_effective = effective_text_content(old_ann);
+    let new_effective = effective_text_content(new_ann);
     if old_effective == new_effective {
         return None;
     }
@@ -3401,18 +3404,6 @@ fn owned_surface_modified_edit(
     })
 }
 
-fn effective_content(node: &AnnotatedContent) -> Content {
-    let surface = node
-        .annotation
-        .patch_surface
-        .as_ref()
-        .unwrap_or(&node.realized);
-    if !surface.plain_text().is_empty() || node.children.is_empty() {
-        return surface.clone();
-    }
-    Content::sequence(node.children.iter().map(effective_content))
-}
-
 fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
     node.annotation
         .slots
@@ -3426,7 +3417,7 @@ fn semantic_edit_claim_key(node: &AnnotatedContent) -> String {
         "{:?}|{:?}|{}",
         node.annotation.semantic_kind,
         slot_labels(node),
-        effective_content(node).plain_text()
+        effective_text_content(node).plain_text()
     )
 }
 
@@ -3441,7 +3432,7 @@ fn resolved_slots(node: &AnnotatedContent) -> Vec<(&SemanticSlot, &AnnotatedCont
 fn annotated_subtree_equal(old: &AnnotatedContent, new: &AnnotatedContent) -> bool {
     old.annotation.semantic_kind == new.annotation.semantic_kind
         && slot_labels(old) == slot_labels(new)
-        && effective_content(old) == effective_content(new)
+        && effective_text_content(old) == effective_text_content(new)
         && old.children.len() == new.children.len()
         && old
             .children
@@ -3494,8 +3485,8 @@ fn modified_edit_content(
     old_child: &AnnotatedContent,
     new_child: &AnnotatedContent,
 ) -> Option<EditContent> {
-    let old_effective = effective_content(old_child);
-    let new_effective = effective_content(new_child);
+    let old_effective = effective_text_content(old_child);
+    let new_effective = effective_text_content(new_child);
     let old_tokens = extract_words_for_annotated(&old_effective, Some(old_child));
     let new_tokens = extract_words_for_annotated(&new_effective, Some(new_child));
     let word_ops = diff_words(&old_tokens, &new_tokens);
@@ -3524,14 +3515,14 @@ fn diff_slot_edits_lcs(
         .slots
         .iter()
         .filter_map(|slot| old_ann.get_path(&slot.path))
-        .map(|child| effective_content(child).plain_text().to_string())
+        .map(|child| effective_text_content(child).plain_text().to_string())
         .collect();
     let new_h: Vec<String> = new_ann
         .annotation
         .slots
         .iter()
         .filter_map(|slot| new_ann.get_path(&slot.path))
-        .map(|child| effective_content(child).plain_text().to_string())
+        .map(|child| effective_text_content(child).plain_text().to_string())
         .collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_h, &new_h);
 
@@ -3577,7 +3568,7 @@ fn diff_slot_edits_lcs(
                     let (slot, child) = new_slots[new_index + i];
                     edits.push(RealizedEdit::ReplaceAt {
                         path: slot.path.clone(),
-                        content: EditContent::Inserted(effective_content(child)),
+                        content: EditContent::Inserted(effective_text_content(child)),
                     });
                 }
             }
@@ -3617,7 +3608,7 @@ fn diff_slot_edits_lcs(
                     let (slot, child) = new_slots[new_index + i];
                     edits.push(RealizedEdit::ReplaceAt {
                         path: slot.path.clone(),
-                        content: EditContent::Inserted(effective_content(child)),
+                        content: EditContent::Inserted(effective_text_content(child)),
                     });
                 }
             }
@@ -3632,7 +3623,7 @@ fn push_deleted_slot_edit(
     new_slots: &[(&SemanticSlot, &AnnotatedContent)],
     new_index: usize,
 ) {
-    let content = deleted_edit(effective_content(old_child));
+    let content = deleted_edit(effective_text_content(old_child));
     if let Some((slot, _)) = new_slots.get(new_index) {
         edits.push(RealizedEdit::InsertBefore {
             anchor: slot.path.clone(),

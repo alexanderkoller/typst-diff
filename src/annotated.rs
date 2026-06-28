@@ -56,6 +56,33 @@ impl AnnotatedContent {
     }
 }
 
+pub(crate) fn effective_content_with(
+    node: &AnnotatedContent,
+    surface_is_sufficient: impl Fn(&Content) -> bool + Copy,
+) -> Content {
+    let surface = node
+        .annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized);
+    if surface_is_sufficient(surface) || node.children.is_empty() {
+        return surface.clone();
+    }
+    Content::sequence(
+        node.children
+            .iter()
+            .map(|child| effective_content_with(child, surface_is_sufficient)),
+    )
+}
+
+pub(crate) fn effective_text_content(node: &AnnotatedContent) -> Content {
+    effective_content_with(node, |surface| !surface.plain_text().is_empty())
+}
+
+pub(crate) fn effective_render_content(node: &AnnotatedContent) -> Content {
+    effective_content_with(node, |surface| !surface.is_empty())
+}
+
 #[derive(Clone)]
 pub struct Annotation {
     /// Pre-realization element type if this node is a tracked structural element.
@@ -597,6 +624,51 @@ mod tests {
     fn contains_kind(node: &AnnotatedContent, kind: &SemanticKind) -> bool {
         node.annotation.semantic_kind.as_ref() == Some(kind)
             || node.children.iter().any(|child| contains_kind(child, kind))
+    }
+
+    #[test]
+    fn effective_text_content_recurses_through_text_empty_surface() {
+        use typst::model::ParbreakElem;
+
+        let surface = Content::sequence([Content::new(ParbreakElem::new())]);
+        assert!(surface.plain_text().is_empty());
+        let node = AnnotatedContent {
+            realized: text("realized"),
+            annotation: Annotation {
+                patch_surface: Some(surface),
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: text("semantic child"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+
+        assert_eq!(effective_text_content(&node).plain_text(), "semantic child");
+    }
+
+    #[test]
+    fn effective_render_content_preserves_structurally_nonempty_surface() {
+        use typst::model::ParbreakElem;
+
+        let surface = Content::sequence([Content::new(ParbreakElem::new())]);
+        assert!(!surface.is_empty());
+        assert!(surface.plain_text().is_empty());
+        let node = AnnotatedContent {
+            realized: text("realized"),
+            annotation: Annotation {
+                patch_surface: Some(surface.clone()),
+                ..Annotation::default()
+            },
+            children: vec![AnnotatedContent {
+                realized: text("semantic child"),
+                annotation: Annotation::default(),
+                children: vec![],
+            }],
+        };
+
+        assert_eq!(effective_render_content(&node), surface);
     }
 
     #[test]
