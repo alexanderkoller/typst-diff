@@ -27,6 +27,8 @@ similar = "2"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 

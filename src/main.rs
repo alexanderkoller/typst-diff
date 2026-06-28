@@ -1,4 +1,4 @@
-use typst_diff::{annotate, build_info, diff, eval_to_realized_content, render_to_pdf, world};
+use typst_diff::{annotate, build_info, debug, diff, eval, render_to_pdf, world};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -30,6 +30,9 @@ struct Args {
     /// Show substitutions as blue without red strikethrough; insertions green, deletions red
     #[arg(short = 's', long)]
     compact_substitutions: bool,
+    /// Write structured YAML diagnostics next to the output PDF
+    #[arg(long)]
+    debug: bool,
 }
 
 fn main() -> Result<()> {
@@ -47,17 +50,15 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to load new document {:?}", inputs.new))?;
 
     eprintln!("Evaluating old document...");
-    let old_content =
-        eval_to_realized_content(&old_world).context("failed to evaluate old document")?;
+    let old_eval = eval::eval_with_debug(&old_world).context("failed to evaluate old document")?;
 
     eprintln!("Evaluating new document...");
-    let new_content =
-        eval_to_realized_content(&new_world).context("failed to evaluate new document")?;
+    let new_eval = eval::eval_with_debug(&new_world).context("failed to evaluate new document")?;
 
     eprintln!("Diffing...");
-    let diff_result = diff::diff_annotated_with_rendered_regions(
-        &old_content,
-        &new_content,
+    let (diff_result, block_debug) = diff::diff_annotated_with_rendered_regions_and_debug(
+        &old_eval.annotated,
+        &new_eval.annotated,
         &old_world,
         &new_world,
     )?;
@@ -71,6 +72,25 @@ fn main() -> Result<()> {
     let annotated =
         annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
 
+    let debug_dir = args.debug.then(|| debug::default_debug_dir(&args.output));
+    if let Some(debug_dir) = &debug_dir {
+        eprintln!("Writing debug bundle to {}...", debug_dir.display());
+        let build_line = build_info::build_report_line();
+        debug::write_debug_bundle(&debug::DebugBundle {
+            build_line: &build_line,
+            args: debug_args(&args),
+            old_input: &inputs.old,
+            new_input: &inputs.new,
+            output: &args.output,
+            debug_dir,
+            old_eval: &old_eval,
+            new_eval: &new_eval,
+            block_debug: &block_debug,
+            diff_result: &diff_result,
+            annotated_output: &annotated,
+        })?;
+    }
+
     eprintln!("Rendering to PDF...");
     let pdf_bytes = render_to_pdf(&annotated, &new_world).context("failed to render PDF")?;
 
@@ -79,6 +99,18 @@ fn main() -> Result<()> {
 
     eprintln!("Written to {}", args.output.display());
     Ok(())
+}
+
+fn debug_args(args: &Args) -> debug::DebugArgs {
+    debug::DebugArgs {
+        old_or_file: args.old_or_file.clone(),
+        new: args.new.clone(),
+        revision: args.revision.clone(),
+        output: args.output.clone(),
+        log_modifications: args.log_modifications.clone(),
+        compact_substitutions: args.compact_substitutions,
+        debug: args.debug,
+    }
 }
 
 /// Absolute paths to the two documents to diff, plus an optional temp directory that

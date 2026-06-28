@@ -950,6 +950,68 @@ fn cli_writes_modification_log_when_requested() {
 }
 
 #[test]
+fn cli_writes_debug_bundle_when_requested() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("old.typ"), "The old text.").unwrap();
+    std::fs::write(dir.path().join("new.typ"), "The new text.").unwrap();
+    let pdf_path = dir.path().join("changes.pdf");
+    let log_path = dir.path().join("mods.txt");
+    let debug_dir = pdf_path.with_extension("debug");
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["old.typ", "new.typ", "-o"])
+        .arg(&pdf_path)
+        .args(["-l"])
+        .arg(&log_path)
+        .arg("--debug")
+        .output()
+        .unwrap();
+
+    assert_command_success(cli, "typst-diff --debug");
+    assert_valid_pdf(&std::fs::read(&pdf_path).unwrap());
+
+    let yaml_files = [
+        "manifest.yml",
+        "old/raw-eval.yml",
+        "old/normalized.yml",
+        "old/realized-tree.yml",
+        "old/blocks.yml",
+        "new/raw-eval.yml",
+        "new/normalized.yml",
+        "new/realized-tree.yml",
+        "new/blocks.yml",
+        "diff/block-raw.yml",
+        "diff/block-matched.yml",
+        "diff/final-edits.yml",
+        "diff/rendered-regions.yml",
+        "output/annotated-content.yml",
+    ];
+    for rel in yaml_files {
+        assert_yaml_file(&debug_dir.join(rel));
+    }
+
+    let manifest = std::fs::read_to_string(debug_dir.join("manifest.yml")).unwrap();
+    assert!(manifest.contains("schema_version: 1"), "{manifest}");
+    assert!(
+        manifest.contains(&typst_diff::build_info::build_report_line()),
+        "{manifest}"
+    );
+    assert!(manifest.contains("old.typ"), "{manifest}");
+    assert!(manifest.contains("new.typ"), "{manifest}");
+    assert!(manifest.contains("changes.pdf"), "{manifest}");
+
+    let final_edits = std::fs::read_to_string(debug_dir.join("diff/final-edits.yml")).unwrap();
+    assert!(final_edits.contains("modified"), "{final_edits}");
+    assert!(final_edits.contains("old"), "{final_edits}");
+    assert!(final_edits.contains("new"), "{final_edits}");
+
+    let standalone_log = std::fs::read_to_string(log_path).unwrap();
+    let debug_log = std::fs::read_to_string(debug_dir.join("output/modification-log.txt")).unwrap();
+    assert_eq!(debug_log, standalone_log);
+}
+
+#[test]
 fn cli_revision_mode_handles_file_in_subdirectory_with_include() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(dir.path().join("chapters")).unwrap();
@@ -977,6 +1039,49 @@ fn cli_revision_mode_handles_file_in_subdirectory_with_include() {
 
     assert_command_success(cli, "typst-diff");
     assert_valid_pdf(&std::fs::read(output).unwrap());
+}
+
+#[test]
+fn cli_debug_manifest_records_revision_mode() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("main.typ"), "The old text.").unwrap();
+
+    git(dir.path(), &["init"]);
+    git(dir.path(), &["config", "user.email", "test@example.com"]);
+    git(dir.path(), &["config", "user.name", "Typst Diff Test"]);
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-m", "old"]);
+
+    std::fs::write(dir.path().join("main.typ"), "The new text.").unwrap();
+    let output = dir.path().join("revision.pdf");
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["main.typ", "--revision", "HEAD", "-o"])
+        .arg(&output)
+        .arg("--debug")
+        .output()
+        .unwrap();
+
+    assert_command_success(cli, "typst-diff --debug --revision");
+    assert_valid_pdf(&std::fs::read(&output).unwrap());
+    let manifest_path = output.with_extension("debug").join("manifest.yml");
+    assert_yaml_file(&manifest_path);
+    let manifest = std::fs::read_to_string(manifest_path).unwrap();
+    assert!(manifest.contains("revision: HEAD"), "{manifest}");
+    assert!(manifest.contains("main.typ"), "{manifest}");
+    assert!(manifest.contains("revision.pdf"), "{manifest}");
+}
+
+fn assert_yaml_file(path: &std::path::Path) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("failed to read YAML file {}: {err}", path.display());
+    });
+    serde_yaml::from_str::<serde_yaml::Value>(&text).unwrap_or_else(|err| {
+        panic!(
+            "failed to parse YAML file {}: {err}\n{text}",
+            path.display()
+        );
+    });
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) {

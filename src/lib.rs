@@ -20,6 +20,7 @@ pub mod annotate;
 pub mod annotated;
 pub mod build_info;
 mod container_ops;
+pub mod debug;
 pub mod diag;
 pub mod diff;
 pub mod eval;

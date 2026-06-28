@@ -2618,6 +2618,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
+ "serde_yaml",
  "similar",
  "tempfile",
  "typst",

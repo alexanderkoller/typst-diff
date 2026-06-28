@@ -61,11 +61,16 @@ Options:
                                 Write a plain-text log of every detected insertion,
                                 deletion, and modification
   -s, --compact-substitutions   Show substitutions as blue without red strikethrough
+      --debug                   Write structured YAML diagnostics next to the output PDF
   -h, --help                    Print help
 ```
 
 Git mode requires `git` and `tar` on your `PATH`. You can use any revision
 accepted by Git: `HEAD`, `HEAD~1`, a branch name, a tag, or a commit hash.
+
+With `--debug`, typst-diff writes a directory next to the output PDF. For
+`typst-diff old.typ new.typ -o changes.pdf --debug`, diagnostics are written to
+`changes.debug/`.
 
 ## Colour scheme
 

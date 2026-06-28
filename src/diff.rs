@@ -1216,6 +1216,20 @@ pub struct DiffBlockEdit {
     pub page_styles: Styles,
 }
 
+pub struct DiffBlockDebug {
+    pub old_blocks: Vec<DiffBlock>,
+    pub new_blocks: Vec<DiffBlock>,
+    pub raw_ops: Vec<BlockOp>,
+    pub matched_ops: Vec<BlockOp>,
+}
+
+struct PreparedDiffInputs {
+    new_layout_blocks: Vec<DiffBlock>,
+    old_realized_blocks: Vec<DiffBlock>,
+    new_realized_blocks: Vec<DiffBlock>,
+    debug: DiffBlockDebug,
+}
+
 pub struct DiffRegionEdit {
     pub path: RegionPath,
     pub base: AnnotatedContent,
@@ -1407,7 +1421,7 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
     }
 }
 
-pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
+fn prepare_diff_inputs(old: &AnnotatedContent, new: &AnnotatedContent) -> PreparedDiffInputs {
     let new_surface = effective_content(new);
     let new_layout_blocks = extract_block_units(&new_surface);
     let old_realized_blocks = extract_block_units(&old.realized);
@@ -1415,18 +1429,40 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
     let old_blocks = non_parbreak_blocks(&old_realized_blocks);
     let new_blocks = non_parbreak_blocks(&new_realized_blocks);
     let raw = diff_block_units_raw(&old_blocks, &new_blocks);
-    let matched = match_edit_zones(raw);
-    let old_region_styles = document_page_styles_raw(&old.realized, &old_realized_blocks);
-    let new_region_styles = document_page_styles_raw(&new.realized, &new_realized_blocks);
+    let matched = match_edit_zones(raw.clone());
+    PreparedDiffInputs {
+        new_layout_blocks,
+        old_realized_blocks,
+        new_realized_blocks,
+        debug: DiffBlockDebug {
+            old_blocks,
+            new_blocks,
+            raw_ops: raw,
+            matched_ops: matched,
+        },
+    }
+}
+
+pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
+    diff_annotated_with_block_debug(old, new).0
+}
+
+pub fn diff_annotated_with_block_debug(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+) -> (DiffResult, DiffBlockDebug) {
+    let prepared = prepare_diff_inputs(old, new);
+    let old_region_styles = document_page_styles_raw(&old.realized, &prepared.old_realized_blocks);
+    let new_region_styles = document_page_styles_raw(&new.realized, &prepared.new_realized_blocks);
     let regions = diff_root_page_regions(&old_region_styles, &new_region_styles);
     let root_styles = sanitize_page_styles(root_page_styles_raw(&new.realized));
 
-    let mut layout = LayoutCursor::new(&new_layout_blocks);
+    let mut layout = LayoutCursor::new(&prepared.new_layout_blocks);
     let mut old_owners = BlockOwnerCursor::new(old);
     let mut new_owners = BlockOwnerCursor::new(new);
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
-    for op in matched {
+    for op in prepared.debug.matched_ops.clone() {
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
@@ -1617,12 +1653,13 @@ pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffRes
     prune_duplicate_empty_container_edits(&mut blocks);
     append_footnote_body_edits(old, new, &mut blocks);
 
-    DiffResult {
+    let result = DiffResult {
         blocks,
         root_styles,
         regions,
         rendered_regions: vec![],
-    }
+    };
+    (result, prepared.debug)
 }
 
 fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
@@ -1868,7 +1905,16 @@ pub fn diff_annotated_with_rendered_regions(
     old_world: &dyn World,
     new_world: &dyn World,
 ) -> anyhow::Result<DiffResult> {
-    let mut result = diff_annotated(old, new);
+    Ok(diff_annotated_with_rendered_regions_and_debug(old, new, old_world, new_world)?.0)
+}
+
+pub fn diff_annotated_with_rendered_regions_and_debug(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    old_world: &dyn World,
+    new_world: &dyn World,
+) -> anyhow::Result<(DiffResult, DiffBlockDebug)> {
+    let (mut result, debug) = diff_annotated_with_block_debug(old, new);
     let old_source = crate::eval::eval_to_content(old_world)?;
     let new_source = crate::eval::eval_to_content(new_world)?;
     let old_doc = crate::eval::layout_document(old_world, &old_source)?;
@@ -1886,7 +1932,7 @@ pub fn diff_annotated_with_rendered_regions(
         new_world,
         &result.regions,
     );
-    Ok(result)
+    Ok((result, debug))
 }
 
 fn diff_root_page_regions(old_styles: &Styles, new_styles: &Styles) -> Vec<DiffRegionEdit> {
