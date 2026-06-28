@@ -221,6 +221,22 @@ its current fallback behavior. These are the contracts the pipeline relies on.
   must not be pushed into ordinary inline/block styles.
 - PDF is the final serialization step, not the primary debugging surface.
 
+## Invariant Test Map
+
+This map ties key invariants to concrete tests so contributors can verify
+contract changes intentionally.
+
+| Invariant | Current tests |
+| --- | --- |
+| `AnnotatedContent.realized` is preserved exactly. | `annotate_preserves_realized_content_unchanged` in `src/annotated.rs`. |
+| Every emitted semantic slot path resolves. | `slot_paths_resolve_in_changed_blocks_for_representative_corpus_cases` in `tests/integration.rs`; plus many slot-specific unit tests in `src/annotated.rs`. |
+| Changed-block edit paths are render-applicable. | `changed_block_edit_paths_resolve_for_representative_corpus_cases` in `tests/integration.rs`. |
+| Slot-level edits render inserted/deleted/modified content. | `edit_contract_guarantees_rendering_for_corpus_18/19/20` and related list/table tests in `tests/integration.rs`; targeted edit-application tests in `src/annotate.rs`. |
+| Page styles remain separated and correctly applied. | `style_partitioning_separates_page_and_non_page_styles` in `src/eval.rs`; page-region tests in `tests/integration.rs`. |
+
+If a cleanup step changes one of these invariants, update the tests and this
+map in the same change set.
+
 ## The Annotated Tree
 
 `AnnotatedContent` is defined in `src/annotated.rs`:

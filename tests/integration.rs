@@ -557,6 +557,44 @@ fn assert_edit_contract_matches_render(corpus_name: &str) {
     }
 }
 
+fn assert_edit_paths_resolve_for_base(
+    base: &typst_diff::annotated::AnnotatedContent,
+    edits: &[typst_diff::diff::RealizedEdit],
+) {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    fn walk_content(content: &EditContent) {
+        if let EditContent::Nested { base, edits } = content {
+            assert_edit_paths_resolve_for_base(base, edits);
+        }
+    }
+
+    for edit in edits {
+        match edit {
+            RealizedEdit::ReplaceAt { path, content } => {
+                assert!(
+                    base.get_path(path).is_some(),
+                    "ReplaceAt path does not resolve: {:?}",
+                    path
+                );
+                walk_content(content);
+            }
+            RealizedEdit::InsertBefore { anchor, content }
+            | RealizedEdit::InsertAfter { anchor, content } => {
+                assert!(
+                    base.get_path(anchor).is_some(),
+                    "Insert anchor path does not resolve: {:?}",
+                    anchor
+                );
+                walk_content(content);
+            }
+            RealizedEdit::Append { content } | RealizedEdit::WholeBlock(content) => {
+                walk_content(content);
+            }
+        }
+    }
+}
+
 #[test]
 fn simple_diff_produces_valid_pdf() {
     let old_world = world_for("simple_old.typ");
@@ -567,6 +605,51 @@ fn simple_diff_produces_valid_pdf() {
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn slot_paths_resolve_in_changed_blocks_for_representative_corpus_cases() {
+    for case in [
+        "18-list-item-changed",
+        "19-list-item-added",
+        "20-nested-list-changed",
+        "35-table-changed",
+        "64-table-row-inserted-middle",
+        "65-table-row-deleted-middle",
+        "69-nested-list-item-inserted",
+        "87-show-paragraph-wrapper-changed",
+    ] {
+        let result = diff_annotated_corpus(case);
+        for block in result.blocks.iter().filter(|b| !b.edits.is_empty()) {
+            for slot in &block.base.annotation.slots {
+                assert!(
+                    block.base.get_path(&slot.path).is_some(),
+                    "slot path should resolve for {case}: {:?} {:?}",
+                    slot.label,
+                    slot.path
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn changed_block_edit_paths_resolve_for_representative_corpus_cases() {
+    for case in [
+        "18-list-item-changed",
+        "19-list-item-added",
+        "20-nested-list-changed",
+        "35-table-changed",
+        "64-table-row-inserted-middle",
+        "65-table-row-deleted-middle",
+        "69-nested-list-item-inserted",
+        "87-show-paragraph-wrapper-changed",
+    ] {
+        let result = diff_annotated_corpus(case);
+        for block in result.blocks.iter().filter(|b| !b.edits.is_empty()) {
+            assert_edit_paths_resolve_for_base(&block.base, &block.edits);
+        }
+    }
 }
 
 #[test]
