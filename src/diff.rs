@@ -32,8 +32,13 @@ use typst::layout::{
     BlockBody, BlockElem, BoxElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel,
 };
 use typst::math::EquationElem;
-use typst::model::{EmphElem, FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
-use typst::text::{RawElem, SpaceElem, TextElem};
+use typst::model::{
+    EmphElem, FootnoteBody, FootnoteElem, HeadingElem, LinkElem, ParElem, ParbreakElem, StrongElem,
+};
+use typst::text::{
+    HighlightElem, OverlineElem, RawElem, SpaceElem, StrikeElem, SubElem, SuperElem, TextElem,
+    UnderlineElem,
+};
 
 use crate::annotated::{
     AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized,
@@ -349,10 +354,10 @@ fn apply_block_styles(block: Content, styles: &Styles) -> Content {
 
 /// A single diffable token: either a word/space split from `TextElem`, or an atomic inline.
 ///
-/// Equality and hashing are based solely on `text` so that the Myers LCS algorithm
-/// can match tokens by visible text content regardless of their structural `content`
-/// representation. `content` carries the original `Content` node so that unchanged
-/// tokens can be reconstructed faithfully in the annotated output.
+/// Equality and hashing are based on visible text plus presentation identity. This
+/// lets Myers treat `regular` → `*regular*`, subscript → superscript, or paragraph
+/// → heading as real token edits while still ignoring non-rendering metadata such as
+/// link targets.
 #[derive(Clone, Debug)]
 pub struct Token {
     pub text: String,
@@ -362,6 +367,7 @@ pub struct Token {
 impl PartialEq for Token {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
+            && presentation_key(&self.content) == presentation_key(&other.content)
     }
 }
 impl Eq for Token {}
@@ -372,13 +378,168 @@ impl PartialOrd for Token {
 }
 impl Ord for Token {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.text.cmp(&other.text)
+        self.text
+            .cmp(&other.text)
+            .then_with(|| presentation_key(&self.content).cmp(&presentation_key(&other.content)))
     }
 }
 impl Hash for Token {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text.hash(state)
+        self.text.hash(state);
+        presentation_key(&self.content).hash(state);
     }
+}
+
+fn presentation_key(content: &Content) -> String {
+    let mut out = String::new();
+    write_presentation_key(content, &mut out);
+    out
+}
+
+fn write_presentation_key(content: &Content, out: &mut String) {
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        out.push_str("seq[");
+        for child in &seq.children {
+            if is_metadata_tag(child) {
+                continue;
+            }
+            write_presentation_key(child, out);
+            out.push(';');
+        }
+        out.push(']');
+    } else if let Some(styled) = content.to_packed::<StyledElem>() {
+        let styles_key = styles_key(&styled.styles);
+        if styles_key.is_empty() {
+            write_presentation_key(&styled.child, out);
+            return;
+        }
+        out.push_str("styled(");
+        out.push_str(&styles_key);
+        out.push_str(")[");
+        write_presentation_key(&styled.child, out);
+        out.push(']');
+    } else if let Some(par) = content.to_packed::<ParElem>() {
+        out.push_str("par[");
+        write_presentation_key(&par.body, out);
+        out.push(']');
+    } else if let Some(heading) = content.to_packed::<HeadingElem>() {
+        out.push_str("heading[");
+        write_presentation_key(&heading.body, out);
+        out.push(']');
+    } else if let Some(block) = content.to_packed::<BlockElem>() {
+        out.push_str("block(");
+        out.push_str(match block.body.get_cloned(StyleChain::default()) {
+            Some(BlockBody::Content(_)) => "content",
+            Some(_) => "other",
+            None => "auto",
+        });
+        out.push_str(")[");
+        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
+            write_presentation_key(&body, out);
+        }
+        out.push(']');
+    } else if let Some(equation) = content.to_packed::<EquationElem>() {
+        out.push_str("equation(");
+        out.push_str(if equation.block.get(StyleChain::default()) {
+            "block"
+        } else {
+            "inline"
+        });
+        out.push_str("):");
+        out.push_str(equation.body.repr().as_str());
+    } else if let Some(link) = content.to_packed::<LinkElem>() {
+        write_presentation_key(&link.body, out);
+    } else if let Some(strong) = content.to_packed::<StrongElem>() {
+        out.push_str("strong[");
+        write_presentation_key(&strong.body, out);
+        out.push(']');
+    } else if let Some(emph) = content.to_packed::<EmphElem>() {
+        out.push_str("emph[");
+        write_presentation_key(&emph.body, out);
+        out.push(']');
+    } else if let Some(highlight) = content.to_packed::<HighlightElem>() {
+        out.push_str("highlight(");
+        out.push_str(&format!("{highlight:?}"));
+        out.push_str(")[");
+        write_presentation_key(&highlight.body, out);
+        out.push(']');
+    } else if let Some(sub) = content.to_packed::<SubElem>() {
+        out.push_str("sub[");
+        write_presentation_key(&sub.body, out);
+        out.push(']');
+    } else if let Some(sup) = content.to_packed::<SuperElem>() {
+        out.push_str("super[");
+        write_presentation_key(&sup.body, out);
+        out.push(']');
+    } else if let Some(underline) = content.to_packed::<UnderlineElem>() {
+        out.push_str("underline[");
+        write_presentation_key(&underline.body, out);
+        out.push(']');
+    } else if let Some(overline) = content.to_packed::<OverlineElem>() {
+        out.push_str("overline[");
+        write_presentation_key(&overline.body, out);
+        out.push(']');
+    } else if let Some(strike) = content.to_packed::<StrikeElem>() {
+        out.push_str("strike[");
+        write_presentation_key(&strike.body, out);
+        out.push(']');
+    } else if content.is::<TextElem>() {
+        out.push_str("text");
+    } else if content.is::<SpaceElem>() {
+        out.push_str("space");
+    } else if is_metadata_tag(content) {
+    } else {
+        let children = container_ops::semantic_diff_child_contents(content);
+        if !children.is_empty() {
+            out.push_str(content.func().name());
+            out.push('[');
+            for child in children {
+                if is_metadata_tag(&child) {
+                    continue;
+                }
+                write_presentation_key(&child, out);
+                out.push(';');
+            }
+            out.push(']');
+        } else {
+            out.push_str(content.func().name());
+            out.push(':');
+            out.push_str(content.plain_text().as_str());
+        }
+    }
+}
+
+fn is_metadata_tag(content: &Content) -> bool {
+    content.func().name() == "tag"
+}
+
+fn write_styles_key(styles: &Styles, out: &mut String) {
+    out.push_str(&styles_key(styles));
+}
+
+fn styles_key(styles: &Styles) -> String {
+    let mut out = String::new();
+    for style in styles.iter() {
+        if !is_presentation_style(style) {
+            continue;
+        }
+        // `Style` equality can include realization provenance. The debug
+        // signature is the same normalization used for inherited-style stripping.
+        out.push_str(&format!("{style:?}"));
+        out.push(';');
+    }
+    out
+}
+
+fn is_presentation_style(style: &Style) -> bool {
+    style.property().is_some()
+        && style.element().is_some_and(|element| {
+            element == TextElem::ELEM
+                || element == ParElem::ELEM
+                || element == HeadingElem::ELEM
+                || element == EquationElem::ELEM
+                || element == RawElem::ELEM
+        })
 }
 
 /// Walk a block's inline content and produce a flat list of [`Token`]s.
@@ -408,6 +569,26 @@ fn extract_words_for_annotated(
         extract_words(fallback)
     } else {
         tokens
+    }
+}
+
+fn extract_words_for_annotated_with_equation_origins(
+    fallback: &Content,
+    annotated: Option<&AnnotatedContent>,
+    equation_origins: &[Content],
+) -> Vec<Token> {
+    let tokens = extract_words_for_annotated(fallback, annotated);
+    if has_meaningful_tokens(&tokens) || equation_origins.is_empty() {
+        return tokens;
+    }
+
+    let mut origin_iter = equation_origins.iter();
+    let mut origin_tokens = Vec::new();
+    collect_tokens_with_equation_origins(fallback, &mut origin_iter, &mut origin_tokens);
+    if origin_tokens.is_empty() {
+        tokens
+    } else {
+        origin_tokens
     }
 }
 
@@ -467,7 +648,15 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             token.content = token.content.clone().emph();
         }
     } else if let Some(par) = content.to_packed::<ParElem>() {
+        let before = out.len();
         collect_tokens(&par.body, out);
+        wrap_tokens_with_context(content, before, out);
+    } else if let Some(heading) = content.to_packed::<HeadingElem>() {
+        let before = out.len();
+        collect_tokens(&heading.body, out);
+        wrap_tokens_with_context(content, before, out);
+    } else if let Some(link) = content.to_packed::<LinkElem>() {
+        collect_tokens(&link.body, out);
     } else if let Some(equation) = content.to_packed::<EquationElem>() {
         out.push(Token {
             text: equation.body.repr().to_string(),
@@ -481,6 +670,7 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             text: " ".to_string(),
             content: content.clone(),
         });
+    } else if is_metadata_tag(content) {
     } else {
         out.push(Token {
             text: content.plain_text().to_string(),
@@ -511,10 +701,20 @@ fn collect_tokens_with_equation_origins<'a>(
             token.content = token.content.clone().styled_with_map(styled.styles.clone());
         }
     } else if let Some(par) = content.to_packed::<ParElem>() {
+        let before = out.len();
         collect_tokens_with_equation_origins(&par.body, origins, out);
+        wrap_tokens_with_context(content, before, out);
+    } else if let Some(heading) = content.to_packed::<HeadingElem>() {
+        let before = out.len();
+        collect_tokens_with_equation_origins(&heading.body, origins, out);
+        wrap_tokens_with_context(content, before, out);
+    } else if let Some(link) = content.to_packed::<LinkElem>() {
+        collect_tokens_with_equation_origins(&link.body, origins, out);
     } else if let Some(block) = content.to_packed::<BlockElem>() {
         if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
+            let before = out.len();
             collect_tokens_with_equation_origins(&body, origins, out);
+            wrap_tokens_with_context(content, before, out);
         } else {
             collect_tokens(content, out);
         }
@@ -537,7 +737,9 @@ fn collect_semantic_child_tokens(content: &Content, out: &mut Vec<Token>) -> boo
     for (index, child) in children.into_iter().enumerate() {
         let before = out.len();
         collect_tokens(&child, out);
-        if content.is::<BoxElem>() {
+        if content.is::<BlockElem>() {
+            wrap_tokens_with_context(content, before, out);
+        } else if content.is::<BoxElem>() {
             for token in &mut out[before..] {
                 if let Some(wrapped) =
                     container_ops::replace_realized_child(content, index, token.content.clone())
@@ -548,6 +750,66 @@ fn collect_semantic_child_tokens(content: &Content, out: &mut Vec<Token>) -> boo
         }
     }
     true
+}
+
+fn wrap_tokens_with_context(context: &Content, before: usize, out: &mut [Token]) {
+    for token in &mut out[before..] {
+        if let Some(wrapped) = token_content_in_context(context, token.content.clone()) {
+            token.content = wrapped;
+        }
+    }
+}
+
+fn token_content_in_context(context: &Content, replacement: Content) -> Option<Content> {
+    let mut result = context.clone();
+
+    if let Some(par) = result.to_packed_mut::<ParElem>() {
+        par.body = replacement;
+        return Some(result);
+    }
+
+    if let Some(heading) = result.to_packed_mut::<HeadingElem>() {
+        heading.body = replacement;
+        return Some(result);
+    }
+
+    if let Some(block) = result.to_packed_mut::<BlockElem>() {
+        block.body.set(Some(BlockBody::Content(replacement)));
+        return Some(result);
+    }
+
+    None
+}
+
+fn token_content_for_direct_edit(token: &Token) -> Content {
+    inline_token_content_for_diff(&token.content, token.text.as_str())
+}
+
+fn inline_token_content_for_diff(content: &Content, text: &str) -> Content {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let child = inline_token_content_for_diff(&styled.child, text);
+        return child.styled_with_map(styled.styles.clone());
+    }
+
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return inline_token_content_for_diff(&par.body, text);
+    }
+
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return inline_token_content_for_diff(&heading.body, text);
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        return inline_token_content_for_diff(&body, text);
+    }
+
+    if content.plain_text().is_empty() && !text.is_empty() {
+        TextElem::packed(text)
+    } else {
+        content.clone()
+    }
 }
 
 fn collect_text_tokens(s: &str, out: &mut Vec<Token>) {
@@ -1067,6 +1329,12 @@ fn has_textual_word_change(word_ops: &[WordOp]) -> bool {
     })
 }
 
+fn has_meaningful_tokens(tokens: &[Token]) -> bool {
+    tokens
+        .iter()
+        .any(|token| token.text.chars().any(|ch| !ch.is_whitespace()))
+}
+
 /// Diff two [`Token`] sequences with Myers LCS, coalescing adjacent same-kind ops.
 ///
 /// Adjacent `Delete Delete` or `Insert Insert` chunks from `similar` are merged into
@@ -1236,6 +1504,20 @@ fn collect_word_op_text(word_ops: &[WordOp], select: fn(&WordOp) -> Option<&Vec<
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn content_log_text(content: &Content) -> String {
+    let plain = content.plain_text();
+    if plain.chars().any(|ch| !ch.is_whitespace()) {
+        return plain.to_string();
+    }
+
+    extract_words(content)
+        .into_iter()
+        .filter(|token| token.text.chars().any(|ch| !ch.is_whitespace()))
+        .map(|token| token.text)
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn single_line(text: &str) -> String {
@@ -1571,18 +1853,18 @@ fn edit_content_kind(content: &EditContent) -> &'static str {
 
 fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
     match content {
-        EditContent::Inserted(content) => push_log_entry(
-            log,
-            index,
-            "insert",
-            &[("text", content.plain_text().to_string())],
-        ),
-        EditContent::Deleted(content) => push_log_entry(
-            log,
-            index,
-            "delete",
-            &[("text", content.plain_text().to_string())],
-        ),
+        EditContent::Inserted(content) => {
+            let text = content_log_text(content);
+            if text.chars().any(|ch| !ch.is_whitespace()) {
+                push_log_entry(log, index, "insert", &[("text", text)]);
+            }
+        }
+        EditContent::Deleted(content) => {
+            let text = content_log_text(content);
+            if text.chars().any(|ch| !ch.is_whitespace()) {
+                push_log_entry(log, index, "delete", &[("text", text)]);
+            }
+        }
         EditContent::OpaqueReplacement { .. } => push_log_entry(
             log,
             index,
@@ -1608,7 +1890,7 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
                     index,
                     "modify",
                     &[
-                        ("block", base.plain_text().to_string()),
+                        ("block", content_log_text(base)),
                         ("deleted", deletes),
                         ("inserted", inserts),
                     ],
@@ -1706,6 +1988,8 @@ fn replace_block_edit(
     new_block: &DiffBlock,
     old_ann: Option<&AnnotatedContent>,
     new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
     debug_events: &mut Option<&mut dyn DebugEventSink>,
 ) -> anyhow::Result<DiffBlockEdit> {
     let page_styles = new_block.page_styles.clone();
@@ -1831,7 +2115,11 @@ fn replace_block_edit(
     {
         let old_visible = footnote_owner_content_without_footnotes(old_ann);
         let old_tokens = extract_words(&old_visible);
-        let new_tokens = extract_words_for_annotated(&new_block.content, new_ann);
+        let new_tokens = extract_words_for_annotated_with_equation_origins(
+            &new_block.content,
+            new_ann,
+            new_equation_origins,
+        );
         let word_ops = diff_words(&old_tokens, &new_tokens);
         if has_textual_word_change(&word_ops) {
             emit_pipeline_trace_event(
@@ -1853,25 +2141,43 @@ fn replace_block_edit(
         }
     }
 
-    let old_tokens = extract_words_for_annotated(&old_block.content, old_ann);
-    let new_tokens = extract_words_for_annotated(&new_block.content, new_ann);
-    let word_ops = diff_words(&old_tokens, &new_tokens);
-    let edits = if has_textual_word_change(&word_ops) {
-        vec![RealizedEdit::WholeBlock(EditContent::Modified {
-            base: new_block.content.clone(),
-            word_ops,
-        })]
-    } else if old_block.content != new_block.content
-        && old_block.content.plain_text().is_empty()
-        && new_block.content.plain_text().is_empty()
+    if block_context_changed(&old_block.content, &new_block.content, old_ann, new_ann)
+        && replacement_has_word_change(
+            old_block,
+            new_block,
+            old_ann,
+            new_ann,
+            old_equation_origins,
+            new_equation_origins,
+        )
     {
-        vec![RealizedEdit::WholeBlock(EditContent::OpaqueReplacement {
-            old: old_block.content.clone(),
-            new: new_block.content.clone(),
-        })]
-    } else {
-        vec![]
-    };
+        emit_pipeline_trace_event(
+            debug_events,
+            PipelineTraceEvent::new("diff/replace-block", "selected")
+                .reason("word diff across changed block context")
+                .old_content(&old_block.content)
+                .new_content(&new_block.content)
+                .selected_edit_kind("context_split_replacement"),
+        )?;
+        return Ok(context_split_replacement_block_edit(
+            old_block,
+            new_block,
+            old_ann,
+            new_ann,
+            old_equation_origins,
+            new_equation_origins,
+            page_styles,
+        ));
+    }
+
+    let edits = word_or_opaque_replacement_edits(
+        old_block,
+        new_block,
+        old_ann,
+        new_ann,
+        old_equation_origins,
+        new_equation_origins,
+    );
     let selected_edit_kind = edits.first().map(realized_edit_kind).unwrap_or("noop");
     emit_pipeline_trace_event(
         debug_events,
@@ -1886,6 +2192,387 @@ fn replace_block_edit(
         edits,
         page_styles,
     })
+}
+
+fn word_or_opaque_replacement_edits(
+    old_block: &DiffBlock,
+    new_block: &DiffBlock,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
+) -> Vec<RealizedEdit> {
+    let (old_word_ann, new_word_ann) = balanced_word_annotations(old_ann, new_ann);
+    let old_tokens = extract_words_for_annotated_with_equation_origins(
+        &old_block.content,
+        old_word_ann,
+        old_equation_origins,
+    );
+    let new_tokens = extract_words_for_annotated_with_equation_origins(
+        &new_block.content,
+        new_word_ann,
+        new_equation_origins,
+    );
+    let mut word_ops = diff_words(&old_tokens, &new_tokens);
+    if !has_meaningful_equal(&word_ops) {
+        let old_inline_tokens = tokens_without_outer_context(&old_tokens);
+        let new_inline_tokens = tokens_without_outer_context(&new_tokens);
+        let inline_word_ops = diff_words(&old_inline_tokens, &new_inline_tokens);
+        if has_meaningful_equal(&inline_word_ops) {
+            word_ops = inline_word_ops;
+        }
+    }
+    if has_textual_word_change(&word_ops) {
+        return vec![RealizedEdit::WholeBlock(EditContent::Modified {
+            base: new_block.content.clone(),
+            word_ops,
+        })];
+    }
+
+    if old_block.content != new_block.content
+        && old_block.content.plain_text().is_empty()
+        && new_block.content.plain_text().is_empty()
+    {
+        return vec![RealizedEdit::WholeBlock(EditContent::OpaqueReplacement {
+            old: old_block.content.clone(),
+            new: new_block.content.clone(),
+        })];
+    }
+
+    vec![]
+}
+
+fn has_meaningful_equal(word_ops: &[WordOp]) -> bool {
+    word_ops.iter().any(|op| match op {
+        WordOp::Equal(tokens) => has_meaningful_tokens(tokens),
+        _ => false,
+    })
+}
+
+fn tokens_without_outer_context(tokens: &[Token]) -> Vec<Token> {
+    tokens
+        .iter()
+        .map(|token| Token {
+            text: token.text.clone(),
+            content: token_content_for_direct_edit(token),
+        })
+        .collect()
+}
+
+fn balanced_word_annotations<'a>(
+    old_ann: Option<&'a AnnotatedContent>,
+    new_ann: Option<&'a AnnotatedContent>,
+) -> (Option<&'a AnnotatedContent>, Option<&'a AnnotatedContent>) {
+    let old_key = old_ann.and_then(|node| block_context_key(&node.realized));
+    let new_key = new_ann.and_then(|node| block_context_key(&node.realized));
+    if old_ann.is_some() == new_ann.is_some() && old_key == new_key {
+        (old_ann, new_ann)
+    } else {
+        (None, None)
+    }
+}
+
+fn replacement_has_word_change(
+    old_block: &DiffBlock,
+    new_block: &DiffBlock,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
+) -> bool {
+    let (old_word_ann, new_word_ann) = balanced_word_annotations(old_ann, new_ann);
+    let old_tokens = extract_words_for_annotated_with_equation_origins(
+        &old_block.content,
+        old_word_ann,
+        old_equation_origins,
+    );
+    let new_tokens = extract_words_for_annotated_with_equation_origins(
+        &new_block.content,
+        new_word_ann,
+        new_equation_origins,
+    );
+    has_textual_word_change(&diff_words(&old_tokens, &new_tokens))
+}
+
+fn context_split_replacement_block_edit(
+    old_block: &DiffBlock,
+    new_block: &DiffBlock,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
+    page_styles: Styles,
+) -> DiffBlockEdit {
+    let base_content = Content::sequence([old_block.content.clone(), new_block.content.clone()]);
+    DiffBlockEdit {
+        base: annotated_block_from(&base_content, None),
+        edits: vec![
+            RealizedEdit::ReplaceAt {
+                path: vec![0],
+                content: context_preserving_deleted_edit(
+                    old_block.content.clone(),
+                    old_ann,
+                    old_equation_origins,
+                ),
+            },
+            RealizedEdit::ReplaceAt {
+                path: vec![1],
+                content: context_preserving_inserted_edit(
+                    new_block.content.clone(),
+                    new_ann,
+                    new_equation_origins,
+                ),
+            },
+        ],
+        page_styles,
+    }
+}
+
+fn context_preserving_deleted_edit(
+    content: Content,
+    annotated: Option<&AnnotatedContent>,
+    equation_origins: &[Content],
+) -> EditContent {
+    let tokens =
+        extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
+    if has_meaningful_tokens(&tokens) {
+        let base = annotated
+            .map(|node| node.realized.clone())
+            .unwrap_or_else(|| content.clone());
+        EditContent::Modified {
+            base,
+            word_ops: vec![WordOp::Delete(tokens)],
+        }
+    } else {
+        deleted_edit(content)
+    }
+}
+
+fn context_preserving_inserted_edit(
+    content: Content,
+    annotated: Option<&AnnotatedContent>,
+    equation_origins: &[Content],
+) -> EditContent {
+    let tokens =
+        extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
+    if has_meaningful_tokens(&tokens) {
+        let base = annotated
+            .map(|node| node.realized.clone())
+            .unwrap_or_else(|| content.clone());
+        EditContent::Modified {
+            base,
+            word_ops: vec![WordOp::Insert(tokens)],
+        }
+    } else {
+        EditContent::Inserted(content)
+    }
+}
+
+fn block_context_changed(
+    old: &Content,
+    new: &Content,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+) -> bool {
+    match (
+        block_context_key_for(old, old_ann),
+        block_context_key_for(new, new_ann),
+    ) {
+        (Some(old_key), Some(new_key)) => old_key != new_key,
+        _ => false,
+    }
+}
+
+fn block_context_key_for(
+    content: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> Option<String> {
+    if annotated.is_some_and(|node| node.annotation.semantic_kind == Some(SemanticKind::Heading)) {
+        return Some(context_presentation_key(content));
+    }
+    annotated
+        .and_then(annotated_block_context_key)
+        .or_else(|| block_context_key(content))
+}
+
+fn annotated_block_context_key(node: &AnnotatedContent) -> Option<String> {
+    match node.annotation.semantic_kind {
+        Some(SemanticKind::Paragraph) => block_context_key(&node.realized),
+        Some(SemanticKind::Heading) => Some(context_presentation_key(&node.realized)),
+        _ => None,
+    }
+}
+
+fn semantic_heading_context(
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+) -> bool {
+    matches!(
+        (old_ann, new_ann),
+        (Some(old), Some(new))
+            if old.annotation.semantic_kind == Some(SemanticKind::Heading)
+                && new.annotation.semantic_kind == Some(SemanticKind::Heading)
+    )
+}
+
+fn context_presentation_key(content: &Content) -> String {
+    let mut out = String::new();
+    write_context_presentation_key(content, &mut out);
+    out
+}
+
+fn write_context_presentation_key(content: &Content, out: &mut String) {
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        out.push_str("seq[");
+        for child in &seq.children {
+            write_context_presentation_key(child, out);
+            out.push(';');
+        }
+        out.push(']');
+    } else if let Some(styled) = content.to_packed::<StyledElem>() {
+        out.push_str("styled(");
+        write_styles_key(&styled.styles, out);
+        out.push_str(")[");
+        write_context_presentation_key(&styled.child, out);
+        out.push(']');
+    } else if let Some(par) = content.to_packed::<ParElem>() {
+        out.push_str("par[");
+        write_context_presentation_key(&par.body, out);
+        out.push(']');
+    } else if let Some(heading) = content.to_packed::<HeadingElem>() {
+        out.push_str("heading(");
+        out.push_str(&format!(
+            "level={:?}:depth={}:offset={}",
+            heading.level.get(StyleChain::default()),
+            heading.depth.get(StyleChain::default()).get(),
+            heading.offset.get(StyleChain::default())
+        ));
+        out.push_str(")[");
+        write_context_presentation_key(&heading.body, out);
+        out.push(']');
+    } else if let Some(block) = content.to_packed::<BlockElem>() {
+        out.push_str("block[");
+        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
+            write_context_presentation_key(&body, out);
+        }
+        out.push(']');
+    } else if is_metadata_tag(content) || content.is::<TextElem>() || content.is::<SpaceElem>() {
+    } else {
+        let children = container_ops::semantic_diff_child_contents(content);
+        if !children.is_empty() {
+            out.push_str(content.func().name());
+            out.push('[');
+            for child in children {
+                write_context_presentation_key(&child, out);
+                out.push(';');
+            }
+            out.push(']');
+        } else {
+            out.push_str(content.func().name());
+        }
+    }
+}
+
+fn block_context_key(content: &Content) -> Option<String> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return block_context_key(&styled.child);
+    }
+
+    if content.is::<ParElem>() {
+        return Some("par".to_string());
+    }
+
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return Some(format!(
+            "heading:level={:?}:depth={}:offset={}",
+            heading.level.get(StyleChain::default()),
+            heading.depth.get(StyleChain::default()).get(),
+            heading.offset.get(StyleChain::default())
+        ));
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>() {
+        return Some(format!(
+            "block:{:?}",
+            block
+                .body
+                .get_cloned(StyleChain::default())
+                .map(|body| match body {
+                    BlockBody::Content(_) => "content",
+                    _ => "other",
+                })
+        ));
+    }
+
+    None
+}
+
+fn is_block_context(content: &Content) -> bool {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return is_block_context(&styled.child);
+    }
+    content.is::<BlockElem>()
+}
+
+fn presentation_changed(
+    old_block: &DiffBlock,
+    new_block: &DiffBlock,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
+) -> bool {
+    let old_tokens = extract_words_for_annotated_with_equation_origins(
+        &old_block.content,
+        old_ann,
+        old_equation_origins,
+    );
+    let new_tokens = extract_words_for_annotated_with_equation_origins(
+        &new_block.content,
+        new_ann,
+        new_equation_origins,
+    );
+    if !old_tokens.is_empty() || !new_tokens.is_empty() {
+        return diff_words(&old_tokens, &new_tokens)
+            .iter()
+            .any(|op| !matches!(op, WordOp::Equal(_)));
+    }
+
+    presentation_key(&old_block.content) != presentation_key(&new_block.content)
+}
+
+fn inserted_block_edit(
+    content: Content,
+    annotated: Option<&AnnotatedContent>,
+    equation_origins: &[Content],
+) -> EditContent {
+    let tokens =
+        extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
+    if content.plain_text().is_empty() && has_meaningful_tokens(&tokens) {
+        EditContent::Modified {
+            base: content,
+            word_ops: vec![WordOp::Insert(tokens)],
+        }
+    } else {
+        EditContent::Inserted(content)
+    }
+}
+
+fn deleted_block_edit(
+    content: Content,
+    annotated: Option<&AnnotatedContent>,
+    equation_origins: &[Content],
+) -> EditContent {
+    let tokens =
+        extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
+    if content.plain_text().is_empty() && has_meaningful_tokens(&tokens) {
+        EditContent::Modified {
+            base: content,
+            word_ops: vec![WordOp::Delete(tokens)],
+        }
+    } else {
+        deleted_edit(content)
+    }
 }
 
 fn diff_annotated_inner(
@@ -1917,6 +2604,8 @@ fn diff_annotated_inner_with_events(
     let mut layout = LayoutCursor::new(&prepared.new_layout_blocks);
     let mut old_owners = BlockOwnerCursor::new(old);
     let mut new_owners = BlockOwnerCursor::new(new);
+    let mut old_equation_origins = EquationOriginBlockCursor::new(old);
+    let mut new_equation_origins = EquationOriginBlockCursor::new(new);
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
     let matched_ops = prepared.matched_ops;
@@ -1927,6 +2616,8 @@ fn diff_annotated_inner_with_events(
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
+                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
+                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
                 let old_ann = old_owners
                     .take_owner_for(&old_block.content)
                     .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
@@ -1991,8 +2682,16 @@ fn diff_annotated_inner_with_events(
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && (has_equation_origins(old_ann) || has_equation_origins(new_ann))
                 {
-                    let old_tokens = extract_words_for_annotated(&old_block.content, Some(old_ann));
-                    let new_tokens = extract_words_for_annotated(&new_block.content, Some(new_ann));
+                    let old_tokens = extract_words_for_annotated_with_equation_origins(
+                        &old_block.content,
+                        Some(old_ann),
+                        &old_eq_origins,
+                    );
+                    let new_tokens = extract_words_for_annotated_with_equation_origins(
+                        &new_block.content,
+                        Some(new_ann),
+                        &new_eq_origins,
+                    );
                     let word_ops = diff_words(&old_tokens, &new_tokens);
                     if has_textual_word_change(&word_ops) {
                         blocks.push(DiffBlockEdit {
@@ -2006,6 +2705,77 @@ fn diff_annotated_inner_with_events(
                         continue;
                     }
                 }
+                if presentation_changed(
+                    &old_block,
+                    &new_block,
+                    old_ann,
+                    new_ann,
+                    &old_eq_origins,
+                    &new_eq_origins,
+                ) {
+                    if (block_context_changed(
+                        &old_block.content,
+                        &new_block.content,
+                        old_ann,
+                        new_ann,
+                    ) || semantic_heading_context(old_ann, new_ann)
+                        || (is_block_context(&old_block.content)
+                            && is_block_context(&new_block.content)))
+                        && replacement_has_word_change(
+                            &old_block,
+                            &new_block,
+                            old_ann,
+                            new_ann,
+                            &old_eq_origins,
+                            &new_eq_origins,
+                        )
+                    {
+                        emit_pipeline_trace_event(
+                            debug_events,
+                            PipelineTraceEvent::new("diff/equal-block", "selected")
+                                .reason("presentation identity changed across block context")
+                                .old_content(&old_block.content)
+                                .new_content(&new_block.content)
+                                .selected_edit_kind("context_split_replacement"),
+                        )?;
+                        blocks.push(context_split_replacement_block_edit(
+                            &old_block,
+                            &new_block,
+                            old_ann,
+                            new_ann,
+                            &old_eq_origins,
+                            &new_eq_origins,
+                            page_styles,
+                        ));
+                        continue;
+                    }
+                    let edits = word_or_opaque_replacement_edits(
+                        &old_block,
+                        &new_block,
+                        old_ann,
+                        new_ann,
+                        &old_eq_origins,
+                        &new_eq_origins,
+                    );
+                    if !edits.is_empty() {
+                        emit_pipeline_trace_event(
+                            debug_events,
+                            PipelineTraceEvent::new("diff/equal-block", "selected")
+                                .reason("presentation identity changed")
+                                .old_content(&old_block.content)
+                                .new_content(&new_block.content)
+                                .selected_edit_kind(
+                                    edits.first().map(realized_edit_kind).unwrap_or("noop"),
+                                ),
+                        )?;
+                        blocks.push(DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, new_ann),
+                            edits,
+                            page_styles,
+                        });
+                        continue;
+                    }
+                }
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, None),
                     edits: vec![],
@@ -2013,6 +2783,7 @@ fn diff_annotated_inner_with_events(
                 });
             }
             BlockOp::Delete(old_block) => {
+                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
                 let old_claim = old_owners.take_claim_for(&old_block.content);
                 if let Some(BlockOp::Insert(new_block)) = matched_ops.get(op_index).cloned() {
                     let new_claim = new_owners.peek_claim_for(&new_block.content);
@@ -2026,6 +2797,7 @@ fn diff_annotated_inner_with_events(
                                 .selected_edit_kind("replace"),
                         )?;
                         let new_claim = new_owners.take_claim_for(&new_block.content);
+                        let new_eq_origins = new_equation_origins.take_for(&new_block.content);
                         blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
                         blocks.push(replace_block_edit(
                             old,
@@ -2034,6 +2806,8 @@ fn diff_annotated_inner_with_events(
                             &new_block,
                             old_claim.owner,
                             new_claim.owner,
+                            &old_eq_origins,
+                            &new_eq_origins,
                             debug_events,
                         )?);
                         op_index += 1;
@@ -2042,35 +2816,42 @@ fn diff_annotated_inner_with_events(
                 }
                 let old_ann = old_claim
                     .owner
-                    .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
+                    .or_else(|| find_annotated_block_owner(old, &old_block.content));
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&old_block.content, old_ann),
-                    edits: vec![RealizedEdit::WholeBlock(deleted_edit(
+                    edits: vec![RealizedEdit::WholeBlock(deleted_block_edit(
                         old_block.content.clone(),
+                        old_ann,
+                        &old_eq_origins,
                     ))],
                     page_styles: old_block.page_styles,
                 });
             }
             BlockOp::Insert(new_block) => {
+                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
                 let new_ann = new_owners
                     .take_owner_for(&new_block.content)
-                    .or_else(|| find_nonempty_annotated_child(new, &new_block.content));
+                    .or_else(|| find_annotated_block_owner(new, &new_block.content));
                 blocks.extend(layout.take_before(&new_block.content, new_ann));
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, new_ann),
-                    edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(
+                    edits: vec![RealizedEdit::WholeBlock(inserted_block_edit(
                         new_block.content.clone(),
+                        new_ann,
+                        &new_eq_origins,
                     ))],
                     page_styles: new_block.page_styles,
                 });
             }
             BlockOp::Replace(old_block, new_block) => {
+                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
+                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
                 let old_ann = old_owners
                     .take_owner_for(&old_block.content)
-                    .or_else(|| find_nonempty_annotated_block_owner(old, &old_block.content));
+                    .or_else(|| find_annotated_block_owner(old, &old_block.content));
                 let new_ann = new_owners
                     .take_owner_for(&new_block.content)
-                    .or_else(|| find_nonempty_annotated_block_owner(new, &new_block.content));
+                    .or_else(|| find_annotated_block_owner(new, &new_block.content));
                 blocks.extend(layout.take_before(&new_block.content, new_ann));
                 blocks.push(replace_block_edit(
                     old,
@@ -2079,6 +2860,8 @@ fn diff_annotated_inner_with_events(
                     &new_block,
                     old_ann,
                     new_ann,
+                    &old_eq_origins,
+                    &new_eq_origins,
                     debug_events,
                 )?);
             }
@@ -2169,6 +2952,15 @@ fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
         }
     }
 
+    let mut previous_wrapper_text_edit = false;
+    for block in &mut *blocks {
+        if previous_wrapper_text_edit && block.base.realized.plain_text().is_empty() {
+            retain_block_edits(block, |edit| !edit_is_opaque_replacement(edit));
+        }
+        previous_wrapper_text_edit =
+            is_owned_empty_wrapper_edit_block(block) && block_has_modified_signature(block);
+    }
+
     let mut seen_signatures = HashSet::new();
     for block in blocks {
         retain_block_edits(block, |edit| {
@@ -2183,6 +2975,33 @@ fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
 
 fn is_owned_empty_edit_block(block: &DiffBlockEdit) -> bool {
     block.base.realized.plain_text().is_empty() && !block.base.annotation.slots.is_empty()
+}
+
+fn is_owned_empty_wrapper_edit_block(block: &DiffBlockEdit) -> bool {
+    block.base.realized.plain_text().is_empty()
+        && matches!(
+            block.base.annotation.semantic_kind,
+            Some(SemanticKind::Wrapper(_) | SemanticKind::Stack)
+        )
+}
+
+fn block_has_modified_signature(block: &DiffBlockEdit) -> bool {
+    block
+        .edits
+        .iter()
+        .any(|edit| !edit_modified_signatures(edit).is_empty())
+}
+
+fn edit_is_opaque_replacement(edit: &RealizedEdit) -> bool {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content) => {
+            matches!(content, EditContent::OpaqueReplacement { .. })
+        }
+    }
 }
 
 fn suppress_block_surface(block: &mut DiffBlockEdit) {
@@ -3436,6 +4255,87 @@ impl<'a> BlockOwnerCursor<'a> {
     }
 }
 
+struct EquationOriginBlockClaim {
+    content: Content,
+    origins: Vec<Content>,
+}
+
+struct EquationOriginBlockCursor {
+    claims: Vec<EquationOriginBlockClaim>,
+    index: usize,
+}
+
+impl EquationOriginBlockCursor {
+    fn new(root: &AnnotatedContent) -> Self {
+        let mut origins = std::collections::VecDeque::from(annotated_equation_origins(root));
+        let claims = extract_block_units(&root.realized)
+            .into_iter()
+            .map(|block| {
+                let count = realized_equation_carrier_count_for_diff(&block.content);
+                let origins = (0..count)
+                    .filter_map(|_| origins.pop_front())
+                    .collect::<Vec<_>>();
+                EquationOriginBlockClaim {
+                    content: block.content,
+                    origins,
+                }
+            })
+            .collect();
+        Self { claims, index: 0 }
+    }
+
+    fn take_for(&mut self, target: &Content) -> Vec<Content> {
+        while let Some(claim) = self.claims.get(self.index) {
+            self.index += 1;
+            if claim.content == *target {
+                return claim.origins.clone();
+            }
+        }
+        vec![]
+    }
+}
+
+fn annotated_equation_origins(root: &AnnotatedContent) -> Vec<Content> {
+    let mut origins = Vec::new();
+    collect_annotated_equation_origins(root, &mut origins);
+    origins
+}
+
+fn collect_annotated_equation_origins(node: &AnnotatedContent, out: &mut Vec<Content>) {
+    out.extend(node.annotation.equation_origins.iter().cloned());
+    for child in &node.children {
+        collect_annotated_equation_origins(child, out);
+    }
+}
+
+fn realized_equation_carrier_count_for_diff(content: &Content) -> usize {
+    if is_realized_equation_carrier(content) {
+        return 1;
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .map(realized_equation_carrier_count_for_diff)
+            .sum();
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return realized_equation_carrier_count_for_diff(&styled.child);
+    }
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return realized_equation_carrier_count_for_diff(&par.body);
+    }
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return realized_equation_carrier_count_for_diff(&heading.body);
+    }
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        return realized_equation_carrier_count_for_diff(&body);
+    }
+    0
+}
+
 fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
     let mut ordinals: HashMap<SemanticKind, usize> = HashMap::new();
     for claim in claims {
@@ -3631,13 +4531,6 @@ fn find_annotated_block_owner<'a>(
         return exact;
     }
     find_single_block_semantic_owner(root, target).or(exact)
-}
-
-fn find_nonempty_annotated_block_owner<'a>(
-    root: &'a AnnotatedContent,
-    target: &Content,
-) -> Option<&'a AnnotatedContent> {
-    (!target.plain_text().is_empty()).then(|| find_annotated_block_owner(root, target))?
 }
 
 fn find_unique_changed_slot_pair<'a>(
@@ -4177,7 +5070,7 @@ fn deleted_visible_text_before_first_footnote(
     if deleted.is_empty() {
         return vec![];
     }
-    let content = Content::sequence(deleted.iter().map(|token| token.content.clone()));
+    let content = Content::sequence(deleted.iter().map(token_content_for_direct_edit));
 
     vec![RealizedEdit::InsertBefore {
         anchor,
@@ -5629,6 +6522,79 @@ mod tests {
             ops.iter().any(|op| matches!(op, WordOp::Insert(_))),
             "expected insert op"
         );
+    }
+
+    #[test]
+    fn same_text_with_style_change_produces_delete_and_insert() {
+        use typst::visualize::Color;
+
+        let old = extract_words(&TextElem::packed("important"));
+        let new = extract_words(
+            &TextElem::packed("important")
+                .styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into())),
+        );
+        let ops = diff_words(&old, &new);
+
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Delete(_))));
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Insert(_))));
+    }
+
+    #[test]
+    fn same_text_subscript_to_superscript_produces_delete_and_insert() {
+        use typst::text::{SubElem, SuperElem};
+
+        let old = extract_words(&Content::new(SubElem::new(TextElem::packed("2"))));
+        let new = extract_words(&Content::new(SuperElem::new(TextElem::packed("2"))));
+        let ops = diff_words(&old, &new);
+
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Delete(_))));
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Insert(_))));
+    }
+
+    #[test]
+    fn same_text_paragraph_to_heading_produces_delete_and_insert() {
+        use typst::model::ParElem;
+
+        let old = extract_words(&Content::new(ParElem::new(TextElem::packed("Background"))));
+        let new = extract_words(&Content::new(HeadingElem::new(TextElem::packed(
+            "Background",
+        ))));
+        let ops = diff_words(&old, &new);
+
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Delete(_))));
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Insert(_))));
+    }
+
+    #[test]
+    fn same_equation_repr_with_different_blockness_produces_delete_and_insert() {
+        let old = extract_words(&Content::new(
+            EquationElem::new(TextElem::packed("x")).with_block(false),
+        ));
+        let new = extract_words(&Content::new(
+            EquationElem::new(TextElem::packed("x")).with_block(true),
+        ));
+        let ops = diff_words(&old, &new);
+
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Delete(_))));
+        assert!(ops.iter().any(|op| matches!(op, WordOp::Insert(_))));
+    }
+
+    #[test]
+    fn block_context_token_identity_does_not_include_sibling_text() {
+        let old = extract_words(&Content::new(BlockElem::new().with_body(Some(
+            BlockBody::Content(TextElem::packed("Definition 2 -- A tree is acyclic.")),
+        ))));
+        let new = extract_words(&Content::new(BlockElem::new().with_body(Some(
+            BlockBody::Content(TextElem::packed("Definition 2 -- A forest is acyclic.")),
+        ))));
+        let ops = diff_words(&old, &new);
+        let equals = collect_word_op_text(&ops, |op| match op {
+            WordOp::Equal(tokens) => Some(tokens),
+            _ => None,
+        });
+
+        assert!(equals.contains("Definition 2"), "ops={ops:?}");
+        assert!(equals.contains("acyclic"), "ops={ops:?}");
     }
 
     #[test]

@@ -83,6 +83,22 @@ fn rendered_text_runs(frame: &typst::layout::Frame) -> Vec<TextRun> {
     out
 }
 
+fn run_size_with_fill(runs: &[TextRun], needle: &str, fill: typst::visualize::Paint) -> f64 {
+    runs.iter()
+        .find(|run| run.text.contains(needle) && run.fill == fill)
+        .unwrap_or_else(|| {
+            panic!("expected run containing {needle:?} with fill {fill:?}: {runs:?}")
+        })
+        .size
+}
+
+fn run_size(runs: &[TextRun], needle: &str) -> f64 {
+    runs.iter()
+        .find(|run| run.text.contains(needle))
+        .unwrap_or_else(|| panic!("expected run containing {needle:?}: {runs:?}"))
+        .size
+}
+
 fn count_nodes<T: typst::foundations::NativeElement>(content: &Content) -> usize {
     let mut count = 0;
     let _ = content.traverse::<_, ()>(&mut |c| {
@@ -744,6 +760,68 @@ fn changed_blocks(result: &typst_diff::diff::DiffResult) -> Vec<&typst_diff::dif
         .collect()
 }
 
+#[test]
+fn same_visible_text_visual_changes_are_reported_as_modifications() {
+    let result = diff_annotated_corpus("36-heading-to-paragraph");
+    let log = result.modification_log();
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        !changed_blocks(&result).is_empty(),
+        "36-heading-to-paragraph should have at least one changed block"
+    );
+    assert!(
+        deleted.contains("Background information"),
+        "deleted={deleted:?}\n{log}"
+    );
+    assert!(
+        inserted.contains("Background information"),
+        "inserted={inserted:?}\n{log}"
+    );
+
+    for (case, needle) in [
+        ("88-show-strong-style-only-change", "important"),
+        ("94-bold-added-to-existing-word", "important"),
+        ("97-highlight-color-changed", "critical"),
+        ("98-subscript-superscript-style-change", "2"),
+    ] {
+        let result = diff_annotated_corpus(case);
+        assert!(
+            !changed_blocks(&result).is_empty(),
+            "{case} should have at least one changed block"
+        );
+        assert_modified_words_include(&result, &[needle], &[needle]);
+    }
+}
+
+#[test]
+fn inserted_display_equation_is_tokenized_and_logged() {
+    let result = diff_annotated_corpus("101-equation-number-reference-changed");
+    let log = result.modification_log();
+    let (_deleted, inserted) = collect_modified_word_texts(&result.blocks);
+
+    assert!(inserted.contains('x'), "inserted={inserted:?}\n{log}");
+    assert!(inserted.contains('y'), "inserted={inserted:?}\n{log}");
+    assert!(inserted.contains("revised"), "inserted={inserted:?}\n{log}");
+    assert!(log.contains("inserted:"), "{log}");
+    assert!(log.contains('x'), "{log}");
+    assert!(log.contains('y'), "{log}");
+    assert!(!log.contains("text: \n"), "{log}");
+}
+
+#[test]
+fn same_visible_text_metadata_only_changes_stay_noop() {
+    for case in [
+        "95-link-target-changed-same-text",
+        "96-label-changed-same-text",
+    ] {
+        let result = diff_annotated_corpus(case);
+        let log = result.modification_log();
+
+        assert!(changed_blocks(&result).is_empty(), "{case} changed:\n{log}");
+        assert!(!log.lines().any(|line| line.starts_with("## ")), "{log}");
+    }
+}
+
 fn only_changed_figure_block<'a>(
     result: &'a typst_diff::diff::DiffResult,
     case: &str,
@@ -1128,6 +1206,80 @@ fn modified_numbered_headings_do_not_apply_heading_style_twice() {
 }
 
 #[test]
+fn paragraph_to_heading_context_change_keeps_deleted_text_body_sized() {
+    let old_world = corpus_world("36-heading-to-paragraph/old.typ");
+    let new_world = corpus_world("36-heading-to-paragraph/new.typ");
+    let old_normal = typst_diff::eval_to_realized_content(&old_world)
+        .unwrap()
+        .realized;
+    let new_normal = typst_diff::eval_to_realized_content(&new_world)
+        .unwrap()
+        .realized;
+    let annotated = annotated_corpus("36-heading-to-paragraph");
+
+    let old_document = typst_diff::eval::layout_document(&old_world, &old_normal).unwrap();
+    let new_document = typst_diff::eval::layout_document(&new_world, &new_normal).unwrap();
+    let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let old_runs = rendered_text_runs(&old_document.pages[0].frame);
+    let new_runs = rendered_text_runs(&new_document.pages[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+
+    let body_size = run_size(&old_runs, "Background");
+    let heading_size = run_size(&new_runs, "Background");
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let green = typst::visualize::Color::from_u8(0, 180, 0, 255).into();
+
+    let deleted_size = run_size_with_fill(&annotated_runs, "Background", red);
+    let inserted_size = run_size_with_fill(&annotated_runs, "Background", green);
+
+    assert!(
+        (deleted_size - body_size).abs() < 0.1,
+        "deleted paragraph should keep body size; body={body_size}, deleted={deleted_size}, runs={annotated_runs:?}"
+    );
+    assert!(
+        (inserted_size - heading_size).abs() < 0.1,
+        "inserted heading should keep heading size; heading={heading_size}, inserted={inserted_size}, runs={annotated_runs:?}"
+    );
+}
+
+#[test]
+fn heading_level_context_change_keeps_deleted_text_at_old_level() {
+    let old_world = corpus_world("38-fn-template-changed/old.typ");
+    let new_world = corpus_world("38-fn-template-changed/new.typ");
+    let old_normal = typst_diff::eval_to_realized_content(&old_world)
+        .unwrap()
+        .realized;
+    let new_normal = typst_diff::eval_to_realized_content(&new_world)
+        .unwrap()
+        .realized;
+    let annotated = annotated_corpus("38-fn-template-changed");
+
+    let old_document = typst_diff::eval::layout_document(&old_world, &old_normal).unwrap();
+    let new_document = typst_diff::eval::layout_document(&new_world, &new_normal).unwrap();
+    let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let old_runs = rendered_text_runs(&old_document.pages[0].frame);
+    let new_runs = rendered_text_runs(&new_document.pages[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+
+    let old_heading_size = run_size(&old_runs, "Overview");
+    let new_heading_size = run_size(&new_runs, "Overview");
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let green = typst::visualize::Color::from_u8(0, 180, 0, 255).into();
+
+    let deleted_size = run_size_with_fill(&annotated_runs, "Overview", red);
+    let inserted_size = run_size_with_fill(&annotated_runs, "Overview", green);
+
+    assert!(
+        (deleted_size - old_heading_size).abs() < 0.1,
+        "deleted heading should keep old level; old={old_heading_size}, deleted={deleted_size}, runs={annotated_runs:?}"
+    );
+    assert!(
+        (inserted_size - new_heading_size).abs() < 0.1,
+        "inserted heading should keep new level; new={new_heading_size}, inserted={inserted_size}, runs={annotated_runs:?}"
+    );
+}
+
+#[test]
 fn emphasis_changes_keep_emphasis_formatting() {
     let annotated = annotated_corpus("15-emph-content-changed");
     let plain = annotated.plain_text();
@@ -1187,6 +1339,11 @@ fn adjacent_replacement_tokens_keep_separator_in_corpus_rendering() {
             "100-figure-inserted-before-figure-reference",
             "Figure 12 for",
             "Figure 1 2 for",
+        ),
+        (
+            "36-heading-to-paragraph",
+            "level-oneheading",
+            "level-one heading",
         ),
     ];
 
@@ -2863,6 +3020,15 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
         &result,
         &["vertices", "tree", "connected"],
         &["nodes", "forest", "collection", "disjoint"],
+    );
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        !deleted.contains("Definition 2"),
+        "Definition 2 should keep shared prefix equal; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        !inserted.contains("Definition 2"),
+        "Definition 2 should keep shared prefix equal; deleted={deleted:?}; inserted={inserted:?}"
     );
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);

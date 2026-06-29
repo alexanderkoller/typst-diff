@@ -96,15 +96,16 @@ fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) ->
         match run {
             WordRenderRun::Equal(tokens) => {
                 for t in tokens {
-                    inline.push(t.content.clone());
+                    inline.push(token_render_content(t));
                 }
             }
             WordRenderRun::Insert {
                 tokens,
                 color,
-                needs_separator,
+                leading_separator,
+                trailing_separator,
             } => {
-                let joined = changed_token_sequence(tokens, needs_separator);
+                let joined = changed_token_sequence(tokens, leading_separator, trailing_separator);
                 inline.push(joined.styled(TextElem::fill.set(color.color().into())));
             }
             WordRenderRun::Delete { tokens, visible } => {
@@ -123,7 +124,8 @@ enum WordRenderRun<'a> {
     Insert {
         tokens: &'a [Token],
         color: ChangeColor,
-        needs_separator: bool,
+        leading_separator: bool,
+        trailing_separator: bool,
     },
     Delete {
         tokens: &'a [Token],
@@ -150,10 +152,14 @@ fn word_render_runs(word_ops: &[WordOp], compact: bool) -> Vec<WordRenderRun<'_>
                         } else {
                             ChangeColor::Green
                         },
-                        needs_separator: !compact
+                        leading_separator: !compact
                             && prev
                                 .and_then(tokens_before_insert)
                                 .is_some_and(|prev| needs_separator(prev, tokens)),
+                        trailing_separator: !compact
+                            && next
+                                .and_then(tokens_after_insert)
+                                .is_some_and(|next| needs_separator(tokens, next)),
                     }
                 }
                 WordOp::Delete(tokens) => {
@@ -176,12 +182,26 @@ fn tokens_before_insert(op: &WordOp) -> Option<&[crate::diff::Token]> {
     }
 }
 
-fn changed_token_sequence(tokens: &[Token], needs_separator: bool) -> Content {
+fn tokens_after_insert(op: &WordOp) -> Option<&[crate::diff::Token]> {
+    match op {
+        WordOp::Equal(tokens) | WordOp::Delete(tokens) => Some(tokens),
+        _ => None,
+    }
+}
+
+fn changed_token_sequence(
+    tokens: &[Token],
+    leading_separator: bool,
+    trailing_separator: bool,
+) -> Content {
     let mut content: Vec<Content> = Vec::new();
-    if needs_separator {
+    if leading_separator {
         content.push(SpaceElem::shared().clone());
     }
-    content.extend(tokens.iter().map(|t| t.content.clone()));
+    content.extend(tokens.iter().map(token_render_content));
+    if trailing_separator {
+        content.push(SpaceElem::shared().clone());
+    }
     Content::sequence(content)
 }
 
@@ -205,7 +225,8 @@ fn needs_separator(left: &[crate::diff::Token], right: &[crate::diff::Token]) ->
 }
 
 fn deleted_token_content(token: &crate::diff::Token) -> Content {
-    if let Some(equation) = token.content.to_packed::<EquationElem>() {
+    let content = token_render_content(token);
+    if let Some(equation) = content.to_packed::<EquationElem>() {
         let body = equation
             .body
             .clone()
@@ -218,13 +239,44 @@ fn deleted_token_content(token: &crate::diff::Token) -> Content {
         );
     }
 
-    let content = if token.content.plain_text().is_empty() {
+    let content = if content.plain_text().is_empty() {
         TextElem::packed(token.text.as_str())
     } else {
-        token.content.clone()
+        content
     };
     let colored = content.styled(TextElem::fill.set(red().into()));
     Content::new(StrikeElem::new(colored))
+}
+
+fn token_render_content(token: &crate::diff::Token) -> Content {
+    inline_token_content(&token.content, token.text.as_str())
+}
+
+fn inline_token_content(content: &Content, text: &str) -> Content {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let child = inline_token_content(&styled.child, text);
+        return child.styled_with_map(styled.styles.clone());
+    }
+
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return inline_token_content(&par.body, text);
+    }
+
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return inline_token_content(&heading.body, text);
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        return inline_token_content(&body, text);
+    }
+
+    if content.plain_text().is_empty() && !text.is_empty() {
+        TextElem::packed(text)
+    } else {
+        content.clone()
+    }
 }
 
 /// Graft `replacement` into the innermost text-bearing position of `template`.
@@ -727,12 +779,13 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
             WordRenderRun::Insert {
                 tokens,
                 color,
-                needs_separator,
+                leading_separator,
+                trailing_separator,
             } => {
                 out.push_str(&format!(
                     "#text(fill: rgb(\"{}\"))[{}]",
                     color.typst_hex(),
-                    changed_tokens_typst_markup(tokens, needs_separator)
+                    changed_tokens_typst_markup(tokens, leading_separator, trailing_separator)
                 ));
             }
             WordRenderRun::Delete { tokens, visible } => {
@@ -748,19 +801,26 @@ fn word_ops_typst_markup(word_ops: &[WordOp], compact: bool) -> String {
     out
 }
 
-fn changed_tokens_typst_markup(tokens: &[Token], needs_separator: bool) -> String {
+fn changed_tokens_typst_markup(
+    tokens: &[Token],
+    leading_separator: bool,
+    trailing_separator: bool,
+) -> String {
     let mut text = String::new();
-    if needs_separator {
+    if leading_separator {
         text.push(' ');
     }
     text.push_str(&tokens_typst_markup(tokens));
+    if trailing_separator {
+        text.push(' ');
+    }
     text
 }
 
 fn tokens_typst_markup(tokens: &[Token]) -> String {
     tokens
         .iter()
-        .map(|token| content_typst_markup(&token.content))
+        .map(|token| content_typst_markup(&token_render_content(token)))
         .collect()
 }
 
@@ -1121,7 +1181,8 @@ mod tests {
                 WordRenderRun::Delete { visible: false, .. },
                 WordRenderRun::Insert {
                     color: ChangeColor::Blue,
-                    needs_separator: false,
+                    leading_separator: false,
+                    trailing_separator: false,
                     ..
                 }
             ]
@@ -1142,7 +1203,8 @@ mod tests {
                 WordRenderRun::Equal(_),
                 WordRenderRun::Insert {
                     color: ChangeColor::Green,
-                    needs_separator: true,
+                    leading_separator: true,
+                    trailing_separator: false,
                     ..
                 }
             ]
@@ -1599,6 +1661,27 @@ mod tests {
             "{plain}"
         );
         assert!(!plain.contains("matterentirely"), "{plain}");
+    }
+
+    #[test]
+    fn annotated_inline_content_inserts_separator_before_following_equal_word() {
+        let inline = annotated_inline_content(
+            &[
+                WordOp::Equal(vec![word_token("This")]),
+                WordOp::Delete(vec![word_token("plain")]),
+                WordOp::Insert(vec![
+                    word_token("proper"),
+                    word_token(" "),
+                    word_token("level-one"),
+                ]),
+                WordOp::Equal(vec![word_token("heading.")]),
+            ],
+            false,
+        );
+        let plain = inline.plain_text();
+
+        assert!(plain.contains("proper level-one heading."), "{plain}");
+        assert!(!plain.contains("level-oneheading"), "{plain}");
     }
 
     #[test]
