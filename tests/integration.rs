@@ -1236,10 +1236,20 @@ fn cli_writes_debug_bundle_when_requested() {
     for rel in yaml_files {
         assert_yaml_file(&debug_dir.join(rel));
     }
-    assert_jsonl_file(&debug_dir.join("diff/rendered-region-frame-traces.jsonl"));
+    assert!(
+        !debug_dir.join("diff/pipeline-events.jsonl").exists(),
+        "--debug should not write pipeline trace JSONL"
+    );
+    assert!(
+        !debug_dir
+            .join("diff/rendered-region-frame-traces.jsonl")
+            .exists(),
+        "--debug should not write rendered frame trace JSONL"
+    );
 
     let manifest = std::fs::read_to_string(debug_dir.join("manifest.yml")).unwrap();
-    assert!(manifest.contains("schema_version: 1"), "{manifest}");
+    assert!(manifest.contains("schema_version: 2"), "{manifest}");
+    assert!(manifest.contains("debug_trace: false"), "{manifest}");
     assert!(
         manifest.contains(&typst_diff::build_info::build_report_line()),
         "{manifest}"
@@ -1259,7 +1269,52 @@ fn cli_writes_debug_bundle_when_requested() {
 }
 
 #[test]
-fn cli_debug_records_rendered_region_frame_trace_events() {
+fn cli_debug_trace_records_pipeline_events_without_frame_trace_for_normal_text() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("old.typ"), "The old text.").unwrap();
+    std::fs::write(dir.path().join("new.typ"), "The new text.").unwrap();
+    let pdf_path = dir.path().join("changes.pdf");
+    let debug_dir = pdf_path.with_extension("debug");
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["old.typ", "new.typ", "-o"])
+        .arg(&pdf_path)
+        .arg("--debug-trace")
+        .output()
+        .unwrap();
+
+    assert_command_success(cli, "typst-diff --debug-trace");
+    assert_valid_pdf(&std::fs::read(&pdf_path).unwrap());
+    assert_yaml_file(&debug_dir.join("manifest.yml"));
+    let trace_path = debug_dir.join("diff/pipeline-events.jsonl");
+    assert_jsonl_file(&trace_path);
+    assert!(
+        !debug_dir
+            .join("diff/rendered-region-frame-traces.jsonl")
+            .exists(),
+        "non-rendered-region diffs should not create a frame trace file"
+    );
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert!(
+        trace.contains(r#""format":"typst-diff-pipeline-events""#),
+        "{trace}"
+    );
+    assert!(trace.contains(r#""stage":"diff/edit-zone""#), "{trace}");
+    assert!(
+        trace.contains(r#""event":"selected_replacement""#),
+        "{trace}"
+    );
+    assert!(trace.contains(r#""stage":"render""#), "{trace}");
+
+    let manifest = std::fs::read_to_string(debug_dir.join("manifest.yml")).unwrap();
+    assert!(manifest.contains("debug_trace: true"), "{manifest}");
+    assert!(manifest.contains("pipeline-events.jsonl"), "{manifest}");
+    assert!(manifest.contains("present: false"), "{manifest}");
+}
+
+#[test]
+fn cli_debug_trace_records_rendered_region_frame_trace_events() {
     let dir = tempfile::TempDir::new().unwrap();
     let pdf_path = dir.path().join("headers.pdf");
     let debug_dir = pdf_path.with_extension("debug");
@@ -1270,12 +1325,13 @@ fn cli_debug_records_rendered_region_frame_trace_events() {
         .arg(corpus("43-alternating-headers/new.typ"))
         .args(["-o"])
         .arg(&pdf_path)
-        .arg("--debug")
+        .arg("--debug-trace")
         .output()
         .unwrap();
 
-    assert_command_success(cli, "typst-diff --debug rendered-region trace");
+    assert_command_success(cli, "typst-diff --debug-trace rendered-region trace");
     assert_valid_pdf(&std::fs::read(&pdf_path).unwrap());
+    assert_jsonl_file(&debug_dir.join("diff/pipeline-events.jsonl"));
     let trace_path = debug_dir.join("diff/rendered-region-frame-traces.jsonl");
     assert_jsonl_file(&trace_path);
     let trace = std::fs::read_to_string(trace_path).unwrap();
@@ -1307,10 +1363,10 @@ fn rendered_region_debug_events_do_not_change_diff_result() {
         events: usize,
     }
 
-    impl typst_diff::diff::DebugEventSink for CountingSink {
+    impl typst_diff::trace::DebugEventSink for CountingSink {
         fn rendered_region_trace_event(
             &mut self,
-            _event: &typst_diff::diff::FrameTraceEvent,
+            _event: &typst_diff::trace::FrameTraceEvent,
         ) -> anyhow::Result<()> {
             self.events += 1;
             Ok(())
@@ -1336,6 +1392,173 @@ fn rendered_region_debug_events_do_not_change_diff_result() {
         "expected debug sink to observe frame events"
     );
     assert_eq!(normal.modification_log(), with_debug.modification_log());
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    pipeline: Vec<typst_diff::trace::PipelineTraceEvent>,
+}
+
+impl typst_diff::trace::DebugEventSink for RecordingSink {
+    fn pipeline_trace_event(
+        &mut self,
+        event: &typst_diff::trace::PipelineTraceEvent,
+    ) -> anyhow::Result<()> {
+        self.pipeline.push(event.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn pipeline_trace_does_not_change_diff_result_for_normal_text() {
+    let (_dir, old_world, new_world) = temp_worlds("The old text.", "The new text.");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+
+    let normal =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+    let mut sink = RecordingSink::default();
+    let (traced, _) = typst_diff::diff::diff_annotated_with_rendered_regions_and_debug_events(
+        &old, &new, &old_world, &new_world, &mut sink,
+    )
+    .unwrap();
+
+    assert_eq!(normal.modification_log(), traced.modification_log());
+    assert!(
+        sink.pipeline
+            .iter()
+            .any(|event| event.stage == "diff/edit-zone"
+                && event.event == "selected_replacement"
+                && event.selected_edit_kind.as_deref() == Some("replace")),
+        "expected edit-zone replacement event"
+    );
+    assert!(
+        sink.pipeline
+            .iter()
+            .any(|event| event.stage == "diff/replace-block"
+                && event.selected_edit_kind.as_deref() == Some("modified")),
+        "expected modified replacement decision"
+    );
+}
+
+#[test]
+fn traced_and_untraced_edit_zone_matching_are_identical() {
+    let old = vec![
+        typst_diff::eval::eval_snippet_to_content("alpha").unwrap(),
+        typst_diff::eval::eval_snippet_to_content("bravo old").unwrap(),
+    ];
+    let new = vec![
+        typst_diff::eval::eval_snippet_to_content("alpha").unwrap(),
+        typst_diff::eval::eval_snippet_to_content("bravo new").unwrap(),
+    ];
+    let raw = typst_diff::diff::diff_blocks_raw(&old, &new);
+    let untraced = typst_diff::diff::match_edit_zones(raw.clone());
+    let mut sink = RecordingSink::default();
+    let traced = typst_diff::diff::match_edit_zones_with_debug_events(raw, &mut sink).unwrap();
+
+    assert_eq!(block_op_signatures(&untraced), block_op_signatures(&traced));
+    assert!(
+        sink.pipeline
+            .iter()
+            .any(|event| event.event == "similarity_candidate"
+                && event.similarity.is_some()
+                && event.threshold == Some(0.3)),
+        "expected similarity candidate trace"
+    );
+}
+
+#[test]
+fn pipeline_trace_records_opaque_replacement_decision() {
+    let old_world = corpus_world("90-opaque-graphic-replaced/old.typ");
+    let new_world = corpus_world("90-opaque-graphic-replaced/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let mut sink = RecordingSink::default();
+
+    typst_diff::diff::diff_annotated_with_block_debug_events(&old, &new, &mut sink).unwrap();
+
+    assert!(
+        sink.pipeline.iter().any(|event| {
+            event
+                .selected_edit_kind
+                .as_deref()
+                .is_some_and(|kind| kind.contains("opaque_replacement"))
+        }),
+        "expected opaque replacement trace event"
+    );
+}
+
+#[test]
+fn pipeline_trace_records_slot_recursion_decision() {
+    let old_world = corpus_world("18-list-item-changed/old.typ");
+    let new_world = corpus_world("18-list-item-changed/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let mut sink = RecordingSink::default();
+
+    typst_diff::diff::diff_annotated_with_block_debug_events(&old, &new, &mut sink).unwrap();
+
+    assert!(
+        sink.pipeline
+            .iter()
+            .any(|event| event.stage == "diff/slot" && event.event == "start"),
+        "expected slot recursion trace event"
+    );
+}
+
+#[test]
+fn pipeline_trace_records_rendered_region_skip_for_semantic_region_diff() {
+    let old_world = corpus_world("80-footer-text-changed/old.typ");
+    let new_world = corpus_world("80-footer-text-changed/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let mut sink = RecordingSink::default();
+
+    typst_diff::diff::diff_annotated_with_rendered_regions_and_debug_events(
+        &old, &new, &old_world, &new_world, &mut sink,
+    )
+    .unwrap();
+
+    assert!(
+        sink.pipeline.iter().any(|event| {
+            event.stage == "diff/rendered-region"
+                && event.event == "skip"
+                && event
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("semantic page-region diff"))
+        }),
+        "expected semantic page-region skip trace event"
+    );
+}
+
+fn block_op_signatures(blocks: &[typst_diff::diff::BlockOp]) -> Vec<String> {
+    blocks
+        .iter()
+        .map(|op| match op {
+            typst_diff::diff::BlockOp::Equal(old, new) => {
+                format!(
+                    "equal:{}=>{}",
+                    old.content.plain_text(),
+                    new.content.plain_text()
+                )
+            }
+            typst_diff::diff::BlockOp::Delete(old) => {
+                format!("delete:{}", old.content.plain_text())
+            }
+            typst_diff::diff::BlockOp::Insert(new) => {
+                format!("insert:{}", new.content.plain_text())
+            }
+            typst_diff::diff::BlockOp::Replace(old, new) => {
+                format!(
+                    "replace:{}=>{}",
+                    old.content.plain_text(),
+                    new.content.plain_text()
+                )
+            }
+        })
+        .collect()
 }
 
 #[test]

@@ -40,6 +40,10 @@ use crate::annotated::{
     effective_render_content, effective_text_content,
 };
 use crate::container_ops;
+use crate::trace::{
+    DebugEventSink, FrameTraceEvent, PipelineTraceEvent, RenderedRegionTraceEnd,
+    RenderedRegionTraceStart, emit_pipeline_trace_event,
+};
 
 /// A block-level unit of content together with the page styles active at its position.
 ///
@@ -720,6 +724,27 @@ fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
     result
 }
 
+fn block_op_trace_event(
+    stage: &'static str,
+    event: &'static str,
+    index: usize,
+    op: &BlockOp,
+) -> PipelineTraceEvent {
+    let base = PipelineTraceEvent::new(stage, event).reason(format!("op_index={index}"));
+    match op {
+        BlockOp::Equal(old, new) => base
+            .old_content(&old.content)
+            .new_content(&new.content)
+            .selected_edit_kind("equal"),
+        BlockOp::Delete(old) => base.old_content(&old.content).selected_edit_kind("delete"),
+        BlockOp::Insert(new) => base.new_content(&new.content).selected_edit_kind("insert"),
+        BlockOp::Replace(old, new) => base
+            .old_content(&old.content)
+            .new_content(&new.content)
+            .selected_edit_kind("replace"),
+    }
+}
+
 /// Scan the raw ops for contiguous `Delete + Insert` zones and pair them by similarity.
 ///
 /// Within each zone every delete is greedily matched to the most-similar unused insert
@@ -727,6 +752,22 @@ fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
 /// inserts are emitted as-is. Paired inserts are emitted after all deletes (in their
 /// original order) to keep the output sequence stable.
 pub fn match_edit_zones(ops: Vec<BlockOp>) -> Vec<BlockOp> {
+    let mut no_debug_events = None;
+    match_edit_zones_inner(ops, &mut no_debug_events).expect("matching without trace cannot fail")
+}
+
+pub fn match_edit_zones_with_debug_events(
+    ops: Vec<BlockOp>,
+    debug_events: &mut dyn DebugEventSink,
+) -> anyhow::Result<Vec<BlockOp>> {
+    let mut debug_events = Some(debug_events);
+    match_edit_zones_inner(ops, &mut debug_events)
+}
+
+fn match_edit_zones_inner(
+    ops: Vec<BlockOp>,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<Vec<BlockOp>> {
     let mut result: Vec<BlockOp> = Vec::new();
     let mut i = 0;
     let n = ops.len();
@@ -757,21 +798,56 @@ pub fn match_edit_zones(ops: Vec<BlockOp>) -> Vec<BlockOp> {
                         _ => None,
                     })
                     .collect();
-                pair_edit_zone(deletes, inserts, &mut result);
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "zone").reason(format!(
+                        "deletes={} inserts={}",
+                        deletes.len(),
+                        inserts.len()
+                    )),
+                )?;
+                pair_edit_zone(deletes, inserts, &mut result, debug_events)?;
             }
         }
     }
-    result
+    Ok(result)
 }
 
-fn pair_edit_zone(deletes: Vec<DiffBlock>, inserts: Vec<DiffBlock>, out: &mut Vec<BlockOp>) {
+fn pair_edit_zone(
+    deletes: Vec<DiffBlock>,
+    inserts: Vec<DiffBlock>,
+    out: &mut Vec<BlockOp>,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<()> {
     if deletes.is_empty() {
+        if debug_events.is_some() {
+            for (index, insert) in inserts.iter().enumerate() {
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "unmatched_insert")
+                        .new_block_index(index)
+                        .new_content(&insert.content)
+                        .selected_edit_kind("insert"),
+                )?;
+            }
+        }
         out.extend(inserts.into_iter().map(BlockOp::Insert));
-        return;
+        return Ok(());
     }
     if inserts.is_empty() {
+        if debug_events.is_some() {
+            for (index, delete) in deletes.iter().enumerate() {
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "unmatched_delete")
+                        .old_block_index(index)
+                        .old_content(&delete.content)
+                        .selected_edit_kind("delete"),
+                )?;
+            }
+        }
         out.extend(deletes.into_iter().map(BlockOp::Delete));
-        return;
+        return Ok(());
     }
 
     // Match each delete to its best insert (greedy, in delete order).
@@ -793,12 +869,61 @@ fn pair_edit_zone(deletes: Vec<DiffBlock>, inserts: Vec<DiffBlock>, out: &mut Ve
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
+        if debug_events.is_some() {
+            for (j, ins) in inserts
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| !used_inserts[*j])
+            {
+                let sim = similarity(del_text.as_str(), ins.content.plain_text().as_str());
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "similarity_candidate")
+                        .old_block_index(paired_insert_idx.len())
+                        .new_block_index(j)
+                        .old_content(&del.content)
+                        .new_content(&ins.content)
+                        .similarity(sim)
+                        .threshold(0.3),
+                )?;
+            }
+        }
+
         match best {
             Some((j, sim)) if sim >= 0.3 => {
                 used_inserts[j] = true;
                 paired_insert_idx.push(Some(j));
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "selected_replacement")
+                        .old_block_index(paired_insert_idx.len() - 1)
+                        .new_block_index(j)
+                        .similarity(sim)
+                        .threshold(0.3)
+                        .selected_edit_kind("replace"),
+                )?;
             }
-            _ => paired_insert_idx.push(None),
+            Some((j, sim)) => {
+                paired_insert_idx.push(None);
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "rejected_candidate")
+                        .old_block_index(paired_insert_idx.len() - 1)
+                        .new_block_index(j)
+                        .similarity(sim)
+                        .threshold(0.3)
+                        .selected_edit_kind("delete"),
+                )?;
+            }
+            None => {
+                paired_insert_idx.push(None);
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/edit-zone", "no_candidate")
+                        .old_block_index(paired_insert_idx.len() - 1)
+                        .selected_edit_kind("delete"),
+                )?;
+            }
         }
     }
 
@@ -813,9 +938,17 @@ fn pair_edit_zone(deletes: Vec<DiffBlock>, inserts: Vec<DiffBlock>, out: &mut Ve
     // Emit unpaired inserts after all deletes (in original insert order).
     for (j, ins) in inserts.into_iter().enumerate() {
         if !used_inserts[j] {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/edit-zone", "unmatched_insert")
+                    .new_block_index(j)
+                    .new_content(&ins.content)
+                    .selected_edit_kind("insert"),
+            )?;
             out.push(BlockOp::Insert(ins));
         }
     }
+    Ok(())
 }
 
 /// Compute a [0, 1] similarity score between two plain-text strings.
@@ -1295,76 +1428,6 @@ pub struct RenderedRegionSegmentEdit {
     pub word_ops: Vec<WordOp>,
 }
 
-pub trait DebugEventSink {
-    fn rendered_region_trace_start(
-        &mut self,
-        _trace: &RenderedRegionTraceStart,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn rendered_region_trace_event(&mut self, _event: &FrameTraceEvent) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn rendered_region_trace_end(&mut self, _trace: &RenderedRegionTraceEnd) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct RenderedRegionTraceStart {
-    pub trace_id: String,
-    pub side: String,
-    pub kind: PageRegionKind,
-    pub page: usize,
-    pub page_width_pt: f64,
-    pub page_height_pt: f64,
-    pub semantic_region_exists: bool,
-}
-
-#[derive(Clone)]
-pub struct RenderedRegionTraceEnd {
-    pub trace_id: String,
-    pub side: String,
-    pub kind: PageRegionKind,
-    pub page: usize,
-    pub extracted_text: String,
-    pub event_count: usize,
-}
-
-#[derive(Clone)]
-pub struct FrameTraceEvent {
-    pub trace_id: String,
-    pub side: String,
-    pub kind: PageRegionKind,
-    pub page: usize,
-    pub event_index: usize,
-    pub frame_path: Vec<usize>,
-    pub group_depth: usize,
-    pub local_x_pt: f64,
-    pub local_y_pt: f64,
-    pub absolute_x_pt: f64,
-    pub absolute_y_pt: f64,
-    pub item_kind: &'static str,
-    pub text: Option<String>,
-    pub text_len: Option<usize>,
-    pub tag_direction: Option<&'static str>,
-    pub tag_element: Option<String>,
-    pub artifact_depth_before: usize,
-    pub artifact_depth_after: usize,
-    pub changed_artifact_state: bool,
-    pub in_region_band: Option<bool>,
-    pub included: Option<bool>,
-    pub excluded_reason: Option<&'static str>,
-    pub group_origin_before_x_pt: Option<f64>,
-    pub group_origin_before_y_pt: Option<f64>,
-    pub group_origin_after_x_pt: Option<f64>,
-    pub group_origin_after_y_pt: Option<f64>,
-    pub group_offset_x_pt: Option<f64>,
-    pub group_offset_y_pt: Option<f64>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegionPath {
     RootPage(PageRegionKind),
@@ -1481,6 +1544,26 @@ fn log_realized_edit(log: &mut String, edit: &RealizedEdit, index: usize) {
     }
 }
 
+fn realized_edit_kind(edit: &RealizedEdit) -> &'static str {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. } => edit_content_kind(content),
+        RealizedEdit::InsertBefore { content, .. } => edit_content_kind(content),
+        RealizedEdit::InsertAfter { content, .. } => edit_content_kind(content),
+        RealizedEdit::Append { content } => edit_content_kind(content),
+        RealizedEdit::WholeBlock(content) => edit_content_kind(content),
+    }
+}
+
+fn edit_content_kind(content: &EditContent) -> &'static str {
+    match content {
+        EditContent::Inserted(_) => "inserted",
+        EditContent::Deleted(_) => "deleted",
+        EditContent::OpaqueReplacement { .. } => "opaque_replacement",
+        EditContent::Modified { .. } => "modified",
+        EditContent::Nested { .. } => "nested",
+    }
+}
+
 fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
     match content {
         EditContent::Inserted(content) => push_log_entry(
@@ -1539,16 +1622,34 @@ fn prepare_diff_inputs(
     old: &AnnotatedContent,
     new: &AnnotatedContent,
     capture_debug: bool,
-) -> PreparedDiffInputs {
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<PreparedDiffInputs> {
     let new_surface = effective_text_content(new);
     let new_layout_blocks = extract_block_units(&new_surface);
     let old_realized_blocks = extract_block_units(&old.realized);
     let new_realized_blocks = extract_block_units(&new.realized);
     let old_blocks = non_parbreak_blocks(&old_realized_blocks);
     let new_blocks = non_parbreak_blocks(&new_realized_blocks);
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/block-extraction", "complete").reason(format!(
+            "old_blocks={} new_blocks={} new_layout_blocks={}",
+            old_blocks.len(),
+            new_blocks.len(),
+            new_layout_blocks.len()
+        )),
+    )?;
     let raw = diff_block_units_raw(&old_blocks, &new_blocks);
+    if debug_events.is_some() {
+        for (index, op) in raw.iter().enumerate() {
+            emit_pipeline_trace_event(
+                debug_events,
+                block_op_trace_event("diff/block-myers", "raw_op", index, op),
+            )?;
+        }
+    }
     let (matched, debug) = if capture_debug {
-        let matched = match_edit_zones(raw.clone());
+        let matched = match_edit_zones_inner(raw.clone(), debug_events)?;
         let debug = DiffBlockDebug {
             old_blocks,
             new_blocks,
@@ -1559,25 +1660,38 @@ fn prepare_diff_inputs(
     } else {
         (match_edit_zones(raw), None)
     };
-    PreparedDiffInputs {
+    Ok(PreparedDiffInputs {
         new_layout_blocks,
         old_realized_blocks,
         new_realized_blocks,
         matched_ops: matched,
         debug,
-    }
+    })
 }
 
 pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
-    diff_annotated_inner(old, new, false).0
+    diff_annotated_inner(old, new, false)
+        .expect("diff without trace cannot fail")
+        .0
 }
 
 pub fn diff_annotated_with_block_debug(
     old: &AnnotatedContent,
     new: &AnnotatedContent,
 ) -> (DiffResult, DiffBlockDebug) {
-    let (result, debug) = diff_annotated_inner(old, new, true);
+    let (result, debug) =
+        diff_annotated_inner(old, new, true).expect("diff without trace cannot fail");
     (result, debug.expect("debug capture requested"))
+}
+
+pub fn diff_annotated_with_block_debug_events(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    debug_events: &mut dyn DebugEventSink,
+) -> anyhow::Result<(DiffResult, DiffBlockDebug)> {
+    let mut debug_events = Some(debug_events);
+    let (result, debug) = diff_annotated_inner_with_events(old, new, true, &mut debug_events)?;
+    Ok((result, debug.expect("debug capture requested")))
 }
 
 fn replace_block_edit(
@@ -1587,7 +1701,8 @@ fn replace_block_edit(
     new_block: &DiffBlock,
     old_ann: Option<&AnnotatedContent>,
     new_ann: Option<&AnnotatedContent>,
-) -> DiffBlockEdit {
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<DiffBlockEdit> {
     let page_styles = new_block.page_styles.clone();
     let unique_changed_pair = match (old_ann, new_ann) {
         (Some(old_ann), Some(new_ann)) if can_recurse_via_slots(old_ann, new_ann) => None,
@@ -1599,42 +1714,82 @@ fn replace_block_edit(
         && can_recurse_via_slots(old_ann, new_ann)
     {
         if annotated_subtree_equal(old_ann, new_ann) {
-            return DiffBlockEdit {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/replace-block", "selected")
+                    .reason("slot-recursive owners are equal")
+                    .old_content(&old_block.content)
+                    .new_content(&new_block.content)
+                    .selected_edit_kind("noop"),
+            )?;
+            return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, None),
                 edits: vec![],
                 page_styles,
-            };
+            });
         }
-        let edits = diff_slot_edits(old_ann, new_ann);
+        let edits = diff_slot_edits_with_events(old_ann, new_ann, debug_events)?;
         if !edits.is_empty() {
-            return DiffBlockEdit {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/replace-block", "selected")
+                    .reason("slot recursion produced edits")
+                    .old_content(&old_block.content)
+                    .new_content(&new_block.content)
+                    .selected_edit_kind("slot_edits"),
+            )?;
+            return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
                 edits,
                 page_styles,
-            };
+            });
         }
         if let Some(edit) = owned_surface_modified_edit(old_ann, new_ann) {
-            return DiffBlockEdit {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/replace-block", "selected")
+                    .reason("owned surface changed after empty slot edits")
+                    .old_content(&old_block.content)
+                    .new_content(&new_block.content)
+                    .selected_edit_kind(realized_edit_kind(&edit)),
+            )?;
+            return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
                 edits: vec![edit],
                 page_styles,
-            };
+            });
         }
-        return DiffBlockEdit {
+        emit_pipeline_trace_event(
+            debug_events,
+            PipelineTraceEvent::new("diff/replace-block", "selected")
+                .reason("slot-recursive owners changed but produced no visible edits")
+                .old_content(&old_block.content)
+                .new_content(&new_block.content)
+                .selected_edit_kind("noop"),
+        )?;
+        return Ok(DiffBlockEdit {
             base: annotated_block_from(&new_block.content, None),
             edits: vec![],
             page_styles,
-        };
+        });
     }
 
     if let Some((old_ann, new_ann)) = unique_changed_pair {
-        let edits = diff_slot_edits(old_ann, new_ann);
+        let edits = diff_slot_edits_with_events(old_ann, new_ann, debug_events)?;
         if !edits.is_empty() {
-            return DiffBlockEdit {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/replace-block", "selected")
+                    .reason("unique changed slot pair")
+                    .old_content(&old_block.content)
+                    .new_content(&new_block.content)
+                    .selected_edit_kind("unique_slot_edits"),
+            )?;
+            return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
                 edits,
                 page_styles,
-            };
+            });
         }
     }
 
@@ -1657,22 +1812,46 @@ fn replace_block_edit(
     } else {
         vec![]
     };
-    DiffBlockEdit {
+    let selected_edit_kind = edits.first().map(realized_edit_kind).unwrap_or("noop");
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/replace-block", "selected")
+            .reason("word diff or opaque fallback")
+            .old_content(&old_block.content)
+            .new_content(&new_block.content)
+            .selected_edit_kind(selected_edit_kind),
+    )?;
+    Ok(DiffBlockEdit {
         base: annotated_block_from(&new_block.content, None),
         edits,
         page_styles,
-    }
+    })
 }
 
 fn diff_annotated_inner(
     old: &AnnotatedContent,
     new: &AnnotatedContent,
     capture_debug: bool,
-) -> (DiffResult, Option<DiffBlockDebug>) {
-    let prepared = prepare_diff_inputs(old, new, capture_debug);
+) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
+    let mut no_debug_events = None;
+    diff_annotated_inner_with_events(old, new, capture_debug, &mut no_debug_events)
+}
+
+fn diff_annotated_inner_with_events(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    capture_debug: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
+    let prepared = prepare_diff_inputs(old, new, capture_debug, debug_events)?;
     let old_region_styles = document_page_styles_raw(&old.realized, &prepared.old_realized_blocks);
     let new_region_styles = document_page_styles_raw(&new.realized, &prepared.new_realized_blocks);
     let regions = diff_root_page_regions(&old_region_styles, &new_region_styles);
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/page-region", "semantic_complete")
+            .reason(format!("region_count={}", regions.len())),
+    )?;
     let root_styles = sanitize_page_styles(root_page_styles_raw(&new.realized));
 
     let mut layout = LayoutCursor::new(&prepared.new_layout_blocks);
@@ -1694,6 +1873,17 @@ fn diff_annotated_inner(
                 let new_ann = new_owners
                     .take_owner_for(&new_block.content)
                     .or_else(|| find_nonempty_annotated_child(new, &new_block.content));
+                emit_pipeline_trace_event(
+                    debug_events,
+                    PipelineTraceEvent::new("diff/owner-claim", "equal_block")
+                        .reason(format!(
+                            "old_owner={} new_owner={}",
+                            old_ann.is_some(),
+                            new_ann.is_some()
+                        ))
+                        .old_content(&old_block.content)
+                        .new_content(&new_block.content),
+                )?;
                 blocks.extend(layout.take_before(&new_block.content, new_ann));
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
@@ -1717,7 +1907,7 @@ fn diff_annotated_inner(
                         });
                         continue;
                     }
-                    let edits = diff_slot_edits(old_ann, new_ann);
+                    let edits = diff_slot_edits_with_events(old_ann, new_ann, debug_events)?;
                     if !edits.is_empty() {
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
@@ -1766,6 +1956,14 @@ fn diff_annotated_inner(
                 if let Some(BlockOp::Insert(new_block)) = matched_ops.get(op_index).cloned() {
                     let new_claim = new_owners.peek_claim_for(&new_block.content);
                     if semantic_owner_claims_match(&old_claim, &new_claim) {
+                        emit_pipeline_trace_event(
+                            debug_events,
+                            PipelineTraceEvent::new("diff/owner-claim", "semantic_match")
+                                .reason("delete/insert owners share semantic kind and ordinal")
+                                .old_content(&old_block.content)
+                                .new_content(&new_block.content)
+                                .selected_edit_kind("replace"),
+                        )?;
                         let new_claim = new_owners.take_claim_for(&new_block.content);
                         blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
                         blocks.push(replace_block_edit(
@@ -1775,7 +1973,8 @@ fn diff_annotated_inner(
                             &new_block,
                             old_claim.owner,
                             new_claim.owner,
-                        ));
+                            debug_events,
+                        )?);
                         op_index += 1;
                         continue;
                     }
@@ -1813,14 +2012,37 @@ fn diff_annotated_inner(
                     .or_else(|| find_nonempty_annotated_block_owner(new, &new_block.content));
                 blocks.extend(layout.take_before(&new_block.content, new_ann));
                 blocks.push(replace_block_edit(
-                    old, new, &old_block, &new_block, old_ann, new_ann,
-                ));
+                    old,
+                    new,
+                    &old_block,
+                    &new_block,
+                    old_ann,
+                    new_ann,
+                    debug_events,
+                )?);
             }
         }
     }
     blocks.extend(layout.take_trailing());
+    let before_prune_edits = count_block_edits(&blocks);
     prune_duplicate_empty_container_edits(&mut blocks);
+    let after_prune_edits = count_block_edits(&blocks);
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/prune-duplicates", "complete").reason(format!(
+            "edits_before={before_prune_edits} edits_after={after_prune_edits}"
+        )),
+    )?;
+    let before_footnote_blocks = blocks.len();
     append_footnote_body_edits(old, new, &mut blocks);
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/footnote-body", "complete").reason(format!(
+            "blocks_before={} blocks_after={}",
+            before_footnote_blocks,
+            blocks.len()
+        )),
+    )?;
 
     let result = DiffResult {
         blocks,
@@ -1828,7 +2050,11 @@ fn diff_annotated_inner(
         regions,
         rendered_regions: vec![],
     };
-    (result, prepared.debug)
+    Ok((result, prepared.debug))
+}
+
+fn count_block_edits(blocks: &[DiffBlockEdit]) -> usize {
+    blocks.iter().map(|block| block.edits.len()).sum()
 }
 
 fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
@@ -2118,10 +2344,11 @@ fn diff_annotated_with_rendered_regions_inner(
     new: &AnnotatedContent,
     old_world: &dyn World,
     new_world: &dyn World,
-    debug_events: Option<&mut dyn DebugEventSink>,
+    mut debug_events: Option<&mut dyn DebugEventSink>,
     capture_debug: bool,
 ) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
-    let (mut result, debug) = diff_annotated_inner(old, new, capture_debug);
+    let (mut result, debug) =
+        diff_annotated_inner_with_events(old, new, capture_debug, &mut debug_events)?;
     let old_source = crate::eval::eval_to_content(old_world)?;
     let new_source = crate::eval::eval_to_content(new_world)?;
     let old_doc = crate::eval::layout_document(old_world, &old_source)?;
@@ -2272,14 +2499,33 @@ fn diff_rendered_root_page_regions(
             .iter()
             .any(|region| region.path == RegionPath::RootPage(kind))
         {
+            emit_pipeline_trace_event(
+                &mut debug_events,
+                PipelineTraceEvent::new("diff/rendered-region", "skip").reason(format!(
+                    "{} has a semantic page-region diff",
+                    page_region_name(kind)
+                )),
+            )?;
             continue;
         }
         let old_content = page_region_content(old_styles, kind);
         let new_content = page_region_content(new_styles, kind);
         if old_content.is_none() && new_content.is_none() {
+            emit_pipeline_trace_event(
+                &mut debug_events,
+                PipelineTraceEvent::new("diff/rendered-region", "skip")
+                    .reason(format!("{} absent on both sides", page_region_name(kind))),
+            )?;
             continue;
         }
         if old_content != new_content {
+            emit_pipeline_trace_event(
+                &mut debug_events,
+                PipelineTraceEvent::new("diff/rendered-region", "skip").reason(format!(
+                    "{} differs semantically; rendered fallback not needed",
+                    page_region_name(kind)
+                )),
+            )?;
             continue;
         }
         let wrapper = new_content
@@ -2291,7 +2537,25 @@ fn diff_rendered_root_page_regions(
         let old_pages = rendered_region_texts("old", old_styles, old_doc, kind, &mut debug_events)?;
         let new_pages = rendered_region_texts("new", new_styles, new_doc, kind, &mut debug_events)?;
         if let Some(region) = diff_rendered_region_texts(kind, wrapper, &old_pages, &new_pages) {
+            emit_pipeline_trace_event(
+                &mut debug_events,
+                PipelineTraceEvent::new("diff/rendered-region", "selected")
+                    .reason(format!(
+                        "{} rendered text changed on {} pages",
+                        page_region_name(kind),
+                        region.pages.iter().filter(|page| page.changed).count()
+                    ))
+                    .selected_edit_kind("rendered_region"),
+            )?;
             rendered_regions.push(region);
+        } else {
+            emit_pipeline_trace_event(
+                &mut debug_events,
+                PipelineTraceEvent::new("diff/rendered-region", "noop").reason(format!(
+                    "{} rendered text unchanged",
+                    page_region_name(kind)
+                )),
+            )?;
         }
     }
 
@@ -3687,6 +3951,41 @@ fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Ve
     } else {
         diff_slot_edits_lcs(old_ann, new_ann)
     }
+}
+
+fn diff_slot_edits_with_events(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<Vec<RealizedEdit>> {
+    let mode = if slot_labels(old_ann) == slot_labels(new_ann) {
+        "same_shape"
+    } else {
+        "lcs"
+    };
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/slot", "start")
+            .reason(mode)
+            .old_content(&old_ann.realized)
+            .new_content(&new_ann.realized),
+    )?;
+    let edits = diff_slot_edits(old_ann, new_ann);
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("diff/slot", "end")
+            .reason(format!("mode={mode} edits={}", edits.len()))
+            .selected_edit_kind(if edits.is_empty() {
+                "noop".to_string()
+            } else {
+                edits
+                    .iter()
+                    .map(realized_edit_kind)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+    )?;
+    Ok(edits)
 }
 
 fn diff_slot_edits_lcs(

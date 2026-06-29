@@ -12,6 +12,7 @@
    - [annotate](#annotate)
    - [render](#render)
    - [diag](#diag)
+   - [debug and trace](#debug-and-trace)
 5. [Key data structures](#key-data-structures)
 6. [Algorithms in depth](#algorithms-in-depth)
    - [Block extraction](#block-extraction)
@@ -23,8 +24,9 @@
 7. [Annotation strategy](#annotation-strategy)
 8. [Rendering and layout convergence](#rendering-and-layout-convergence)
 9. [Git revision mode](#git-revision-mode)
-10. [Performance notes](#performance-notes)
-11. [Limitations and known edge cases](#limitations-and-known-edge-cases)
+10. [Debugging and tracing](#debugging-and-tracing)
+11. [Performance notes](#performance-notes)
+12. [Limitations and known edge cases](#limitations-and-known-edge-cases)
 
 ---
 
@@ -61,7 +63,9 @@ src/
 ├── diff.rs            — Block, semantic-owner, slot, word, and region diff
 ├── annotate.rs        — Build annotated Content from a DiffResult
 ├── render.rs          — layout_document + typst_pdf → Vec<u8>
-└── diag.rs            — Diagnostic formatting (file:line:col messages)
+├── diag.rs            — Diagnostic formatting (file:line:col messages)
+├── debug.rs           — YAML debug bundle and JSONL trace serialization
+└── trace.rs           — Trace event types and sink trait
 ```
 
 The crate is both a library and a binary. `src/lib.rs` exports the public API
@@ -244,6 +248,30 @@ newline-joined string of `path:line:col: message` entries.
 
 The path is the virtual path (e.g. `chapter.typ`), not the absolute disk path,
 so it matches what the user wrote in their `.typ` source.
+
+### debug and trace
+
+`debug.rs` owns the on-disk diagnostic formats. It writes:
+
+- YAML snapshots for `--debug`;
+- `diff/pipeline-events.jsonl` for `--debug-trace`;
+- `diff/rendered-region-frame-traces.jsonl` lazily when rendered page-region
+  frame walking runs.
+
+`trace.rs` owns the trace API used by the pipeline:
+
+- `DebugEventSink` is the shared sink trait for both whole-pipeline events and
+  rendered-region frame events.
+- `PipelineTraceEvent` is the compact decision-event type. It stores stage,
+  event name, optional reason, content hash/preview summaries, block indexes,
+  slot paths, similarity score, threshold, and selected edit kind.
+- `RenderedRegionTraceStart`, `FrameTraceEvent`, and
+  `RenderedRegionTraceEnd` describe the existing low-level frame-walk trace for
+  contextual page regions.
+
+Keeping these types out of `diff.rs` prevents tracing from becoming part of the
+diff algorithm's conceptual model. Diff, annotation, and the CLI emit events;
+`debug.rs` decides how those events become files.
 
 ---
 
@@ -722,6 +750,63 @@ when `main()` returns.
 - The file must be tracked by the repository at the given revision.
 - Binary assets (images, fonts not included in the Typst kit) must also be
   present at the revision for the old document to render.
+
+---
+
+## Debugging and tracing
+
+The CLI has two diagnostic flags:
+
+**`--debug`**
+Writes a YAML bundle next to the output PDF. If the output is `diff.pdf`, the
+bundle directory is `diff.debug/`. The bundle captures coarse stage snapshots:
+
+- raw eval: `old/raw-eval.yml`, `new/raw-eval.yml`;
+- normalized authored content: `old/normalized.yml`, `new/normalized.yml`;
+- realized annotated trees: `old/realized-tree.yml`,
+  `new/realized-tree.yml`;
+- block extraction: `old/blocks.yml`, `new/blocks.yml`;
+- raw and matched block ops: `diff/block-raw.yml`,
+  `diff/block-matched.yml`;
+- final edit script and page-region summaries: `diff/final-edits.yml`,
+  `diff/rendered-regions.yml`;
+- final render input and modification log:
+  `output/annotated-content.yml`, `output/modification-log.txt`.
+
+**`--debug-trace`**
+Implies `--debug` and adds JSONL traces. It always writes
+`diff/pipeline-events.jsonl`. It writes
+`diff/rendered-region-frame-traces.jsonl` only if rendered page-region frame
+walking actually runs.
+
+The two JSONL files answer different questions:
+
+- `pipeline-events.jsonl` is the whole-pipeline decision trace. It covers block
+  extraction counts, raw Myers ops, edit-zone similarity candidates and
+  selected replacements, semantic owner claims, slot recursion mode, opaque
+  fallback decisions, duplicate-pruning counts, footnote-body append counts,
+  semantic/rendered page-region decisions, annotation grouping, and render
+  start/end events.
+- `rendered-region-frame-traces.jsonl` is narrower. It records the frame-walk
+  used to extract contextual header/footer/background/foreground text from
+  rendered Typst pages. It is expected to be absent for ordinary text, figure,
+  caption, list, equation, and opaque visual bugs.
+
+Debug and trace modes must not change the semantic result. Normal mode,
+`--debug`, and `--debug-trace` all use the same evaluation, diff, annotation,
+and render pipeline. The flags only control whether snapshots are retained and
+whether trace events are emitted. When tracing is disabled, the hot path pays
+only cheap `Option` checks around trace emission points.
+
+When diagnosing a complex bug, prefer this order:
+
+1. Use `--debug` to find the first snapshot whose invariant is wrong.
+2. Use `--debug-trace` when the snapshots are plausible but a decision is
+   surprising.
+3. For contextual page-region bugs, inspect `rendered-regions.yml` first, then
+   the frame trace if rendered extraction ran.
+4. Avoid reading PDFs directly; inspect source, content trees, edit scripts,
+   layout frame text runs, and rendered images instead.
 
 ---
 

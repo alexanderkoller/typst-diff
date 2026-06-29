@@ -31,6 +31,7 @@ use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
     RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, Token, WordOp,
 };
+use crate::trace::{DebugEventSink, PipelineTraceEvent, emit_pipeline_trace_event};
 
 fn green() -> Color {
     Color::from_u8(0, 180, 0, 255)
@@ -450,6 +451,25 @@ pub fn build_annotated_content_from_tree(
     result: &crate::diff::DiffResult,
     compact_substitutions: bool,
 ) -> Content {
+    let mut no_debug_events = None;
+    build_annotated_content_from_tree_inner(result, compact_substitutions, &mut no_debug_events)
+        .expect("annotation without trace cannot fail")
+}
+
+pub fn build_annotated_content_from_tree_with_debug_events(
+    result: &crate::diff::DiffResult,
+    compact_substitutions: bool,
+    debug_events: &mut dyn DebugEventSink,
+) -> anyhow::Result<Content> {
+    let mut debug_events = Some(debug_events);
+    build_annotated_content_from_tree_inner(result, compact_substitutions, &mut debug_events)
+}
+
+fn build_annotated_content_from_tree_inner(
+    result: &crate::diff::DiffResult,
+    compact_substitutions: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<Content> {
     let mut groups: Vec<Content> = Vec::new();
     let mut current_blocks: Vec<Content> = Vec::new();
     let mut current_page_styles: Option<typst::foundations::Styles> = None;
@@ -458,11 +478,17 @@ pub fn build_annotated_content_from_tree(
         &result.rendered_regions,
         compact_substitutions,
     );
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("annotate/page-regions", "updates")
+            .reason(format!("count={}", page_region_updates.len())),
+    )?;
 
-    for mut annotated_block in result
+    for (index, mut annotated_block) in result
         .blocks
         .iter()
         .map(|block| annotate_block_edit(block, compact_substitutions))
+        .enumerate()
     {
         apply_page_region_updates(
             &mut annotated_block.page_styles,
@@ -477,6 +503,12 @@ pub fn build_annotated_content_from_tree(
         }
         current_page_styles.get_or_insert_with(|| annotated_block.page_styles.clone());
         current_blocks.push(annotated_block.content);
+        emit_pipeline_trace_event(
+            debug_events,
+            PipelineTraceEvent::new("annotate/block", "annotated")
+                .new_block_index(index)
+                .reason(format!("current_group_blocks={}", current_blocks.len())),
+        )?;
     }
     flush_group(&mut groups, &mut current_blocks, current_page_styles);
     let mut root_styles = result.root_styles.clone();
@@ -485,9 +517,14 @@ pub fn build_annotated_content_from_tree(
         &page_region_updates,
         PageRegionUpdateScope::All,
     );
-    crate::normalize::normalize_list_item_runs(
+    emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("annotate/groups", "complete")
+            .reason(format!("group_count={}", groups.len())),
+    )?;
+    Ok(crate::normalize::normalize_list_item_runs(
         Content::sequence(groups).styled_with_map(root_styles),
-    )
+    ))
 }
 
 fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {

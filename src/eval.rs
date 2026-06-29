@@ -134,8 +134,7 @@ impl World for SnippetWorld {
 /// The returned `AnnotatedContent` wraps the realized `Content` with semantic
 /// annotations built by walking the pre- and post-realization trees together.
 pub fn eval_to_realized_content(world: &dyn World) -> Result<crate::annotated::AnnotatedContent> {
-    let pre_content = normalize_list_item_runs(eval_to_content(world)?);
-    Ok(realize_and_annotate(world, &pre_content)?)
+    Ok(eval_realized_pipeline(world, false)?.annotated)
 }
 
 /// Intermediate results from the realized evaluation pipeline.
@@ -147,14 +146,39 @@ pub struct EvalDebug {
 
 /// Evaluate, normalize, realize, and annotate while preserving debug checkpoints.
 pub fn eval_with_debug(world: &dyn World) -> Result<EvalDebug> {
-    let raw = eval_to_content(world)?;
-    let normalized = normalize_list_item_runs(raw.clone());
-    let annotated = realize_and_annotate(world, &normalized)?;
+    let pipeline = eval_realized_pipeline(world, true)?;
     Ok(EvalDebug {
-        raw,
-        normalized,
-        annotated,
+        raw: pipeline.raw.expect("debug capture requested"),
+        normalized: pipeline.normalized.expect("debug capture requested"),
+        annotated: pipeline.annotated,
     })
+}
+
+struct EvalPipeline {
+    raw: Option<Content>,
+    normalized: Option<Content>,
+    annotated: crate::annotated::AnnotatedContent,
+}
+
+fn eval_realized_pipeline(world: &dyn World, capture_debug: bool) -> Result<EvalPipeline> {
+    let raw = eval_to_content(world)?;
+    if capture_debug {
+        let normalized = normalize_list_item_runs(raw.clone());
+        let annotated = realize_and_annotate(world, &normalized)?;
+        Ok(EvalPipeline {
+            raw: Some(raw),
+            normalized: Some(normalized),
+            annotated,
+        })
+    } else {
+        let normalized = normalize_list_item_runs(raw);
+        let annotated = realize_and_annotate(world, &normalized)?;
+        Ok(EvalPipeline {
+            raw: None,
+            normalized: None,
+            annotated,
+        })
+    }
 }
 
 fn realize_and_annotate(

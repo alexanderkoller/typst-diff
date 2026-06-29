@@ -12,12 +12,15 @@ use typst::syntax::Span;
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind};
 use crate::diff::{
-    BlockOp, DebugEventSink, DiffBlock, DiffBlockDebug, DiffResult, EditContent, FrameTraceEvent,
-    PageRegionKind, RealizedEdit, RegionPath, RenderedRegionAlignment, RenderedRegionSegmentEdit,
-    RenderedRegionTraceEnd, RenderedRegionTraceStart, RenderedRegionWrapper, WordOp,
+    BlockOp, DiffBlock, DiffBlockDebug, DiffResult, EditContent, PageRegionKind, RealizedEdit,
+    RegionPath, RenderedRegionAlignment, RenderedRegionSegmentEdit, RenderedRegionWrapper, WordOp,
+};
+use crate::trace::{
+    DebugEventSink, FrameTraceEvent, PipelineTraceEvent, RenderedRegionTraceEnd,
+    RenderedRegionTraceStart,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const PREVIEW_CHARS: usize = 120;
 const CONTENT_DEPTH_LIMIT: usize = 32;
 
@@ -33,6 +36,7 @@ pub struct DebugBundle<'a> {
     pub block_debug: &'a DiffBlockDebug,
     pub diff_result: &'a DiffResult,
     pub annotated_output: &'a Content,
+    pub trace_files: Vec<DebugTraceFile>,
 }
 
 #[derive(Clone)]
@@ -44,6 +48,14 @@ pub struct DebugArgs {
     pub log_modifications: Option<PathBuf>,
     pub compact_substitutions: bool,
     pub debug: bool,
+    pub debug_trace: bool,
+}
+
+#[derive(Clone)]
+pub struct DebugTraceFile {
+    pub path: PathBuf,
+    pub format: &'static str,
+    pub present: bool,
 }
 
 pub fn default_debug_dir(output: &Path) -> PathBuf {
@@ -52,6 +64,10 @@ pub fn default_debug_dir(output: &Path) -> PathBuf {
 
 pub fn rendered_region_frame_traces_path(debug_dir: &Path) -> PathBuf {
     debug_dir.join("diff/rendered-region-frame-traces.jsonl")
+}
+
+pub fn pipeline_events_path(debug_dir: &Path) -> PathBuf {
+    debug_dir.join("diff/pipeline-events.jsonl")
 }
 
 pub fn write_debug_bundle(bundle: &DebugBundle<'_>) -> Result<()> {
@@ -123,49 +139,126 @@ pub fn write_debug_bundle(bundle: &DebugBundle<'_>) -> Result<()> {
     Ok(())
 }
 
-pub struct JsonlDebugEventWriter {
-    writer: BufWriter<fs::File>,
+pub struct JsonlTraceWriter {
+    debug_dir: PathBuf,
+    pipeline_writer: BufWriter<fs::File>,
+    frame_writer: Option<BufWriter<fs::File>>,
+    next_seq: u64,
+    rendered_region_frame_trace_created: bool,
 }
 
-impl JsonlDebugEventWriter {
+impl JsonlTraceWriter {
     pub fn create(debug_dir: &Path) -> Result<Self> {
         fs::create_dir_all(debug_dir.join("diff"))
             .with_context(|| format!("failed to create debug diff directory {:?}", debug_dir))?;
-        let path = rendered_region_frame_traces_path(debug_dir);
+        let path = pipeline_events_path(debug_dir);
         let file = fs::File::create(&path)
             .with_context(|| format!("failed to create debug JSONL trace {:?}", path))?;
         let mut writer = Self {
-            writer: BufWriter::new(file),
+            debug_dir: debug_dir.to_path_buf(),
+            pipeline_writer: BufWriter::new(file),
+            frame_writer: None,
+            next_seq: 0,
+            rendered_region_frame_trace_created: false,
         };
-        writer.write_jsonl(&JsonlSchemaRecord {
-            schema_version: SCHEMA_VERSION,
-            record: "schema",
-            format: "typst-diff-rendered-region-frame-trace",
-        })?;
+        let seq = writer.next_seq();
+        write_jsonl(
+            &mut writer.pipeline_writer,
+            &JsonlSchemaRecord {
+                schema_version: SCHEMA_VERSION,
+                record: "schema",
+                seq,
+                format: "typst-diff-pipeline-events",
+            },
+        )?;
         Ok(writer)
     }
 
-    fn write_jsonl(&mut self, value: &impl Serialize) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, value)
-            .context("failed to serialize debug JSONL trace record")?;
-        self.writer
-            .write_all(b"\n")
-            .context("failed to write debug JSONL trace newline")?;
-        Ok(())
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
     }
 
-    pub fn finish(mut self) -> Result<()> {
-        self.writer
+    fn ensure_frame_writer(&mut self) -> Result<&mut BufWriter<fs::File>> {
+        if self.frame_writer.is_none() {
+            let path = rendered_region_frame_traces_path(&self.debug_dir);
+            let file = fs::File::create(&path)
+                .with_context(|| format!("failed to create debug JSONL trace {:?}", path))?;
+            let mut frame_writer = BufWriter::new(file);
+            let seq = self.next_seq();
+            write_jsonl(
+                &mut frame_writer,
+                &JsonlSchemaRecord {
+                    schema_version: SCHEMA_VERSION,
+                    record: "schema",
+                    seq,
+                    format: "typst-diff-rendered-region-frame-trace",
+                },
+            )?;
+            self.frame_writer = Some(frame_writer);
+            self.rendered_region_frame_trace_created = true;
+        }
+        Ok(self
+            .frame_writer
+            .as_mut()
+            .expect("frame writer just created"))
+    }
+
+    pub fn finish(mut self) -> Result<Vec<DebugTraceFile>> {
+        self.pipeline_writer
             .flush()
-            .context("failed to flush debug JSONL trace")
+            .context("failed to flush pipeline JSONL trace")?;
+        if let Some(mut frame_writer) = self.frame_writer.take() {
+            frame_writer
+                .flush()
+                .context("failed to flush rendered-region JSONL trace")?;
+        }
+        Ok(vec![
+            DebugTraceFile {
+                path: pipeline_events_path(&self.debug_dir),
+                format: "typst-diff-pipeline-events",
+                present: true,
+            },
+            DebugTraceFile {
+                path: rendered_region_frame_traces_path(&self.debug_dir),
+                format: "typst-diff-rendered-region-frame-trace",
+                present: self.rendered_region_frame_trace_created,
+            },
+        ])
     }
 }
 
-impl DebugEventSink for JsonlDebugEventWriter {
+fn write_jsonl(writer: &mut BufWriter<fs::File>, value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(writer.by_ref(), value)
+        .context("failed to serialize debug JSONL trace record")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write debug JSONL trace newline")?;
+    Ok(())
+}
+
+impl DebugEventSink for JsonlTraceWriter {
+    fn pipeline_trace_event(&mut self, event: &PipelineTraceEvent) -> Result<()> {
+        let seq = self.next_seq();
+        write_jsonl(
+            &mut self.pipeline_writer,
+            &PipelineTraceRecord {
+                schema_version: SCHEMA_VERSION,
+                record: "pipeline_event",
+                seq,
+                event,
+            },
+        )
+    }
+
     fn rendered_region_trace_start(&mut self, trace: &RenderedRegionTraceStart) -> Result<()> {
-        self.write_jsonl(&TraceStartRecord {
+        self.ensure_frame_writer()?;
+        let seq = self.next_seq();
+        let record = TraceStartRecord {
             schema_version: SCHEMA_VERSION,
             record: "rendered_region_trace_start",
+            seq,
             trace_id: trace.trace_id.clone(),
             side: trace.side.clone(),
             region_kind: page_region_label(trace.kind),
@@ -173,32 +266,44 @@ impl DebugEventSink for JsonlDebugEventWriter {
             page_width_pt: trace.page_width_pt,
             page_height_pt: trace.page_height_pt,
             semantic_region_exists: trace.semantic_region_exists,
-        })
+        };
+        let writer = self.ensure_frame_writer()?;
+        write_jsonl(writer, &record)
     }
 
     fn rendered_region_trace_event(&mut self, event: &FrameTraceEvent) -> Result<()> {
-        self.write_jsonl(&TraceEventRecord {
+        self.ensure_frame_writer()?;
+        let seq = self.next_seq();
+        let record = TraceEventRecord {
             schema_version: SCHEMA_VERSION,
             record: "rendered_region_trace_event",
+            seq,
             trace_id: event.trace_id.clone(),
             side: event.side.clone(),
             region_kind: page_region_label(event.kind),
             page: event.page,
             event: summarize_frame_trace_event(event),
-        })
+        };
+        let writer = self.ensure_frame_writer()?;
+        write_jsonl(writer, &record)
     }
 
     fn rendered_region_trace_end(&mut self, trace: &RenderedRegionTraceEnd) -> Result<()> {
-        self.write_jsonl(&TraceEndRecord {
+        self.ensure_frame_writer()?;
+        let seq = self.next_seq();
+        let record = TraceEndRecord {
             schema_version: SCHEMA_VERSION,
             record: "rendered_region_trace_end",
+            seq,
             trace_id: trace.trace_id.clone(),
             side: trace.side.clone(),
             region_kind: page_region_label(trace.kind),
             page: trace.page,
             extracted_text: trace.extracted_text.clone(),
             event_count: trace.event_count,
-        })
+        };
+        let writer = self.ensure_frame_writer()?;
+        write_jsonl(writer, &record)
     }
 }
 
@@ -206,13 +311,24 @@ impl DebugEventSink for JsonlDebugEventWriter {
 struct JsonlSchemaRecord {
     schema_version: u32,
     record: &'static str,
+    seq: u64,
     format: &'static str,
+}
+
+#[derive(Serialize)]
+struct PipelineTraceRecord<'a> {
+    schema_version: u32,
+    record: &'static str,
+    seq: u64,
+    #[serde(flatten)]
+    event: &'a PipelineTraceEvent,
 }
 
 #[derive(Serialize)]
 struct TraceStartRecord {
     schema_version: u32,
     record: &'static str,
+    seq: u64,
     trace_id: String,
     side: String,
     region_kind: String,
@@ -226,6 +342,7 @@ struct TraceStartRecord {
 struct TraceEventRecord {
     schema_version: u32,
     record: &'static str,
+    seq: u64,
     trace_id: String,
     side: String,
     region_kind: String,
@@ -237,6 +354,7 @@ struct TraceEventRecord {
 struct TraceEndRecord {
     schema_version: u32,
     record: &'static str,
+    seq: u64,
     trace_id: String,
     side: String,
     region_kind: String,
@@ -259,6 +377,7 @@ struct Manifest {
     resolved_inputs: ResolvedInputs,
     output_pdf: String,
     debug_dir: String,
+    trace_files: Vec<ManifestTraceFile>,
 }
 
 #[derive(Serialize)]
@@ -270,12 +389,20 @@ struct ManifestArgs {
     log_modifications: Option<String>,
     compact_substitutions: bool,
     debug: bool,
+    debug_trace: bool,
 }
 
 #[derive(Serialize)]
 struct ResolvedInputs {
     old: String,
     new: String,
+}
+
+#[derive(Serialize)]
+struct ManifestTraceFile {
+    path: String,
+    format: String,
+    present: bool,
 }
 
 fn manifest(bundle: &DebugBundle<'_>) -> Manifest {
@@ -294,6 +421,7 @@ fn manifest(bundle: &DebugBundle<'_>) -> Manifest {
                 .map(|path| path_string(path)),
             compact_substitutions: bundle.args.compact_substitutions,
             debug: bundle.args.debug,
+            debug_trace: bundle.args.debug_trace,
         },
         resolved_inputs: ResolvedInputs {
             old: path_string(bundle.old_input),
@@ -301,6 +429,15 @@ fn manifest(bundle: &DebugBundle<'_>) -> Manifest {
         },
         output_pdf: path_string(bundle.output),
         debug_dir: path_string(bundle.debug_dir),
+        trace_files: bundle
+            .trace_files
+            .iter()
+            .map(|file| ManifestTraceFile {
+                path: path_string(&file.path),
+                format: file.format.to_string(),
+                present: file.present,
+            })
+            .collect(),
     }
 }
 

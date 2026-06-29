@@ -1,4 +1,4 @@
-use typst_diff::{annotate, build_info, debug, diff, eval, render_to_pdf, world};
+use typst_diff::{annotate, build_info, debug, diff, eval, render_to_pdf, trace, world};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -33,6 +33,9 @@ struct Args {
     /// Write structured YAML diagnostics next to the output PDF
     #[arg(long)]
     debug: bool,
+    /// Write expensive JSONL pipeline traces next to the output PDF; implies --debug
+    #[arg(long)]
+    debug_trace: bool,
 }
 
 fn main() -> Result<()> {
@@ -49,87 +52,167 @@ fn main() -> Result<()> {
     let new_world = world::SystemWorld::new(&inputs.new)
         .with_context(|| format!("failed to load new document {:?}", inputs.new))?;
 
-    if args.debug {
-        run_with_debug(&args, &inputs, &old_world, &new_world)
-    } else {
-        run_normal(&args, &old_world, &new_world)
-    }
+    run_pipeline(&args, &inputs, &old_world, &new_world)
 }
 
-fn run_normal(
-    args: &Args,
-    old_world: &world::SystemWorld,
-    new_world: &world::SystemWorld,
-) -> Result<()> {
-    eprintln!("Evaluating old document...");
-    let old_content =
-        eval::eval_to_realized_content(old_world).context("failed to evaluate old document")?;
-
-    eprintln!("Evaluating new document...");
-    let new_content =
-        eval::eval_to_realized_content(new_world).context("failed to evaluate new document")?;
-
-    eprintln!("Diffing...");
-    let diff_result = diff::diff_annotated_with_rendered_regions(
-        &old_content,
-        &new_content,
-        old_world,
-        new_world,
-    )?;
-
-    eprintln!("Annotating...");
-    let annotated =
-        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
-
-    write_log_and_pdf(args, new_world, &diff_result, &annotated)
-}
-
-fn run_with_debug(
+fn run_pipeline(
     args: &Args,
     inputs: &ResolvedInputs,
     old_world: &world::SystemWorld,
     new_world: &world::SystemWorld,
 ) -> Result<()> {
+    let capture_snapshots = args.debug || args.debug_trace;
+    let debug_dir = debug::default_debug_dir(&args.output);
+    let mut trace_writer = if args.debug_trace {
+        Some(debug::JsonlTraceWriter::create(&debug_dir)?)
+    } else {
+        None
+    };
+
     eprintln!("Evaluating old document...");
-    let old_eval = eval::eval_with_debug(old_world).context("failed to evaluate old document")?;
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("eval/old", "start"),
+    )?;
+    let old_eval = if capture_snapshots {
+        Some(eval::eval_with_debug(old_world).context("failed to evaluate old document")?)
+    } else {
+        None
+    };
+    let old_content = if let Some(eval) = &old_eval {
+        eval.annotated.clone()
+    } else {
+        eval::eval_to_realized_content(old_world).context("failed to evaluate old document")?
+    };
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("eval/old", "end").snapshot_ref(if capture_snapshots {
+            "old/realized-tree.yml"
+        } else {
+            ""
+        }),
+    )?;
 
     eprintln!("Evaluating new document...");
-    let new_eval = eval::eval_with_debug(new_world).context("failed to evaluate new document")?;
-
-    let debug_dir = debug::default_debug_dir(&args.output);
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("eval/new", "start"),
+    )?;
+    let new_eval = if capture_snapshots {
+        Some(eval::eval_with_debug(new_world).context("failed to evaluate new document")?)
+    } else {
+        None
+    };
+    let new_content = if let Some(eval) = &new_eval {
+        eval.annotated.clone()
+    } else {
+        eval::eval_to_realized_content(new_world).context("failed to evaluate new document")?
+    };
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("eval/new", "end").snapshot_ref(if capture_snapshots {
+            "new/realized-tree.yml"
+        } else {
+            ""
+        }),
+    )?;
 
     eprintln!("Diffing...");
-    let mut debug_events = debug::JsonlDebugEventWriter::create(&debug_dir)?;
-    let (diff_result, block_debug) = diff::diff_annotated_with_rendered_regions_and_debug_events(
-        &old_eval.annotated,
-        &new_eval.annotated,
-        old_world,
-        new_world,
-        &mut debug_events,
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("diff", "start"),
     )?;
-    debug_events.finish()?;
+    let (diff_result, block_debug) = if capture_snapshots {
+        if let Some(writer) = trace_writer.as_mut() {
+            let (result, debug) = diff::diff_annotated_with_rendered_regions_and_debug_events(
+                &old_content,
+                &new_content,
+                old_world,
+                new_world,
+                writer,
+            )?;
+            (result, Some(debug))
+        } else {
+            let (result, debug) = diff::diff_annotated_with_rendered_regions_and_debug(
+                &old_content,
+                &new_content,
+                old_world,
+                new_world,
+            )?;
+            (result, Some(debug))
+        }
+    } else {
+        (
+            diff::diff_annotated_with_rendered_regions(
+                &old_content,
+                &new_content,
+                old_world,
+                new_world,
+            )?,
+            None,
+        )
+    };
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("diff", "end")
+            .reason(format!("blocks={}", diff_result.blocks.len()))
+            .snapshot_ref(if capture_snapshots {
+                "diff/final-edits.yml"
+            } else {
+                ""
+            }),
+    )?;
 
     eprintln!("Annotating...");
-    let annotated =
-        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions);
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("annotate", "start"),
+    )?;
+    let annotated = if let Some(writer) = trace_writer.as_mut() {
+        annotate::build_annotated_content_from_tree_with_debug_events(
+            &diff_result,
+            args.compact_substitutions,
+            writer,
+        )?
+    } else {
+        annotate::build_annotated_content_from_tree(&diff_result, args.compact_substitutions)
+    };
+    emit_cli_trace(
+        &mut trace_writer,
+        trace::PipelineTraceEvent::new("annotate", "end").snapshot_ref(if capture_snapshots {
+            "output/annotated-content.yml"
+        } else {
+            ""
+        }),
+    )?;
 
-    eprintln!("Writing debug bundle to {}...", debug_dir.display());
-    let build_line = build_info::build_report_line();
-    debug::write_debug_bundle(&debug::DebugBundle {
-        build_line: &build_line,
-        args: debug_args(args),
-        old_input: &inputs.old,
-        new_input: &inputs.new,
-        output: &args.output,
-        debug_dir: &debug_dir,
-        old_eval: &old_eval,
-        new_eval: &new_eval,
-        block_debug: &block_debug,
-        diff_result: &diff_result,
-        annotated_output: &annotated,
-    })?;
+    write_log_and_pdf(args, new_world, &diff_result, &annotated, &mut trace_writer)?;
 
-    write_log_and_pdf(args, new_world, &diff_result, &annotated)
+    let trace_files = match trace_writer {
+        Some(writer) => writer.finish()?,
+        None => Vec::new(),
+    };
+
+    if capture_snapshots {
+        eprintln!("Writing debug bundle to {}...", debug_dir.display());
+        let build_line = build_info::build_report_line();
+        debug::write_debug_bundle(&debug::DebugBundle {
+            build_line: &build_line,
+            args: debug_args(args),
+            old_input: &inputs.old,
+            new_input: &inputs.new,
+            output: &args.output,
+            debug_dir: &debug_dir,
+            old_eval: old_eval.as_ref().expect("snapshots requested"),
+            new_eval: new_eval.as_ref().expect("snapshots requested"),
+            block_debug: block_debug.as_ref().expect("snapshots requested"),
+            diff_result: &diff_result,
+            annotated_output: &annotated,
+            trace_files,
+        })?;
+    }
+
+    Ok(())
 }
 
 fn write_log_and_pdf(
@@ -137,6 +220,7 @@ fn write_log_and_pdf(
     new_world: &world::SystemWorld,
     diff_result: &diff::DiffResult,
     annotated: &typst::foundations::Content,
+    trace_writer: &mut Option<debug::JsonlTraceWriter>,
 ) -> Result<()> {
     if let Some(path) = &args.log_modifications {
         std::fs::write(path, diff_result.modification_log())
@@ -145,12 +229,32 @@ fn write_log_and_pdf(
     }
 
     eprintln!("Rendering to PDF...");
+    emit_cli_trace(
+        trace_writer,
+        trace::PipelineTraceEvent::new("render", "start"),
+    )?;
     let pdf_bytes = render_to_pdf(annotated, new_world).context("failed to render PDF")?;
+    emit_cli_trace(
+        trace_writer,
+        trace::PipelineTraceEvent::new("render", "end")
+            .reason(format!("pdf_bytes={}", pdf_bytes.len())),
+    )?;
 
     std::fs::write(&args.output, &pdf_bytes)
         .with_context(|| format!("failed to write {:?}", args.output))?;
 
     eprintln!("Written to {}", args.output.display());
+    Ok(())
+}
+
+fn emit_cli_trace(
+    trace_writer: &mut Option<debug::JsonlTraceWriter>,
+    event: trace::PipelineTraceEvent,
+) -> Result<()> {
+    if let Some(writer) = trace_writer.as_mut() {
+        let mut sink = Some(writer as &mut dyn trace::DebugEventSink);
+        trace::emit_pipeline_trace_event(&mut sink, event)?;
+    }
     Ok(())
 }
 
@@ -163,6 +267,7 @@ fn debug_args(args: &Args) -> debug::DebugArgs {
         log_modifications: args.log_modifications.clone(),
         compact_substitutions: args.compact_substitutions,
         debug: args.debug,
+        debug_trace: args.debug_trace,
     }
 }
 

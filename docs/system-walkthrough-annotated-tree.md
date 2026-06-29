@@ -846,6 +846,44 @@ fallbacks as temporary evidence that an invariant is missing or underspecified.
 
 ## Where To Start When Debugging
 
+The CLI has two diagnostic modes:
+
+- `--debug` writes YAML snapshots under `<output>.debug/`.
+- `--debug-trace` implies `--debug` and also writes JSONL event traces.
+
+Both modes run the same semantic diff, annotation, and rendering pipeline as a
+normal invocation. The flags only control whether intermediate state is retained
+for serialization and whether trace events are emitted.
+
+Use `--debug` first when you need stage checkpoints:
+
+| File | Question it answers |
+|------|---------------------|
+| `old/raw-eval.yml`, `new/raw-eval.yml` | Did Typst evaluation produce the source-level content expected? |
+| `old/normalized.yml`, `new/normalized.yml` | Did normalization group list, enum, and terms items correctly? |
+| `old/realized-tree.yml`, `new/realized-tree.yml` | Did realization and semantic annotation preserve the intended owners and slots? |
+| `old/blocks.yml`, `new/blocks.yml` | Did block extraction create the intended block boundaries? |
+| `diff/block-raw.yml` | What did raw Myers block diff see? |
+| `diff/block-matched.yml` | Which delete/insert zones were promoted to replacements? |
+| `diff/final-edits.yml` | What edit script will annotation apply? |
+| `diff/rendered-regions.yml` | Were contextual page-region edits generated? |
+| `output/annotated-content.yml` | What content tree will be sent to PDF rendering? |
+
+Use `--debug-trace` when the snapshot is correct but the decision is unclear.
+It adds:
+
+- `diff/pipeline-events.jsonl`: compact whole-pipeline events with stage,
+  event name, reason, content hashes/previews, block indexes, slot paths,
+  similarity scores, thresholds, and selected edit kind.
+- `diff/rendered-region-frame-traces.jsonl`: low-level frame-walk events for
+  contextual headers, footers, backgrounds, and foregrounds. This file is
+  created lazily only when rendered-region frame walking actually runs.
+
+The frame trace is not a general document trace. If a normal paragraph, figure,
+caption, list item, equation, or opaque visual behaves unexpectedly, inspect
+`pipeline-events.jsonl` and the YAML snapshots first. The frame trace only
+explains how text was extracted from rendered page-region frames.
+
 When diagnosing a bug, walk the pipeline in order:
 
 1. Does `eval_to_content` contain the semantic source element you expect?

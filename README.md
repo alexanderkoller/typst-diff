@@ -62,16 +62,50 @@ Options:
                                 deletion, and modification
   -s, --compact-substitutions   Show substitutions as blue without red strikethrough
       --debug                   Write structured diagnostics next to the output PDF
+      --debug-trace             Write debug diagnostics plus detailed JSONL traces
   -h, --help                    Print help
 ```
 
 Git mode requires `git` and `tar` on your `PATH`. You can use any revision
 accepted by Git: `HEAD`, `HEAD~1`, a branch name, a tag, or a commit hash.
 
-With `--debug`, typst-diff writes a directory next to the output PDF. For
+## Debugging and tracing
+
+`--debug` writes a diagnostic bundle next to the output PDF. For
 `typst-diff old.typ new.typ -o changes.pdf --debug`, diagnostics are written to
-`changes.debug/`. Most debug summaries are YAML; high-volume rendered-frame
-traces are JSONL.
+`changes.debug/`.
+
+Debug mode uses the same diff pipeline as normal mode. It only keeps
+intermediate data structures long enough to serialize them after the run.
+
+The debug bundle contains YAML snapshots:
+
+| Path | Meaning |
+|------|---------|
+| `manifest.yml` | Build identity, resolved inputs, CLI flags, output paths, and trace-file metadata |
+| `old/raw-eval.yml`, `new/raw-eval.yml` | Raw evaluated Typst content before normalization |
+| `old/normalized.yml`, `new/normalized.yml` | Content after list/enum/terms normalization |
+| `old/realized-tree.yml`, `new/realized-tree.yml` | Realized content with semantic annotations |
+| `old/blocks.yml`, `new/blocks.yml` | Extracted semantic block units |
+| `diff/block-raw.yml` | Raw Myers block operations |
+| `diff/block-matched.yml` | Block operations after similarity pairing |
+| `diff/final-edits.yml` | Final block, page-region, and rendered-region edit script |
+| `diff/rendered-regions.yml` | Per-page rendered header/footer/background/foreground edits |
+| `output/annotated-content.yml` | Typst content tree that will be rendered to the output PDF |
+| `output/modification-log.txt` | Same text as `--log-modifications` would write |
+
+Use `--debug-trace` when the snapshots are too coarse and you need to see
+decisions. It implies `--debug` and additionally writes JSONL files:
+
+| Path | Created when | Meaning |
+|------|--------------|---------|
+| `diff/pipeline-events.jsonl` | Always with `--debug-trace` | Whole-pipeline decision events: block extraction, block matching, similarity scores, owner claims, slot recursion, opaque fallback, page-region decisions, annotation grouping, and render boundaries |
+| `diff/rendered-region-frame-traces.jsonl` | Only when rendered page-region frame walking runs | Low-level frame-walk events for contextual headers, footers, backgrounds, and foregrounds |
+
+The rendered-region frame trace is intentionally scoped. It explains how text
+was extracted from Typst layout frames for contextual page regions; it is not a
+whole-document trace. For normal text, figures, captions, lists, equations, and
+opaque content, start with `diff/pipeline-events.jsonl` and the YAML snapshots.
 
 ## Colour scheme
 

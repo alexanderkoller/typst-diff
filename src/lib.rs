@@ -26,6 +26,7 @@ pub mod diff;
 pub mod eval;
 mod normalize;
 pub mod render;
+pub mod trace;
 pub mod world;
 
 pub use annotated::AnnotatedContent;
