@@ -128,6 +128,17 @@ blue. This reduces visual noise when many individual words change at once.
 - **Opaque visuals** such as raw graphics, SVGs, and text-empty shapes are not
   diffed word-by-word. Structural visual changes are shown as an old visual
   replacement framed in red plus a new visual replacement framed in green.
+- **Ambiguous footnote identity** is not guessed. If one version has a different
+  number of authored footnotes in the same paragraph, typst-diff treats the
+  bodies as separate inserted and deleted footnotes instead of matching them by
+  textual similarity. For example, if
+  `Existing note mentions baseline settings.` is the only old footnote body and
+  the new paragraph contains both `New note explains calibration.` and
+  `Existing note mentions revised settings.`, the footer shows the two new
+  bodies as insertions and the old body as a deleted synthetic footnote. Inline
+  text converted to a footnote is likewise shown as deleted inline text plus an
+  inserted footnote body; the reverse is shown as inserted inline text plus a
+  deleted footnote body.
 - **Moved paragraphs** show as a deletion at the old location plus an insertion
   at the new location.
 - **PDF only.** No other output formats are supported.

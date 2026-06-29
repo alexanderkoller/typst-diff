@@ -21,7 +21,9 @@ use typst::foundations::{Content, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
-use typst::model::{EmphElem, EnumElem, HeadingElem, ListElem, ParElem, ParbreakElem};
+use typst::model::{
+    EmphElem, EnumElem, FootnoteBody, FootnoteElem, HeadingElem, ListElem, ParElem, ParbreakElem,
+};
 use typst::text::{SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
@@ -254,6 +256,15 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
         return Some(content);
     }
 
+    if let Some(footnote) = content.to_packed_mut::<FootnoteElem>()
+        && let FootnoteBody::Content(body) = &footnote.body
+    {
+        footnote.body = FootnoteBody::Content(
+            replace_text_container(body, replacement).unwrap_or_else(|| replacement.clone()),
+        );
+        return Some(content);
+    }
+
     if let Some(block) = content.to_packed_mut::<BlockElem>()
         && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
     {
@@ -373,6 +384,13 @@ fn map_transparent_children(
 
     if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
         heading.body = map_child(&heading.body);
+        return Some(content);
+    }
+
+    if let Some(footnote) = content.to_packed_mut::<FootnoteElem>()
+        && let FootnoteBody::Content(body) = &footnote.body
+    {
+        footnote.body = FootnoteBody::Content(map_child(body));
         return Some(content);
     }
 

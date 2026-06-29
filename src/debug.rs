@@ -1102,7 +1102,6 @@ fn semantic_kind_label(kind: &SemanticKind) -> String {
         SemanticKind::Grid => "grid".to_string(),
         SemanticKind::Stack => "stack".to_string(),
         SemanticKind::Figure => "figure".to_string(),
-        SemanticKind::Footnote => "footnote".to_string(),
         SemanticKind::Quote => "quote".to_string(),
         SemanticKind::Equation => "equation".to_string(),
         SemanticKind::Wrapper(kind) => format!("wrapper/{}", wrapper_kind_label(kind)),

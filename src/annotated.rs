@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
 use typst::layout::{BlockBody, BlockElem};
 use typst::math::EquationElem;
-use typst::model::{HeadingElem, ParElem, ParbreakElem};
+use typst::model::{FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
 use typst::syntax::Span;
 use typst::text::RawElem;
 
@@ -126,7 +126,6 @@ pub enum SemanticKind {
     Grid,
     Stack,
     Figure,
-    Footnote,
     Quote,
     Equation,
     Wrapper(WrapperKind),
@@ -206,6 +205,9 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     }
 
     // --- Structural elements: semantic_kind + slot map ---
+    if pre.is::<FootnoteElem>() {
+        return annotate_footnote_element(pre, realized);
+    }
     if let Some(kind) = ContainerKind::of(pre) {
         return annotate_container(pre, realized, kind);
     }
@@ -238,16 +240,19 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         pre.to_packed::<SequenceElem>(),
         realized.to_packed::<SequenceElem>(),
     ) {
-        let children: Vec<AnnotatedContent> = if pre_seq.children.len() == real_seq.children.len() {
-            pre_seq
-                .children
-                .iter()
-                .zip(real_seq.children.iter())
-                .map(|(p, r)| annotate_realized(p, r))
-                .collect()
-        } else {
-            pair_sequence_by_span(&pre_seq.children, &real_seq.children)
-        };
+        let children: Vec<AnnotatedContent> =
+            if sequence_contains_footnote(pre_seq) && sequence_has_paragraph_blocks(real_seq) {
+                pair_sequence_with_footnote_paragraphs(&pre_seq.children, &real_seq.children)
+            } else if pre_seq.children.len() == real_seq.children.len() {
+                pre_seq
+                    .children
+                    .iter()
+                    .zip(real_seq.children.iter())
+                    .map(|(p, r)| annotate_realized(p, r))
+                    .collect()
+            } else {
+                pair_sequence_by_span(&pre_seq.children, &real_seq.children)
+            };
         let patch_surface = sequence_patch_surface(&children);
         let has_layout_surface = children.len() != real_seq.children.len()
             && children
@@ -321,6 +326,195 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             ..Annotation::default()
         },
     )
+}
+
+fn sequence_contains_footnote(seq: &SequenceElem) -> bool {
+    seq.children.iter().any(content_contains_footnote)
+}
+
+fn content_contains_footnote(content: &Content) -> bool {
+    if content.is::<FootnoteElem>() {
+        return true;
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq.children.iter().any(content_contains_footnote);
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return content_contains_footnote(&styled.child);
+    }
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return content_contains_footnote(&par.body);
+    }
+    false
+}
+
+fn sequence_has_paragraph_blocks(seq: &SequenceElem) -> bool {
+    seq.children
+        .iter()
+        .any(|child| paragraph_body_path(child).is_some())
+}
+
+fn pair_sequence_with_footnote_paragraphs(
+    pre_children: &[Content],
+    real_children: &[Content],
+) -> Vec<AnnotatedContent> {
+    let runs = source_paragraph_runs(pre_children);
+    let mut run_index = 0;
+    let mut out = Vec::with_capacity(real_children.len());
+
+    for real_child in real_children {
+        if paragraph_body_path(real_child).is_some() && run_index < runs.len() {
+            let run = &runs[run_index];
+            run_index += 1;
+            if run.iter().any(content_contains_footnote) {
+                out.push(annotate_footnote_paragraph_run(run, real_child));
+            } else {
+                let pre_run = Content::sequence(run.iter().cloned());
+                out.push(annotate_realized(&pre_run, real_child));
+            }
+        } else {
+            out.push(leaf_annotated(real_child, Annotation::default()));
+        }
+    }
+
+    out
+}
+
+fn source_paragraph_runs(pre_children: &[Content]) -> Vec<Vec<Content>> {
+    let mut runs = Vec::new();
+    let mut current = Vec::new();
+
+    for child in pre_children {
+        if child.is::<ParbreakElem>() {
+            if current.iter().any(|content: &Content| !content.is_empty()) {
+                runs.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        } else {
+            current.push(child.clone());
+        }
+    }
+
+    if current.iter().any(|content| !content.is_empty()) {
+        runs.push(current);
+    }
+
+    runs
+}
+
+fn annotate_footnote_paragraph_run(run: &[Content], realized: &Content) -> AnnotatedContent {
+    let pre_body = Content::sequence(run.iter().cloned());
+    let Some(body_path) = paragraph_body_path(realized) else {
+        return annotate_realized(&pre_body, realized);
+    };
+    let Some(patch_surface) = replace_content_path(realized, &body_path, pre_body) else {
+        return annotate_realized(&Content::sequence(run.iter().cloned()), realized);
+    };
+    let patch_tree = annotate_realized(&patch_surface, &patch_surface);
+    let mut slots = Vec::new();
+    collect_promoted_footnote_slots(&patch_tree, &mut Vec::new(), &mut slots);
+    if slots.is_empty() {
+        return patch_tree;
+    }
+
+    AnnotatedContent {
+        realized: realized.clone(),
+        annotation: Annotation {
+            semantic_kind: Some(SemanticKind::Paragraph),
+            slots,
+            patch_surface: Some(patch_surface),
+            span: run
+                .iter()
+                .find(|content| !content.span().is_detached())
+                .map(Content::span)
+                .unwrap_or_else(Span::detached),
+            ..Annotation::default()
+        },
+        children: patch_tree.children,
+    }
+}
+
+fn annotate_footnote_element(pre: &Content, realized: &Content) -> AnnotatedContent {
+    let Some(pre_body) = footnote_body(pre) else {
+        return leaf_annotated(
+            realized,
+            Annotation {
+                span: pre.span(),
+                ..Annotation::default()
+            },
+        );
+    };
+    let realized_body = footnote_body(realized).unwrap_or_else(|| pre_body.clone());
+    let mut body = annotate_realized(&pre_body, &realized_body);
+    body.annotation.span = pre.span();
+    AnnotatedContent {
+        realized: realized.clone(),
+        annotation: Annotation {
+            slots: vec![SemanticSlot {
+                label: SlotStep::FootnoteBody,
+                path: vec![0],
+            }],
+            span: pre.span(),
+            ..Annotation::default()
+        },
+        children: vec![body],
+    }
+}
+
+fn footnote_body(content: &Content) -> Option<Content> {
+    let footnote = content.to_packed::<FootnoteElem>()?;
+    let FootnoteBody::Content(body) = &footnote.body else {
+        return None;
+    };
+    Some(body.clone())
+}
+
+fn paragraph_body_path(content: &Content) -> Option<Vec<usize>> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let mut path = paragraph_body_path(&styled.child)?;
+        path.insert(0, 0);
+        return Some(path);
+    }
+    content.is::<ParElem>().then_some(vec![0])
+}
+
+fn replace_content_path(
+    content: &Content,
+    path: &[usize],
+    replacement: Content,
+) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return Some(replacement);
+    };
+    let child = container_ops::realized_child_contents(content)
+        .get(*index)
+        .cloned()?;
+    let patched_child = replace_content_path(&child, rest, replacement)?;
+    container_ops::replace_realized_child(content, *index, patched_child)
+}
+
+fn collect_promoted_footnote_slots(
+    node: &AnnotatedContent,
+    path: &mut Vec<usize>,
+    out: &mut Vec<SemanticSlot>,
+) {
+    for slot in &node.annotation.slots {
+        if matches!(slot.label, SlotStep::FootnoteBody) {
+            let mut slot_path = path.clone();
+            slot_path.extend(slot.path.iter().copied());
+            out.push(SemanticSlot {
+                label: SlotStep::FootnoteBody,
+                path: slot_path,
+            });
+        }
+    }
+
+    for (index, child) in node.children.iter().enumerate() {
+        path.push(index);
+        collect_promoted_footnote_slots(child, path, out);
+        path.pop();
+    }
 }
 
 fn leaf_annotated(realized: &Content, annotation: Annotation) -> AnnotatedContent {
@@ -1230,12 +1424,13 @@ mod tests {
         let realized = text("Footnote text");
         let node = annotate_realized(&pre, &realized);
 
-        assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::Footnote));
+        assert_eq!(node.annotation.semantic_kind, None);
         assert_eq!(node.annotation.slots.len(), 1);
         assert!(matches!(
             node.annotation.slots[0].label,
             SlotStep::FootnoteBody
         ));
+        assert_eq!(node.annotation.slots[0].path, vec![0]);
         assert_eq!(node.children[0].realized.plain_text(), "Footnote text");
     }
 

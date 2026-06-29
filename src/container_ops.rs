@@ -30,7 +30,6 @@ pub(crate) enum ContainerKind {
     Grid,
     Stack,
     Figure,
-    Footnote,
     Quote,
     Wrapper(WrapperKind),
 }
@@ -49,7 +48,6 @@ impl ContainerKind {
             Self::Grid => SemanticKind::Grid,
             Self::Stack => SemanticKind::Stack,
             Self::Figure => SemanticKind::Figure,
-            Self::Footnote => SemanticKind::Footnote,
             Self::Quote => SemanticKind::Quote,
             Self::Wrapper(kind) => SemanticKind::Wrapper(kind.clone()),
         }
@@ -116,7 +114,6 @@ struct TableOps;
 struct GridOps;
 struct StackOps;
 struct FigureOps;
-struct FootnoteOps;
 struct QuoteOps;
 struct WrapperOps;
 
@@ -128,7 +125,6 @@ static CONTAINER_OPS: &[&dyn ContainerOps] = &[
     &GridOps,
     &StackOps,
     &FigureOps,
-    &FootnoteOps,
     &QuoteOps,
     &WrapperOps,
 ];
@@ -504,38 +500,6 @@ impl ContainerOps for FigureOps {
     }
 }
 
-impl ContainerOps for FootnoteOps {
-    fn kind(&self, content: &Content) -> Option<ContainerKind> {
-        content
-            .is::<FootnoteElem>()
-            .then_some(ContainerKind::Footnote)
-    }
-
-    fn slot_parts(&self, content: &Content) -> Option<Vec<SlotPart>> {
-        let footnote = content.to_packed::<FootnoteElem>()?;
-        let FootnoteBody::Content(body) = &footnote.body else {
-            return None;
-        };
-        Some(vec![SlotPart {
-            label: SlotStep::FootnoteBody,
-            pre_content: body.clone(),
-        }])
-    }
-
-    fn replace_child(
-        &self,
-        content: &mut Content,
-        index: usize,
-        replacement: Content,
-    ) -> Option<()> {
-        if index == 0 {
-            content.to_packed_mut::<FootnoteElem>()?.body = FootnoteBody::Content(replacement);
-            return Some(());
-        }
-        None
-    }
-}
-
 impl ContainerOps for QuoteOps {
     fn kind(&self, content: &Content) -> Option<ContainerKind> {
         content.is::<QuoteElem>().then_some(ContainerKind::Quote)
@@ -661,6 +625,11 @@ pub(crate) fn realized_child_contents(content: &Content) -> Vec<Content> {
     {
         return vec![body];
     }
+    if let Some(footnote) = content.to_packed::<FootnoteElem>()
+        && let FootnoteBody::Content(body) = &footnote.body
+    {
+        return vec![body.clone()];
+    }
     if let Some(children) = ops_for(content).and_then(|ops| ops.child_contents(content)) {
         return children;
     }
@@ -756,6 +725,14 @@ pub(crate) fn replace_realized_child(
     if let Some(block) = result.to_packed_mut::<BlockElem>() {
         if index == 0 {
             block.body.set(Some(BlockBody::Content(replacement)));
+            return Some(result);
+        }
+        return None;
+    }
+
+    if let Some(footnote) = result.to_packed_mut::<FootnoteElem>() {
+        if index == 0 {
+            footnote.body = FootnoteBody::Content(replacement);
             return Some(result);
         }
         return None;

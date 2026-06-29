@@ -272,6 +272,48 @@ fn diff_temp_sources(
     (dir, result, annotated)
 }
 
+fn diff_temp_sources_with_world(
+    old_source: &str,
+    new_source: &str,
+) -> (
+    tempfile::TempDir,
+    typst_diff::world::SystemWorld,
+    typst_diff::diff::DiffResult,
+    Content,
+) {
+    let (dir, old_world, new_world) = temp_worlds(old_source, new_source);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    (dir, new_world, result, annotated)
+}
+
+fn rendered_main_body_and_footer_text(
+    content: &Content,
+    world: &typst_diff::world::SystemWorld,
+) -> (String, String, Vec<TextRun>, Vec<TextRun>) {
+    let document = typst_diff::eval::layout_document(world, content).unwrap();
+    let first_page = &document.pages[0].frame;
+    let page_height = first_page.height().to_pt();
+    let (body_runs, footer_runs): (Vec<_>, Vec<_>) = rendered_text_runs(first_page)
+        .into_iter()
+        .partition(|run| run.y <= page_height * 0.8);
+    let body = normalize_whitespace(
+        &body_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>(),
+    );
+    let footer = normalize_whitespace(
+        &footer_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>(),
+    );
+    (body, footer, body_runs, footer_runs)
+}
+
 fn assert_modified_words_include(
     result: &typst_diff::diff::DiffResult,
     deleted_needles: &[&str],
@@ -2219,19 +2261,198 @@ fn semantic_container_changes_are_word_localized() {
 }
 
 #[test]
-fn nearby_footnote_insert_keeps_existing_note_body_localized() {
+fn nearby_footnote_insert_treats_ambiguous_existing_note_as_delete_insert() {
     let log = diff_annotated_corpus("74-footnote-added-near-existing-footnote").modification_log();
 
-    assert!(log.contains("inserted: It remains reproducible.2"), "{log}");
+    assert!(log.contains("inserted: It remains reproducible."), "{log}");
     assert!(
-        log.contains("block: Existing note mentions revised settings."),
+        log.contains("inserted: New note explains calibration."),
         "{log}"
     );
-    assert!(log.contains("deleted: baseline"), "{log}");
-    assert!(log.contains("inserted: revised"), "{log}");
     assert!(
-        !log.contains("deleted: Existing note mentions baseline settings."),
+        log.contains("inserted: Existing note mentions revised settings."),
         "{log}"
+    );
+    assert!(
+        log.contains("deleted: Existing note mentions baseline settings."),
+        "{log}"
+    );
+}
+
+#[test]
+fn footnote_body_change_preserves_marker_paragraph_regression() {
+    let old = r#"The API remains stable#footnote[Old footnote guidance for deployers.].
+
+The rest of the paragraph is unchanged.
+"#;
+    let new = r#"The API remains stable#footnote[New footnote guidance for operators.].
+
+The rest of the paragraph is unchanged.
+"#;
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+
+    assert_modified_words_include(&result, &["Old", "deployers"], &["New", "operators"]);
+    let (body, footer, _body_runs, _footer_runs) =
+        rendered_main_body_and_footer_text(&annotated, &new_world);
+
+    assert_contains_in_order(
+        &body,
+        &[
+            "The API remains stable",
+            "1",
+            ".",
+            "The rest of the paragraph is unchanged.",
+        ],
+    );
+    assert!(
+        !body.contains("footnote guidance"),
+        "footnote body should stay in the footer, not the main body:\nbody={body}\nfooter={footer}"
+    );
+    assert!(footer.contains("Old"), "footer={footer}");
+    assert!(footer.contains("New"), "footer={footer}");
+    assert!(footer.contains("deployers"), "footer={footer}");
+    assert!(footer.contains("operators"), "footer={footer}");
+}
+
+#[test]
+fn nearby_inserted_footnote_keeps_bodies_in_footer_without_ambiguous_pairing_regression() {
+    let old = r#"The method is stable.#footnote[Existing note mentions baseline settings.]
+
+The conclusion follows from the evaluation.
+"#;
+    let new = r#"The method is stable.#footnote[New note explains calibration.] It remains reproducible.#footnote[Existing note mentions revised settings.]
+
+The conclusion follows from the evaluation.
+"#;
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+    let log = result.modification_log();
+
+    assert!(log.contains("inserted: It remains reproducible."), "{log}");
+    assert!(
+        log.contains("inserted: New note explains calibration."),
+        "{log}"
+    );
+    assert!(
+        log.contains("inserted: Existing note mentions revised settings."),
+        "{log}"
+    );
+    assert!(
+        log.contains("deleted: Existing note mentions baseline settings."),
+        "{log}"
+    );
+
+    let (body, footer, _body_runs, _footer_runs) =
+        rendered_main_body_and_footer_text(&annotated, &new_world);
+    assert_contains_in_order(
+        &body,
+        &[
+            "The method is stable.",
+            "1",
+            "It remains reproducible.",
+            "2",
+            "3",
+            "The conclusion follows from the evaluation.",
+        ],
+    );
+    assert!(
+        !body.contains("Existing note mentions"),
+        "existing footnote body should not become a standalone main-body paragraph:\nbody={body}\nfooter={footer}"
+    );
+    assert!(
+        footer.contains("New note explains calibration."),
+        "newly inserted footnote body should render in footer:\nbody={body}\nfooter={footer}"
+    );
+    assert!(footer.contains("Existing note mentions"), "footer={footer}");
+    assert!(footer.contains("baseline"), "footer={footer}");
+    assert!(footer.contains("revised"), "footer={footer}");
+}
+
+#[test]
+fn inline_text_to_footnote_body_regression() {
+    let old = "The procedure keeps the calibration note inline.\n";
+    let new = "The procedure keeps the#footnote[calibration note] inline.\n";
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+    let log = result.modification_log();
+
+    assert!(log.contains("text: calibration note"), "{log}");
+    assert!(log.contains("inserted: calibration note"), "{log}");
+    let (body, footer, _body_runs, _footer_runs) =
+        rendered_main_body_and_footer_text(&annotated, &new_world);
+
+    assert_contains_in_order(
+        &body,
+        &[
+            "The procedure keeps the",
+            "calibration note",
+            "1",
+            "inline.",
+        ],
+    );
+    assert!(text_is_struck(&annotated, "calibration"));
+    assert!(text_is_struck(&annotated, "note"));
+    assert!(footer.contains("calibration note"), "footer={footer}");
+}
+
+#[test]
+fn footnote_body_to_inline_text_regression() {
+    let old = "The procedure keeps the#footnote[calibration note] inline.\n";
+    let new = "The procedure keeps the calibration note inline.\n";
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+
+    assert_modified_words_include(&result, &["calibration note"], &["calibration note"]);
+    let (body, footer, _body_runs, _footer_runs) =
+        rendered_main_body_and_footer_text(&annotated, &new_world);
+
+    assert_contains_in_order(&body, &["The procedure keeps the calibration note inline."]);
+    assert!(
+        footer.contains("calibration note"),
+        "deleted old footnote body should remain visible in the footer as a deletion:\nbody={body}\nfooter={footer}"
+    );
+}
+
+#[test]
+fn visible_number_before_footnote_marker_is_not_marker() {
+    let old = "Step 1#footnote[Old note for deployers.] remains stable.\n";
+    let new = "Step 1#footnote[New note for operators.] remains stable.\n";
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+
+    assert_modified_words_include(&result, &["Old", "deployers"], &["New", "operators"]);
+    let (body, footer, _body_runs, _footer_runs) =
+        rendered_main_body_and_footer_text(&annotated, &new_world);
+    assert_contains_in_order(&body, &["Step", "1", "1", "remains stable."]);
+    assert!(
+        !body.contains("note for"),
+        "the ordinary visible 1 must not absorb footnote metadata:\nbody={body}\nfooter={footer}"
+    );
+    assert!(footer.contains("Old"), "footer={footer}");
+    assert!(footer.contains("New"), "footer={footer}");
+}
+
+#[test]
+fn section_references_stay_on_realized_text_path_regression() {
+    let old = r#"#set heading(numbering: "1.")
+
+= API <api>
+
+See @api for the old contract.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= API <api>
+
+See @api for the new contract.
+"#;
+    let (_dir, result, annotated) = diff_temp_sources(old, new);
+    let plain = annotated.plain_text();
+
+    assert_modified_words_include(&result, &["old"], &["new"]);
+    assert!(
+        plain.contains("Section"),
+        "section reference should remain realized inline text:\n{plain}"
+    );
+    assert!(
+        !plain.contains("Footnote"),
+        "section references should not be routed through footnote handling:\n{plain}"
     );
 }
 

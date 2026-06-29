@@ -422,6 +422,11 @@ fn collect_annotated_tokens(node: &AnnotatedContent, out: &mut Vec<Token>) {
         return;
     }
 
+    if all_slots_are_footnote_bodies(node) {
+        collect_tokens(&node.realized, out);
+        return;
+    }
+
     let slots = resolved_slots(node);
     if !slots.is_empty() {
         for (_slot, child) in slots {
@@ -1728,7 +1733,8 @@ fn replace_block_edit(
                 page_styles,
             });
         }
-        let edits = diff_slot_edits_with_events(old_ann, new_ann, debug_events)?;
+        let mut edits = footnote_visible_text_edits(old_ann, new_ann);
+        edits.extend(diff_slot_edits_with_events(old_ann, new_ann, debug_events)?);
         if !edits.is_empty() {
             emit_pipeline_trace_event(
                 debug_events,
@@ -1788,6 +1794,60 @@ fn replace_block_edit(
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
                 edits,
+                page_styles,
+            });
+        }
+    }
+
+    if let Some(new_ann) = new_ann
+        && all_slots_are_footnote_bodies(new_ann)
+        && old_ann.is_none_or(|old_ann| !all_slots_are_footnote_bodies(old_ann))
+    {
+        let mut edits = inserted_footnote_body_edits(new_ann);
+        edits.extend(deleted_visible_text_before_first_footnote(
+            &old_block.content,
+            new_ann,
+        ));
+        if !edits.is_empty() {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/replace-block", "selected")
+                    .reason("inline text and inserted footnote body are separate edits")
+                    .old_content(&old_block.content)
+                    .new_content(&new_block.content)
+                    .selected_edit_kind("footnote_body_insert"),
+            )?;
+            return Ok(DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, Some(new_ann)),
+                edits,
+                page_styles,
+            });
+        }
+    }
+
+    if let Some(old_ann) = old_ann
+        && all_slots_are_footnote_bodies(old_ann)
+        && new_ann.is_none_or(|new_ann| !all_slots_are_footnote_bodies(new_ann))
+    {
+        let old_visible = footnote_owner_content_without_footnotes(old_ann);
+        let old_tokens = extract_words(&old_visible);
+        let new_tokens = extract_words_for_annotated(&new_block.content, new_ann);
+        let word_ops = diff_words(&old_tokens, &new_tokens);
+        if has_textual_word_change(&word_ops) {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("diff/replace-block", "selected")
+                    .reason("deleted footnote body and inline text are separate edits")
+                    .old_content(&old_block.content)
+                    .new_content(&new_block.content)
+                    .selected_edit_kind("footnote_body_to_inline"),
+            )?;
+            return Ok(DiffBlockEdit {
+                base: annotated_block_from(&new_block.content, new_ann),
+                edits: vec![RealizedEdit::WholeBlock(EditContent::Modified {
+                    base: new_block.content.clone(),
+                    word_ops,
+                })],
                 page_styles,
             });
         }
@@ -1907,7 +1967,8 @@ fn diff_annotated_inner_with_events(
                         });
                         continue;
                     }
-                    let edits = diff_slot_edits_with_events(old_ann, new_ann, debug_events)?;
+                    let mut edits = footnote_visible_text_edits(old_ann, new_ann);
+                    edits.extend(diff_slot_edits_with_events(old_ann, new_ann, debug_events)?);
                     if !edits.is_empty() {
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
@@ -2145,77 +2206,43 @@ fn append_footnote_body_edits(
 ) {
     let old_bodies = footnote_body_contents(old);
     let new_bodies = footnote_body_contents(new);
-    if old_bodies.is_empty() || new_bodies.is_empty() {
+    if old_bodies.is_empty() {
         return;
     }
-
-    let mut used_new = HashSet::new();
-    for old_body in old_bodies {
-        let Some((new_index, new_body)) =
-            best_matching_footnote_body(&old_body, &new_bodies, &used_new)
-        else {
-            continue;
-        };
-        used_new.insert(new_index);
-        if old_body == *new_body {
-            continue;
-        }
-
-        let old_tokens = extract_words(&old_body);
-        let new_tokens = extract_words(new_body);
-        let word_ops = diff_words(&old_tokens, &new_tokens);
-        if !has_textual_word_change(&word_ops) {
-            continue;
-        }
-
-        let edit = RealizedEdit::WholeBlock(EditContent::Modified {
-            base: new_body.clone(),
-            word_ops,
-        });
-        let signatures = edit_modified_signatures(&edit);
-        if blocks
-            .iter()
-            .flat_map(|block| &block.edits)
-            .any(|existing| {
-                let existing_signatures = edit_modified_signatures(existing);
-                signatures
-                    .iter()
-                    .any(|signature| existing_signatures.contains(signature))
-            })
-        {
-            continue;
-        }
-
-        blocks.push(DiffBlockEdit {
-            base: annotated_block_from(new_body, None),
-            edits: vec![edit],
-            page_styles: Styles::new(),
-        });
+    if new_bodies.is_empty() {
+        append_deleted_footnote_body_edits(old_bodies, blocks);
     }
 }
 
-fn best_matching_footnote_body<'a>(
-    old_body: &Content,
-    new_bodies: &'a [Content],
-    used_new: &HashSet<usize>,
-) -> Option<(usize, &'a Content)> {
-    new_bodies
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !used_new.contains(index))
-        .map(|(index, new_body)| {
-            (
-                index,
-                similarity(
-                    old_body.plain_text().as_str(),
-                    new_body.plain_text().as_str(),
-                ),
-                new_body,
-            )
-        })
-        .filter(|(_, score, _)| *score >= 0.3)
-        .max_by(|(_, left_score, _), (_, right_score, _)| left_score.total_cmp(right_score))
-        .map(|(index, _, body)| (index, body))
+fn append_deleted_footnote_body_edits(old_bodies: Vec<Content>, blocks: &mut Vec<DiffBlockEdit>) {
+    for old_body in old_bodies {
+        let tokens = extract_words(&old_body);
+        if tokens.is_empty() {
+            continue;
+        }
+        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(old_body.clone())));
+        let base = annotate_realized(&footnote, &footnote);
+        let Some(path) = base
+            .annotation
+            .slots
+            .iter()
+            .find(|slot| matches!(slot.label, SlotStep::FootnoteBody))
+            .map(|slot| slot.path.clone())
+        else {
+            continue;
+        };
+        blocks.push(DiffBlockEdit {
+            base,
+            edits: vec![RealizedEdit::ReplaceAt {
+                path,
+                content: EditContent::Modified {
+                    base: old_body,
+                    word_ops: vec![WordOp::Delete(tokens)],
+                },
+            }],
+            page_styles: Styles::new(),
+        });
+    }
 }
 
 fn footnote_body_contents(root: &AnnotatedContent) -> Vec<Content> {
@@ -2225,16 +2252,21 @@ fn footnote_body_contents(root: &AnnotatedContent) -> Vec<Content> {
 }
 
 fn collect_footnote_body_contents(node: &AnnotatedContent, out: &mut Vec<Content>) {
-    if matches!(node.annotation.semantic_kind, Some(SemanticKind::Footnote))
-        && let Some(slot) = node
-            .annotation
-            .slots
-            .iter()
-            .find(|slot| matches!(slot.label, SlotStep::FootnoteBody))
-        && let Some(body) = node.get_path(&slot.path)
-    {
-        out.push(effective_text_content(body));
+    let slots = node
+        .annotation
+        .slots
+        .iter()
+        .filter(|slot| matches!(slot.label, SlotStep::FootnoteBody))
+        .collect::<Vec<_>>();
+    if !slots.is_empty() {
+        for slot in slots {
+            if let Some(body) = node.get_path(&slot.path) {
+                out.push(effective_text_content(body));
+            }
+        }
+        return;
     }
+
     if let Some(footnote) = &node.annotation.footnote
         && let Some(body) = footnote_body_content(&footnote.body)
     {
@@ -3453,7 +3485,6 @@ fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<Bloc
 
 fn is_owned_diff_region(node: &AnnotatedContent) -> bool {
     !node.annotation.slots.is_empty()
-        && !matches!(node.annotation.semantic_kind, Some(SemanticKind::Footnote))
 }
 
 fn owned_block_matches(owner_block: &Content, target: &Content) -> bool {
@@ -3927,6 +3958,285 @@ fn modified_edit_content(
     opaque_replacement_content(old_child, new_child)
 }
 
+#[derive(Clone)]
+struct VisibleFootnoteUnit {
+    text: String,
+    content: Content,
+    path: Option<Vec<usize>>,
+    is_footnote: bool,
+}
+
+fn footnote_visible_text_edits(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+) -> Vec<RealizedEdit> {
+    if !all_slots_are_footnote_bodies(old_ann) || !all_slots_are_footnote_bodies(new_ann) {
+        return vec![];
+    }
+
+    let Some(old_units) = visible_footnote_units(old_ann) else {
+        return vec![];
+    };
+    let Some(new_units) = visible_footnote_units(new_ann) else {
+        return vec![];
+    };
+    let old_keys = old_units
+        .iter()
+        .map(|unit| unit.text.clone())
+        .collect::<Vec<_>>();
+    let new_keys = new_units
+        .iter()
+        .map(|unit| unit.text.clone())
+        .collect::<Vec<_>>();
+    let ops = capture_diff_slices(Algorithm::Myers, &old_keys, &new_keys);
+
+    let mut edits = Vec::new();
+    for op in ops {
+        match op {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                for unit in &new_units[new_index..new_index + new_len] {
+                    push_visible_insert_edit(&mut edits, unit);
+                }
+            }
+            DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+            } => {
+                for unit in &old_units[old_index..old_index + old_len] {
+                    push_visible_delete_edit(&mut edits, unit, &new_units, new_index);
+                }
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                let paired = old_len.min(new_len);
+                for i in 0..paired {
+                    let old_unit = &old_units[old_index + i];
+                    let new_unit = &new_units[new_index + i];
+                    if old_unit.is_footnote || new_unit.is_footnote {
+                        continue;
+                    }
+                    if let Some(path) = &new_unit.path {
+                        let old_tokens = extract_words(&old_unit.content);
+                        let new_tokens = extract_words(&new_unit.content);
+                        let word_ops = diff_words(&old_tokens, &new_tokens);
+                        if has_textual_word_change(&word_ops) {
+                            edits.push(RealizedEdit::ReplaceAt {
+                                path: path.clone(),
+                                content: EditContent::Modified {
+                                    base: new_unit.content.clone(),
+                                    word_ops,
+                                },
+                            });
+                        }
+                    }
+                }
+                for unit in &old_units[old_index + paired..old_index + old_len] {
+                    push_visible_delete_edit(&mut edits, unit, &new_units, new_index + paired);
+                }
+                for unit in &new_units[new_index + paired..new_index + new_len] {
+                    push_visible_insert_edit(&mut edits, unit);
+                }
+            }
+        }
+    }
+
+    edits
+}
+
+fn push_visible_insert_edit(edits: &mut Vec<RealizedEdit>, unit: &VisibleFootnoteUnit) {
+    if unit.is_footnote || unit.text.trim().is_empty() {
+        return;
+    }
+    let Some(path) = &unit.path else {
+        return;
+    };
+    let tokens = extract_words(&unit.content);
+    if tokens.is_empty() {
+        return;
+    }
+    edits.push(RealizedEdit::ReplaceAt {
+        path: path.clone(),
+        content: EditContent::Modified {
+            base: unit.content.clone(),
+            word_ops: vec![WordOp::Insert(tokens)],
+        },
+    });
+}
+
+fn push_visible_delete_edit(
+    edits: &mut Vec<RealizedEdit>,
+    unit: &VisibleFootnoteUnit,
+    new_units: &[VisibleFootnoteUnit],
+    new_index: usize,
+) {
+    if unit.is_footnote || unit.text.trim().is_empty() {
+        return;
+    }
+    let content = deleted_edit(unit.content.clone());
+    if let Some(anchor) = new_units
+        .get(new_index)
+        .and_then(|unit| unit.path.as_ref())
+        .cloned()
+    {
+        edits.push(RealizedEdit::InsertBefore { anchor, content });
+    } else if new_index > 0 {
+        if let Some(anchor) = new_units
+            .get(new_index - 1)
+            .and_then(|unit| unit.path.as_ref())
+            .cloned()
+        {
+            edits.push(RealizedEdit::InsertAfter { anchor, content });
+        } else {
+            edits.push(RealizedEdit::Append { content });
+        }
+    } else {
+        edits.push(RealizedEdit::Append { content });
+    }
+}
+
+fn visible_footnote_units(node: &AnnotatedContent) -> Option<Vec<VisibleFootnoteUnit>> {
+    let surface = node
+        .annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized);
+    let body_path = paragraph_body_path(surface)?;
+    let body = content_at_path(surface, &body_path)?;
+    let seq = body.to_packed::<SequenceElem>()?;
+    let mut footnote_number = 1;
+    let mut out = Vec::new();
+    for (index, child) in seq.children.iter().enumerate() {
+        let mut path = body_path.clone();
+        path.push(index);
+        if child.is::<FootnoteElem>() {
+            out.push(VisibleFootnoteUnit {
+                text: footnote_number.to_string(),
+                content: child.clone(),
+                path: Some(path),
+                is_footnote: true,
+            });
+            footnote_number += 1;
+        } else {
+            out.push(VisibleFootnoteUnit {
+                text: child.plain_text().to_string(),
+                content: child.clone(),
+                path: Some(path),
+                is_footnote: false,
+            });
+        }
+    }
+    Some(out)
+}
+
+fn paragraph_body_path(content: &Content) -> Option<Vec<usize>> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let mut path = paragraph_body_path(&styled.child)?;
+        path.insert(0, 0);
+        return Some(path);
+    }
+    content.is::<ParElem>().then_some(vec![0])
+}
+
+fn content_at_path<'a>(content: &'a Content, path: &[usize]) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return Some(content.clone());
+    };
+    let child = container_ops::realized_child_contents(content)
+        .get(*index)
+        .cloned()?;
+    content_at_path(&child, rest)
+}
+
+fn deleted_visible_text_before_first_footnote(
+    old_content: &Content,
+    new_ann: &AnnotatedContent,
+) -> Vec<RealizedEdit> {
+    let Some(anchor) = first_footnote_call_path(new_ann) else {
+        return vec![];
+    };
+    let new_visible = footnote_owner_content_without_footnotes(new_ann);
+    let old_tokens = extract_words(old_content);
+    let new_tokens = extract_words(&new_visible);
+    let mut deleted = diff_words(&old_tokens, &new_tokens)
+        .into_iter()
+        .filter_map(|op| match op {
+            WordOp::Delete(tokens) => Some(tokens),
+            WordOp::Equal(_) | WordOp::Insert(_) => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    trim_whitespace_tokens(&mut deleted);
+    if deleted.is_empty() {
+        return vec![];
+    }
+    let content = Content::sequence(deleted.iter().map(|token| token.content.clone()));
+
+    vec![RealizedEdit::InsertBefore {
+        anchor,
+        content: EditContent::Deleted(content),
+    }]
+}
+
+fn trim_whitespace_tokens(tokens: &mut Vec<Token>) {
+    while tokens
+        .first()
+        .is_some_and(|token| token.text.chars().all(char::is_whitespace))
+    {
+        tokens.remove(0);
+    }
+    while tokens
+        .last()
+        .is_some_and(|token| token.text.chars().all(char::is_whitespace))
+    {
+        tokens.pop();
+    }
+}
+
+fn footnote_owner_content_without_footnotes(node: &AnnotatedContent) -> Content {
+    let surface = node
+        .annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized);
+    remove_footnote_calls(surface)
+}
+
+fn remove_footnote_calls(content: &Content) -> Content {
+    if content.is::<FootnoteElem>() {
+        return Content::sequence([]);
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return Content::sequence(seq.children.iter().map(remove_footnote_calls));
+    }
+    if let Some(children) = maybe_map_realized_children(content, remove_footnote_calls) {
+        return children;
+    }
+    content.clone()
+}
+
+fn maybe_map_realized_children(
+    content: &Content,
+    mut map_child: impl FnMut(&Content) -> Content,
+) -> Option<Content> {
+    let children = container_ops::realized_child_contents(content);
+    if children.is_empty() {
+        return None;
+    }
+    let mut mapped = content.clone();
+    for (index, child) in children.iter().enumerate() {
+        mapped = container_ops::replace_realized_child(&mapped, index, map_child(child))?;
+    }
+    Some(mapped)
+}
+
 fn opaque_replacement_content(
     old_child: &AnnotatedContent,
     new_child: &AnnotatedContent,
@@ -3946,11 +4256,141 @@ fn opaque_replacement_content(
 }
 
 fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {
+    if all_slots_are_footnote_bodies(old_ann) && all_slots_are_footnote_bodies(new_ann) {
+        return diff_footnote_body_slot_edits(old_ann, new_ann);
+    }
     if slot_labels(old_ann) == slot_labels(new_ann) {
         diff_slot_edits_same_shape(old_ann, new_ann)
     } else {
         diff_slot_edits_lcs(old_ann, new_ann)
     }
+}
+
+fn all_slots_are_footnote_bodies(node: &AnnotatedContent) -> bool {
+    !node.annotation.slots.is_empty()
+        && node
+            .annotation
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.label, SlotStep::FootnoteBody))
+}
+
+fn diff_footnote_body_slot_edits(
+    old_ann: &AnnotatedContent,
+    new_ann: &AnnotatedContent,
+) -> Vec<RealizedEdit> {
+    let old_slots = resolved_slots(old_ann);
+    let new_slots = resolved_slots(new_ann);
+
+    let mut edits = Vec::new();
+
+    if old_slots.len() == 1 && new_slots.len() == 1 {
+        let old_child = old_slots[0].1;
+        let (new_slot, new_child) = new_slots[0];
+        if !annotated_subtree_equal(old_child, new_child)
+            && let Some(content) = recursive_slot_edit_content(old_child, new_child)
+                .or_else(|| modified_edit_content(old_child, new_child))
+        {
+            edits.push(RealizedEdit::ReplaceAt {
+                path: new_slot.path.clone(),
+                content,
+            });
+        }
+        return edits;
+    }
+
+    for (new_slot, new_child) in &new_slots {
+        let body = effective_text_content(new_child);
+        edits.push(RealizedEdit::ReplaceAt {
+            path: new_slot.path.clone(),
+            content: inserted_footnote_body_edit_content(body),
+        });
+    }
+
+    if let Some(edit) = deleted_footnote_call_edit(&old_slots, &new_slots) {
+        edits.push(edit);
+    }
+
+    edits
+}
+
+fn inserted_footnote_body_edits(new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {
+    resolved_slots(new_ann)
+        .into_iter()
+        .filter(|(slot, _)| matches!(slot.label, SlotStep::FootnoteBody))
+        .filter_map(|(slot, child)| {
+            let body = effective_text_content(child);
+            let tokens = extract_words(&body);
+            (!tokens.is_empty()).then(|| RealizedEdit::ReplaceAt {
+                path: slot.path.clone(),
+                content: inserted_footnote_body_edit_content_with_tokens(body, tokens),
+            })
+        })
+        .collect()
+}
+
+fn inserted_footnote_body_edit_content(body: Content) -> EditContent {
+    let tokens = extract_words(&body);
+    inserted_footnote_body_edit_content_with_tokens(body, tokens)
+}
+
+fn inserted_footnote_body_edit_content_with_tokens(
+    body: Content,
+    tokens: Vec<Token>,
+) -> EditContent {
+    EditContent::Modified {
+        base: body,
+        word_ops: vec![WordOp::Insert(tokens)],
+    }
+}
+
+fn deleted_footnote_call_edit(
+    old_slots: &[(&SemanticSlot, &AnnotatedContent)],
+    new_slots: &[(&SemanticSlot, &AnnotatedContent)],
+) -> Option<RealizedEdit> {
+    let calls = old_slots
+        .iter()
+        .map(|(_slot, child)| {
+            Content::new(FootnoteElem::new(FootnoteBody::Content(
+                effective_text_content(child),
+            )))
+        })
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return None;
+    }
+
+    let content = if calls.len() == 1 {
+        let call = calls.into_iter().next().expect("single deleted footnote");
+        let tokens = extract_words(&call);
+        EditContent::Modified {
+            base: call,
+            word_ops: vec![WordOp::Delete(tokens)],
+        }
+    } else {
+        EditContent::Deleted(Content::sequence(calls))
+    };
+    if let Some(anchor) = new_slots
+        .iter()
+        .rev()
+        .find_map(|(slot, _child)| footnote_call_path(slot))
+    {
+        Some(RealizedEdit::InsertAfter { anchor, content })
+    } else {
+        Some(RealizedEdit::Append { content })
+    }
+}
+
+fn first_footnote_call_path(node: &AnnotatedContent) -> Option<Vec<usize>> {
+    node.annotation.slots.iter().find_map(footnote_call_path)
+}
+
+fn footnote_call_path(slot: &SemanticSlot) -> Option<Vec<usize>> {
+    if !matches!(slot.label, SlotStep::FootnoteBody) {
+        return None;
+    }
+    let (last, parent) = slot.path.split_last()?;
+    (*last == 0).then(|| parent.to_vec())
 }
 
 fn diff_slot_edits_with_events(
