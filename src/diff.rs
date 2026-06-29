@@ -2083,6 +2083,22 @@ fn replace_block_edit(
         }
     }
 
+    if let Some(edit) = raw_block_modified_edit(old_ann, new_ann, &new_block.content) {
+        emit_pipeline_trace_event(
+            debug_events,
+            PipelineTraceEvent::new("diff/replace-block", "selected")
+                .reason("raw block line diff")
+                .old_content(&old_block.content)
+                .new_content(&new_block.content)
+                .selected_edit_kind(realized_edit_kind(&edit)),
+        )?;
+        return Ok(DiffBlockEdit {
+            base: annotated_block_from(&new_block.content, new_ann),
+            edits: vec![edit],
+            page_styles,
+        });
+    }
+
     if let Some(new_ann) = new_ann
         && all_slots_are_footnote_bodies(new_ann)
         && old_ann.is_none_or(|old_ann| !all_slots_are_footnote_bodies(old_ann))
@@ -2240,6 +2256,111 @@ fn word_or_opaque_replacement_edits(
     }
 
     vec![]
+}
+
+fn raw_block_modified_edit(
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    new_base: &Content,
+) -> Option<RealizedEdit> {
+    let old_ann = old_ann.filter(|node| {
+        node.annotation.semantic_kind == Some(SemanticKind::RawBlock)
+    })?;
+    let new_ann = new_ann.filter(|node| {
+        node.annotation.semantic_kind == Some(SemanticKind::RawBlock)
+    })?;
+    let old_text = raw_block_text(old_ann)?;
+    let new_text = raw_block_text(new_ann)?;
+    if old_text == new_text {
+        return None;
+    }
+    let word_ops = diff_raw_block_lines(&old_text, &new_text);
+    Some(RealizedEdit::WholeBlock(EditContent::Modified {
+        base: new_base.clone(),
+        word_ops,
+    }))
+}
+
+fn raw_block_text(node: &AnnotatedContent) -> Option<String> {
+    let surface = node
+        .annotation
+        .patch_surface
+        .as_ref()
+        .unwrap_or(&node.realized);
+    (surface.to_packed::<RawElem>().is_some()
+        || node.annotation.semantic_kind == Some(SemanticKind::RawBlock))
+    .then(|| surface.plain_text().to_string())
+}
+
+fn diff_raw_block_lines(old_text: &str, new_text: &str) -> Vec<WordOp> {
+    let old_lines = raw_block_lines(old_text);
+    let new_lines = raw_block_lines(new_text);
+    let mut ops = Vec::new();
+    for op in capture_diff_slices(Algorithm::Myers, &old_lines, &new_lines) {
+        match op {
+            DiffOp::Equal {
+                old_index,
+                new_index: _,
+                len,
+            } => coalesce(
+                &mut ops,
+                WordOp::Equal(raw_line_tokens(&old_lines[old_index..old_index + len])),
+            ),
+            DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index: _,
+            } => coalesce(
+                &mut ops,
+                WordOp::Delete(raw_line_tokens(&old_lines[old_index..old_index + old_len])),
+            ),
+            DiffOp::Insert {
+                old_index: _,
+                new_index,
+                new_len,
+            } => coalesce(
+                &mut ops,
+                WordOp::Insert(raw_line_tokens(&new_lines[new_index..new_index + new_len])),
+            ),
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                coalesce(
+                    &mut ops,
+                    WordOp::Delete(raw_line_tokens(&old_lines[old_index..old_index + old_len])),
+                );
+                coalesce(
+                    &mut ops,
+                    WordOp::Insert(raw_line_tokens(&new_lines[new_index..new_index + new_len])),
+                );
+            }
+        }
+    }
+    ops
+}
+
+fn raw_block_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn raw_line_tokens(lines: &[String]) -> Vec<Token> {
+    lines
+        .iter()
+        .map(|line| Token {
+            text: line.clone(),
+            content: TextElem::packed(line.as_str()),
+        })
+        .collect()
 }
 
 fn has_meaningful_equal(word_ops: &[WordOp]) -> bool {

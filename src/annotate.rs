@@ -24,7 +24,7 @@ use typst::math::{CancelElem, EquationElem};
 use typst::model::{
     EmphElem, EnumElem, FootnoteBody, FootnoteElem, HeadingElem, ListElem, ParElem, ParbreakElem,
 };
-use typst::text::{SpaceElem, StrikeElem, TextElem};
+use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
 use crate::annotated::effective_render_content;
@@ -1022,11 +1022,122 @@ fn render_edit_content(content: &EditContent, compact: bool) -> Content {
             framed_opaque_visual(new, green()),
         ]),
         EditContent::Modified { base, word_ops } => {
+            if let Some(raw) = render_raw_block_modified(base, word_ops, compact) {
+                return raw;
+            }
             let inline = annotated_inline_content(word_ops, compact);
             replace_text_container(base, &inline).unwrap_or(inline)
         }
         EditContent::Nested { base, edits } => apply_edits_to_base(base, edits, compact),
     }
+}
+
+fn render_raw_block_modified(base: &Content, word_ops: &[WordOp], compact: bool) -> Option<Content> {
+    if !contains_raw_line(base) {
+        return None;
+    }
+    replace_raw_line_sequence(base, raw_line_diff_sequence(word_ops, compact))
+}
+
+fn contains_raw_line(content: &Content) -> bool {
+    let mut found = content.is::<RawLine>();
+    let _ = content.traverse::<_, ()>(&mut |child| {
+        if child.is::<RawLine>() {
+            found = true;
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    found
+}
+
+fn replace_raw_line_sequence(content: &Content, replacement: Content) -> Option<Content> {
+    let mut content = content.clone();
+
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        if seq.children.iter().any(|child| child.is::<RawLine>()) {
+            seq.children = replacement
+                .to_packed::<SequenceElem>()
+                .map(|seq| seq.children.clone())
+                .unwrap_or_else(|| vec![replacement].into_iter().collect());
+            return Some(content);
+        }
+        for child in &mut seq.children {
+            if let Some(replaced) = replace_raw_line_sequence(child, replacement.clone()) {
+                *child = replaced;
+                return Some(content);
+            }
+        }
+        return None;
+    }
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        if let Some(child) = replace_raw_line_sequence(&styled.child, replacement) {
+            styled.child = child;
+            return Some(content);
+        }
+        return None;
+    }
+
+    if let Some(block) = content.to_packed_mut::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+        && let Some(body) = replace_raw_line_sequence(&body, replacement)
+    {
+        block.body.set(Some(BlockBody::Content(body)));
+        return Some(content);
+    }
+
+    None
+}
+
+fn raw_line_diff_sequence(word_ops: &[WordOp], compact: bool) -> Content {
+    let mut lines = Vec::new();
+    for run in word_render_runs(word_ops, compact) {
+        match run {
+            WordRenderRun::Equal(tokens) => {
+                lines.extend(tokens.iter().map(|token| raw_line_body(token.text.as_str())));
+            }
+            WordRenderRun::Insert { tokens, color, .. } => {
+                lines.extend(tokens.iter().map(|token| {
+                    raw_line_body(token.text.as_str())
+                        .styled(TextElem::fill.set(color.color().into()))
+                }));
+            }
+            WordRenderRun::Delete { tokens, visible } => {
+                if visible {
+                    lines.extend(tokens.iter().map(|token| {
+                        Content::new(StrikeElem::new(
+                            raw_line_body(token.text.as_str())
+                                .styled(TextElem::fill.set(red().into())),
+                        ))
+                    }));
+                }
+            }
+        }
+    }
+    raw_lines_sequence(lines)
+}
+
+fn raw_line_body(text: &str) -> Content {
+    TextElem::packed(text)
+}
+
+fn raw_lines_sequence(lines: Vec<Content>) -> Content {
+    let count = lines.len() as i64;
+    let mut children = Vec::new();
+    for (index, body) in lines.into_iter().enumerate() {
+        if index > 0 {
+            children.push(Content::new(LinebreakElem::new()));
+        }
+        let text = body.plain_text();
+        children.push(Content::new(RawLine::new(
+            index as i64 + 1,
+            count,
+            text,
+            body,
+        )));
+    }
+    Content::sequence(children)
 }
 
 fn replace_annotated_path_content(

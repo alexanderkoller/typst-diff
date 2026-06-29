@@ -809,6 +809,30 @@ fn inserted_display_equation_is_tokenized_and_logged() {
 }
 
 #[test]
+fn raw_block_changes_use_authored_lines_once() {
+    let result = diff_annotated_corpus("24-code-block-changed");
+    let log = result.modification_log();
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+
+    assert!(
+        deleted.contains("fn greet() -> &'static str {"),
+        "deleted={deleted:?}\n{log}"
+    );
+    assert!(
+        inserted.contains("fn greet(name: &str) -> String {"),
+        "inserted={inserted:?}\n{log}"
+    );
+    assert!(
+        !deleted.contains("fn greet() -> &'static str {fn greet() -> &'static str {"),
+        "raw delete tokens should come from authored raw text, not synthesized RawLine plain text:\n{log}"
+    );
+    assert!(
+        !inserted.contains("fn greet(name: &str) -> String {fn greet(name: &str) -> String {"),
+        "raw insert tokens should come from authored raw text, not synthesized RawLine plain text:\n{log}"
+    );
+}
+
+#[test]
 fn same_visible_text_metadata_only_changes_stay_noop() {
     for case in [
         "95-link-target-changed-same-text",

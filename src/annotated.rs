@@ -229,6 +229,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             realized,
             Annotation {
                 semantic_kind: Some(SemanticKind::RawBlock),
+                patch_surface: (pre != realized).then_some(pre.clone()),
                 span: pre.span(),
                 ..Annotation::default()
             },
