@@ -575,6 +575,33 @@ impl ContainerOps for WrapperOps {
         }])
     }
 
+    fn map_slots(
+        &self,
+        _pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        let mut parts = parts.into_iter();
+        let part = parts.next()?;
+        if parts.next().is_some() || part.label != SlotStep::WrapperBody {
+            return None;
+        }
+
+        let path = direct_wrapper_body_path(realized)?;
+        let mut tree = anonymous_realized_tree(realized);
+        let realized_body = tree.get_path(&path)?.realized.clone();
+        let pre_content = normalize_list_item_runs(part.pre_content);
+        let replacement = annotate_realized(&pre_content, &realized_body);
+        replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
+            patch_surface: tree.realized,
+            children: tree.children,
+            slots: vec![SemanticSlot {
+                label: SlotStep::WrapperBody,
+                path,
+            }],
+        })
+    }
+
     fn replace_child(
         &self,
         content: &mut Content,
@@ -587,6 +614,16 @@ impl ContainerOps for WrapperOps {
         }
         None
     }
+}
+
+fn direct_wrapper_body_path(content: &Content) -> Option<Vec<usize>> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let mut path = direct_wrapper_body_path(&styled.child)?;
+        path.insert(0, 0);
+        return Some(path);
+    }
+
+    wrapper_kind_of(content).map(|_| vec![0])
 }
 
 pub(crate) fn map_container(

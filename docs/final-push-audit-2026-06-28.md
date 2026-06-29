@@ -350,3 +350,48 @@ Verification after the inherited-style fix:
 - The current fail-flip overview was regenerated at
   `output/pdf/corpus-flipped-to-fail-overview.pdf` and has 11 pages. Its
   pass-to-fail set is now `25`, `30`, `38`, `49`, and `87`.
+
+## 2026-06-29 Wrapper-Body Slot Follow-Up
+
+Corpus `39-fn-content-args-changed` exposed a more specific wrapper mapping bug
+after the broader wrapper ownership work: Definition 2 rendered the deleted
+body text but dropped the inserted body text. The old slot mapping could point
+`WrapperBody` at the first realized leaf under a wrapper body. In a body shaped
+like `*Definition* -- tree`, that made the slot too narrow: replacing the body
+only patched the leading styled label/leaf, while the rest of the realized body
+was no longer a complete local edit surface.
+
+The fix keeps wrapper slot ownership at the direct realized wrapper body:
+
+- bare wrappers map `WrapperBody` to `[0]`;
+- styled realized wrappers prefix through `StyledElem`, for example `[0, 0]`;
+- mapping stops at the wrapper body itself and never descends into leaf text or
+  block-text children;
+- the mapped child is annotated by pairing the authored wrapper body with the
+  realized wrapper body, then replacing that child in an anonymous realized
+  tree.
+
+Regression coverage now checks both corpus `39` and smaller wrapper shapes:
+
+- corpus `39` asserts modified deletions include `vertices`, `tree`, and
+  `connected`, modified insertions include `nodes`, `forest`, `collection`, and
+  `disjoint`, inserted `forest` is styled, and deleted `tree` is struck;
+- prefix/body and body/suffix `block[...]` replacements keep both sides;
+- nested block wrappers keep inserted body text;
+- repeated macro-generated wrappers keep the changed middle instance's
+  insertion without mentioning unchanged siblings;
+- two-paragraph wrapper bodies keep inserted text in the second paragraph.
+
+Verification after the wrapper-body slot fix:
+
+- `cargo test annotate_block_wrapper_body_slot_points_to_whole_body -- --nocapture`: pass.
+- `cargo test repeated_function_expansions_with_same_span_keep_their_own_content -- --nocapture`: pass.
+- `cargo test replacement_keeps -- --nocapture`: pass.
+- `cargo test wrapper -- --nocapture`: pass.
+- `cargo test`: pass, 140 library/unit tests, 71 integration tests, and doc
+  tests.
+- Corpus `39` debug output with `--debug -l` now includes
+  `inserted: forest | collection of disjoint acyclic graphs`.
+- A full corpus debug-log scan no longer reports corpus `39` among suspicious
+  one-sided replacement entries. The remaining one-sided entries are expected
+  pure insertion/deletion or split/merge cases.

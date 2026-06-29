@@ -500,6 +500,22 @@ FigureElem     FigureBody -> [0], FigureCaption -> [1]
 Wrapper(Box)   WrapperBody -> [0]
 ```
 
+Wrappers are single-slot containers, but their realized body may be wrapped by
+Typst styling before the actual wrapper element appears. `WrapperOps` therefore
+computes the direct realized wrapper-body path rather than reusing the generic
+leaf-path mapping:
+
+- bare realized wrappers use body path `[0]`;
+- styled realized wrappers prefix through each `StyledElem`, for example
+  `[0, 0]`;
+- the path stops at the wrapper body itself and never descends into a first
+  text leaf, paragraph child, or block child.
+
+That last rule is what keeps replacements over compound wrapper bodies
+well-formed. A body such as `*Definition* -- old text` must be tokenized as the
+whole body so the word diff can emit both the deleted `old` side and the
+inserted replacement side.
+
 Slot diff has two paths:
 
 ```mermaid

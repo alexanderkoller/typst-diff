@@ -474,6 +474,14 @@ document order, and each `framed(…)` invocation gets the body that
 The author of the bug fix described this commit message as "Fixed Corpus 39
 (same-span bug)"; the issue was open for three weeks.
 
+Corpus 39 later exposed a separate wrapper-body mapping failure. The same-span
+queue preserved the right repeated macro instances, but `WrapperBody` could
+still point at the first realized leaf under a block body instead of the whole
+direct body. That narrower path showed the deleted side of Definition 2 while
+dropping inserted body tokens such as `forest`. The current wrapper mapping
+fixes that by addressing the direct realized wrapper body (`[0]` for bare
+wrappers, `[0, 0]` through a styled wrapper) and stopping before leaf text.
+
 This is one of those bugs where the test name *is* the explanation. If you
 want to internalize the gotcha, read
 [`restore_preserved_consumes_same_span_values_in_order`](../src/eval.rs#L511-L526)

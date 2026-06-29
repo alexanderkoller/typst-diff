@@ -239,6 +239,7 @@ contract changes intentionally.
 | Every emitted semantic slot path resolves. | `slot_paths_resolve_in_changed_blocks_for_representative_corpus_cases` in `tests/integration.rs`; plus many slot-specific unit tests in `src/annotated.rs`. |
 | Changed-block edit paths are render-applicable. | `changed_block_edit_paths_resolve_for_representative_corpus_cases` in `tests/integration.rs`. |
 | Figure ownership noise does not steal or duplicate edits. | `figure_caption_slot_paths_ignore_realized_layout_scaffolding`, `figure_caption_add_delete_pair_by_semantic_owner_not_text`, and `ownership_noise_does_not_steal_figure_or_duplicate_caption_text` in `tests/integration.rs`. |
+| Wrapper body slots point to the whole direct realized body, not the first leaf. | `annotate_block_wrapper_body_slot_points_to_whole_body` in `src/annotated.rs`; `block_prefix_then_body_replacement_keeps_inserted_body`, `block_body_then_suffix_replacement_keeps_both_sides`, `nested_wrapper_body_replacement_keeps_both_sides`, `repeated_macro_wrappers_keep_changed_instance_insertions`, `wrapper_second_paragraph_replacement_keeps_inserted_text`, and corpus `39` coverage in `repeated_function_expansions_with_same_span_keep_their_own_content` in `tests/integration.rs`. |
 | Text-empty structural changes produce visible edits. | `text_empty_structural_visual_changes_produce_opaque_replacement` and `opaque_figure_body_and_caption_change_share_one_owner_block` in `tests/integration.rs`. |
 | Slot-level edits render inserted/deleted/modified content. | `edit_contract_guarantees_rendering_for_corpus_18/19/20` and related list/table tests in `tests/integration.rs`; targeted edit-application tests in `src/annotate.rs`. |
 | Page styles remain separated and correctly applied. | `style_partitioning_separates_page_and_non_page_styles` in `src/eval.rs`; page-region tests in `tests/integration.rs`. |
@@ -345,6 +346,14 @@ order is layout scaffolding and is not used as the slot map.
 For wrappers such as `box`, `block`, `align`, `pad`, `place`, `columns`,
 `rect`, `circle`, and `ellipse`, the slot is `WrapperBody`.
 
+Wrapper body paths have one extra guardrail. The slot points to the direct
+realized wrapper body, not to the first leaf under that body. A bare realized
+wrapper uses `[0]`; a styled realized wrapper prefixes through the style wrapper,
+for example `[0, 0]`. The mapping stops there. It does not descend into the
+first paragraph, strong label, or text node. This keeps a body like
+`*Definition* -- old text` as one local edit surface, so replacement tokenization
+can show both deleted and inserted words.
+
 Slots are the mechanism that lets a table cell or list item be diffed as the
 changed unit instead of treating the whole table or whole list as a single
 paragraph.
@@ -432,6 +441,11 @@ A patch surface should be understood as "the content tree we will patch and
 render for this node", while `realized` remains "the content Typst gave us."
 The long-term design direction should keep patch surfaces principled and tied
 to structural invariants, not to one-off visual repairs.
+
+For wrapper bodies, the principled patch surface is an anonymous realized tree
+whose direct body child has been re-annotated by pairing the authored wrapper
+body with that realized body. That preserves Typst's realized wrapper shape
+while ensuring `WrapperBody` addresses the complete body edit surface.
 
 A good patch surface preserves three things at once: the semantic slots being
 edited, the renderable container shape, and any layout boundary that Typst's

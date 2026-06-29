@@ -260,6 +260,38 @@ fn collect_modified_word_texts(blocks: &[typst_diff::diff::DiffBlockEdit]) -> (S
     (deleted.join(" | "), inserted.join(" | "))
 }
 
+fn diff_temp_sources(
+    old_source: &str,
+    new_source: &str,
+) -> (tempfile::TempDir, typst_diff::diff::DiffResult, Content) {
+    let (dir, old_world, new_world) = temp_worlds(old_source, new_source);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    (dir, result, annotated)
+}
+
+fn assert_modified_words_include(
+    result: &typst_diff::diff::DiffResult,
+    deleted_needles: &[&str],
+    inserted_needles: &[&str],
+) {
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    for needle in deleted_needles {
+        assert!(
+            deleted.contains(needle),
+            "expected deleted modified word {needle:?}; deleted={deleted:?}; inserted={inserted:?}"
+        );
+    }
+    for needle in inserted_needles {
+        assert!(
+            inserted.contains(needle),
+            "expected inserted modified word {needle:?}; deleted={deleted:?}; inserted={inserted:?}"
+        );
+    }
+}
+
 fn collect_region_modified_word_texts(
     regions: &[typst_diff::diff::DiffRegionEdit],
 ) -> (String, String) {
@@ -603,6 +635,60 @@ fn assert_edit_paths_resolve_for_base(
             }
             RealizedEdit::Append { content } | RealizedEdit::WholeBlock(content) => {
                 walk_content(content);
+            }
+        }
+    }
+}
+
+fn edit_content_or_nested_matches(
+    content: &typst_diff::diff::EditContent,
+    matches_content: fn(&typst_diff::diff::EditContent) -> bool,
+) -> bool {
+    if matches_content(content) {
+        return true;
+    }
+    if let typst_diff::diff::EditContent::Nested { edits, .. } = content {
+        return edits
+            .iter()
+            .any(|edit| realized_edit_content_or_nested_matches(edit, matches_content));
+    }
+    false
+}
+
+fn realized_edit_content_or_nested_matches(
+    edit: &typst_diff::diff::RealizedEdit,
+    matches_content: fn(&typst_diff::diff::EditContent) -> bool,
+) -> bool {
+    use typst_diff::diff::RealizedEdit;
+
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content) => {
+            edit_content_or_nested_matches(content, matches_content)
+        }
+    }
+}
+
+fn realized_edit_contains_replace_at_modified(edit: &typst_diff::diff::RealizedEdit) -> bool {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    match edit {
+        RealizedEdit::ReplaceAt {
+            content: EditContent::Modified { .. },
+            ..
+        } => true,
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content) => {
+            if let EditContent::Nested { edits, .. } = content {
+                edits.iter().any(realized_edit_contains_replace_at_modified)
+            } else {
+                false
             }
         }
     }
@@ -2399,7 +2485,7 @@ fn assert_alternating_header_page_layout(frame: &typst::layout::Frame, odd_page:
 
 #[test]
 fn header_footer_add_delete_change_are_page_region_edits() {
-    use typst_diff::diff::{EditContent, PageRegionKind, RealizedEdit, RegionPath};
+    use typst_diff::diff::{EditContent, PageRegionKind, RegionPath};
 
     fn has_region(name: &str, kind: PageRegionKind, matches_content: fn(&EditContent) -> bool) {
         let result = diff_annotated_corpus(name);
@@ -2409,13 +2495,10 @@ fn header_footer_add_delete_change_are_page_region_edits() {
             .find(|region| region.path == RegionPath::RootPage(kind))
             .unwrap_or_else(|| panic!("expected {kind:?} region for {name}"));
         assert!(
-            region.edits.iter().any(|edit| match edit {
-                RealizedEdit::WholeBlock(content)
-                | RealizedEdit::ReplaceAt { content, .. }
-                | RealizedEdit::InsertBefore { content, .. }
-                | RealizedEdit::InsertAfter { content, .. }
-                | RealizedEdit::Append { content } => matches_content(content),
-            }),
+            region
+                .edits
+                .iter()
+                .any(|edit| realized_edit_content_or_nested_matches(edit, matches_content)),
             "unexpected region edits for {name}"
         );
     }
@@ -2435,7 +2518,7 @@ fn header_footer_add_delete_change_are_page_region_edits() {
 
 #[test]
 fn grid_inside_header_uses_slot_level_region_edit() {
-    use typst_diff::diff::{EditContent, PageRegionKind, RealizedEdit, RegionPath};
+    use typst_diff::diff::{PageRegionKind, RealizedEdit, RegionPath};
 
     let (_dir, old_world, new_world) = temp_worlds(
         r#"#set page(header: grid(columns: (1fr, 1fr), [Old left], [Stable right]))
@@ -2456,13 +2539,10 @@ Body unchanged.
         .find(|region| region.path == RegionPath::RootPage(PageRegionKind::Header))
         .expect("expected header region edit");
     assert!(
-        header.edits.iter().any(|edit| matches!(
-            edit,
-            RealizedEdit::ReplaceAt {
-                content: EditContent::Modified { .. },
-                ..
-            }
-        )),
+        header
+            .edits
+            .iter()
+            .any(realized_edit_contains_replace_at_modified),
         "expected a slot-level replacement inside the header grid"
     );
     assert!(
@@ -2558,6 +2638,11 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
     assert!(log.contains("tree"), "{log}");
     assert!(log.contains("forest"), "{log}");
     assert!(!log.contains("spanning tree as a subgraph"), "{log}");
+    assert_modified_words_include(
+        &result,
+        &["vertices", "tree", "connected"],
+        &["nodes", "forest", "collection", "disjoint"],
+    );
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let annotated_plain = annotated.plain_text();
@@ -2570,6 +2655,14 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
         "{annotated_plain}"
     );
     assert!(annotated_plain.contains("Theorem"), "{annotated_plain}");
+    assert!(
+        text_has_any_style(&annotated, "forest"),
+        "inserted Definition 2 word should be styled in rendered annotated content: {annotated_plain:?}"
+    );
+    assert!(
+        text_is_struck(&annotated, "tree"),
+        "deleted Definition 2 word should be struck in rendered annotated content: {annotated_plain:?}"
+    );
     assert_eq!(
         annotated_plain.matches("Theorem").count(),
         1,
@@ -2579,6 +2672,107 @@ fn repeated_function_expansions_with_same_span_keep_their_own_content() {
 
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn block_prefix_then_body_replacement_keeps_inserted_body() {
+    let (_dir, result, annotated) = diff_temp_sources(
+        "#block[*Label* -- old body]\n",
+        "#block[*Label* -- new body]\n",
+    );
+
+    assert_modified_words_include(&result, &["old"], &["new"]);
+    assert!(text_has_any_style(&annotated, "new"));
+    assert!(text_is_struck(&annotated, "old"));
+}
+
+#[test]
+fn block_body_then_suffix_replacement_keeps_both_sides() {
+    let (_dir, result, annotated) = diff_temp_sources(
+        "#block[old body -- *Label*]\n",
+        "#block[new body -- *Label*]\n",
+    );
+
+    assert_modified_words_include(&result, &["old"], &["new"]);
+    assert!(text_has_any_style(&annotated, "new"));
+    assert!(text_is_struck(&annotated, "old"));
+}
+
+#[test]
+fn nested_wrapper_body_replacement_keeps_both_sides() {
+    let (_dir, result, annotated) = diff_temp_sources(
+        "#block[#block[*Definition* -- old text]]\n",
+        "#block[#block[*Definition* -- new text]]\n",
+    );
+
+    assert_modified_words_include(&result, &["old"], &["new"]);
+    assert!(text_has_any_style(&annotated, "new"));
+    assert!(text_is_struck(&annotated, "old"));
+}
+
+#[test]
+fn repeated_macro_wrappers_keep_changed_instance_insertions() {
+    let old = r#"
+#let card(title, body) = block(stroke: 0.5pt, inset: 6pt)[
+  *#title*
+
+  #body
+]
+
+#card("Alpha", [Ready for review.])
+
+#card("Beta", [Waiting for data.])
+
+#card("Gamma", [Scheduled for next week.])
+"#;
+    let new = r#"
+#let card(title, body) = block(stroke: 0.5pt, inset: 6pt)[
+  *#title*
+
+  #body
+]
+
+#card("Alpha", [Ready for review.])
+
+#card("Beta", [Waiting for approval.])
+
+#card("Gamma", [Scheduled for next week.])
+"#;
+    let (_dir, result, annotated) = diff_temp_sources(old, new);
+    let log = result.modification_log();
+
+    assert_modified_words_include(&result, &["data"], &["approval"]);
+    assert!(!log.contains("Alpha"), "{log}");
+    assert!(!log.contains("Gamma"), "{log}");
+    assert!(text_has_any_style(&annotated, "approval"));
+    assert!(text_is_struck(&annotated, "data"));
+}
+
+#[test]
+fn wrapper_second_paragraph_replacement_keeps_inserted_text() {
+    let old = r#"
+#block[
+  *Label*
+
+  First paragraph remains stable.
+
+  Old second paragraph explains the baseline.
+]
+"#;
+    let new = r#"
+#block[
+  *Label*
+
+  First paragraph remains stable.
+
+  New second paragraph explains the revision.
+]
+"#;
+    let (_dir, result, annotated) = diff_temp_sources(old, new);
+
+    assert_modified_words_include(&result, &["Old", "baseline"], &["New", "revision"]);
+    assert!(text_has_any_style(&annotated, "revision"));
+    assert!(text_is_struck(&annotated, "baseline"));
 }
 
 #[test]

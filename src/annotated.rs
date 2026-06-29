@@ -1045,6 +1045,33 @@ mod tests {
     }
 
     #[test]
+    fn annotate_block_wrapper_body_slot_points_to_whole_body() {
+        use typst::layout::{BlockBody, BlockElem};
+        use typst::model::StrongElem;
+
+        let body = seq([
+            Content::new(StrongElem::new(text("Label"))),
+            text(" -- changed body"),
+        ]);
+        let block = Content::new(BlockElem::new().with_body(Some(BlockBody::Content(body))));
+        let node = annotate_realized(&block, &block);
+
+        assert_eq!(
+            node.annotation.semantic_kind,
+            Some(SemanticKind::Wrapper(WrapperKind::Block))
+        );
+        assert_eq!(node.annotation.slots.len(), 1);
+        assert_eq!(node.annotation.slots[0].label, SlotStep::WrapperBody);
+        assert_eq!(node.annotation.slots[0].path, vec![0]);
+        assert_eq!(
+            node.get_path(&node.annotation.slots[0].path)
+                .unwrap()
+                .plain_text(),
+            "Label -- changed body"
+        );
+    }
+
+    #[test]
     fn annotate_empty_list_has_kind_list_and_zero_slots() {
         use typst::model::ListElem;
         let pre = Content::new(ListElem::new(vec![]));

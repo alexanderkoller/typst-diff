@@ -87,6 +87,12 @@ document order." It works for many containers because tests keep the realized
 shape aligned, but it is fragile for tables/grids with headers, footers,
 spans, gutters, or non-cell children.
 
+Wrappers now have an explicit exception to this pressure point:
+`WrapperOps::map_slots` maps `WrapperBody` to the direct realized wrapper body
+and does not descend to the first leaf. That addresses the corpus `39`
+replacement-tokenization bug, but the generic leaf-path concern still applies
+to other container families until they own similarly explicit path semantics.
+
 Suggested direction:
 
 - Keep `ContainerOps` as the single owner, but make each container responsible
