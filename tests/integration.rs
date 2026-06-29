@@ -2305,6 +2305,8 @@ fn opaque_wrapper_changes_are_reported_once() {
         "58-stack-changed",
         "60-rect-changed",
         "61-circle-changed",
+        "62-ellipse-changed",
+        "93-math-diagram-plot-changed",
         "56-place-changed",
     ] {
         let result = diff_annotated_corpus(name);
@@ -2324,30 +2326,91 @@ fn opaque_wrapper_change_renders_only_the_annotated_replacement() {
     let cases = [
         (
             "54-align-changed",
+            Some("Old New centered announcement for the review board."),
             "New centered announcement for the review board.",
         ),
-        ("55-pad-changed", "New padded note for readers."),
+        (
+            "55-pad-changed",
+            Some("Old New padded note for readers."),
+            "New padded note for readers.",
+        ),
         (
             "57-columns-changed",
+            Some("Old New first column text for comparison."),
             "New first column text for comparison.",
         ),
-        ("58-stack-changed", "New stacked item"),
-        ("60-rect-changed", "New rectangle label"),
-        ("61-circle-changed", "New circle label"),
-        ("62-ellipse-changed", "New ellipse label"),
-        ("103-repeated-macro-containers-with-one-edit", "approval"),
-        ("105-paragraph-split-inside-wrapper", "It also has"),
+        (
+            "56-place-changed",
+            Some("Old New placed label"),
+            "New placed label",
+        ),
+        (
+            "58-stack-changed",
+            Some("Old New stacked item"),
+            "New stacked item",
+        ),
+        (
+            "60-rect-changed",
+            Some("Old New rectangle label"),
+            "New rectangle label",
+        ),
+        (
+            "61-circle-changed",
+            Some("Old New circle label"),
+            "New circle label",
+        ),
+        (
+            "62-ellipse-changed",
+            Some("Old New ellipse label"),
+            "New ellipse label",
+        ),
+        (
+            "93-math-diagram-plot-changed",
+            Some("Old New trend"),
+            "New trend",
+        ),
+        (
+            "103-repeated-macro-containers-with-one-edit",
+            None,
+            "approval",
+        ),
+        ("105-paragraph-split-inside-wrapper", None, "It also has"),
     ];
 
-    for (name, new_surface) in cases {
+    for (name, modified_surface, new_surface) in cases {
         let annotated = annotated_tree_corpus(name);
         let text = annotated.plain_text();
 
-        assert_eq!(
-            text.matches(new_surface).count(),
-            1,
-            "{name} should not render both a plain new copy and a diff copy:\n{text}"
-        );
+        if let Some(modified_surface) = modified_surface {
+            assert_eq!(
+                text.matches(modified_surface).count(),
+                1,
+                "{name} should render the word-level replacement surface exactly once:\n{text}"
+            );
+            let new_world = corpus_world(&format!("{name}/new.typ"));
+            let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+            let rendered_text = rendered_text_runs(&document.pages[0].frame)
+                .into_iter()
+                .map(|run| run.text)
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(
+                rendered_text.matches(modified_surface).count(),
+                1,
+                "{name} should render the word-level replacement surface exactly once in the laid-out frame:\n{rendered_text}"
+            );
+            assert_eq!(
+                rendered_text.matches(new_surface).count(),
+                1,
+                "{name} should not render both an annotated replacement and a plain new copy in the laid-out frame:\n{rendered_text}"
+            );
+        } else {
+            assert_eq!(
+                text.matches(new_surface).count(),
+                1,
+                "{name} should not render both a plain new copy and a diff copy:\n{text}"
+            );
+        }
     }
 }
 

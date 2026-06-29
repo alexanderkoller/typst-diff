@@ -2618,11 +2618,14 @@ fn diff_annotated_inner_with_events(
                 let page_styles = new_block.page_styles.clone();
                 let old_eq_origins = old_equation_origins.take_for(&old_block.content);
                 let new_eq_origins = new_equation_origins.take_for(&new_block.content);
-                let old_ann = old_owners
-                    .take_owner_for(&old_block.content)
+                let old_claim = old_owners.take_claim_for(&old_block.content);
+                let new_claim = new_owners.take_claim_for(&new_block.content);
+                let new_claim_key = new_claim.key.clone();
+                let old_ann = old_claim
+                    .owner
                     .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
-                let new_ann = new_owners
-                    .take_owner_for(&new_block.content)
+                let new_ann = new_claim
+                    .owner
                     .or_else(|| find_nonempty_annotated_child(new, &new_block.content));
                 emit_pipeline_trace_event(
                     debug_events,
@@ -2639,18 +2642,16 @@ fn diff_annotated_inner_with_events(
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
-                    if new_block.content.plain_text().is_empty() {
-                        let recursed_key = semantic_edit_claim_key(new_ann);
-                        if !recursed_equal_semantic_nodes.insert(recursed_key) {
-                            blocks.push(DiffBlockEdit {
-                                base: annotated_block_from(&new_block.content, None),
-                                edits: vec![],
-                                page_styles,
-                            });
-                            continue;
-                        }
+                    if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim_key) {
+                        blocks.push(DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, None),
+                            edits: vec![],
+                            page_styles,
+                        });
+                        continue;
                     }
                     if annotated_subtree_equal(old_ann, new_ann) {
+                        mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim_key);
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, None),
                             edits: vec![],
@@ -2661,6 +2662,7 @@ fn diff_annotated_inner_with_events(
                     let mut edits = footnote_visible_text_edits(old_ann, new_ann);
                     edits.extend(diff_slot_edits_with_events(old_ann, new_ann, debug_events)?);
                     if !edits.is_empty() {
+                        mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim_key);
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
                             edits,
@@ -2671,6 +2673,7 @@ fn diff_annotated_inner_with_events(
                     if new_block.content.plain_text().is_empty()
                         && let Some(edit) = owned_surface_modified_edit(old_ann, new_ann)
                     {
+                        mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim_key);
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
                             edits: vec![edit],
@@ -2798,6 +2801,11 @@ fn diff_annotated_inner_with_events(
                         )?;
                         let new_claim = new_owners.take_claim_for(&new_block.content);
                         let new_eq_origins = new_equation_origins.take_for(&new_block.content);
+                        if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
+                            blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
+                            op_index += 1;
+                            continue;
+                        }
                         blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
                         blocks.push(replace_block_edit(
                             old,
@@ -2846,12 +2854,18 @@ fn diff_annotated_inner_with_events(
             BlockOp::Replace(old_block, new_block) => {
                 let old_eq_origins = old_equation_origins.take_for(&old_block.content);
                 let new_eq_origins = new_equation_origins.take_for(&new_block.content);
-                let old_ann = old_owners
-                    .take_owner_for(&old_block.content)
+                let old_claim = old_owners.take_claim_for(&old_block.content);
+                let new_claim = new_owners.take_claim_for(&new_block.content);
+                let old_ann = old_claim
+                    .owner
                     .or_else(|| find_annotated_block_owner(old, &old_block.content));
-                let new_ann = new_owners
-                    .take_owner_for(&new_block.content)
+                let new_ann = new_claim
+                    .owner
                     .or_else(|| find_annotated_block_owner(new, &new_block.content));
+                if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
+                    blocks.extend(layout.take_before(&new_block.content, new_ann));
+                    continue;
+                }
                 blocks.extend(layout.take_before(&new_block.content, new_ann));
                 blocks.push(replace_block_edit(
                     old,
@@ -2956,6 +2970,9 @@ fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
     for block in &mut *blocks {
         if previous_wrapper_text_edit && block.base.realized.plain_text().is_empty() {
             retain_block_edits(block, |edit| !edit_is_opaque_replacement(edit));
+            if block.edits.is_empty() {
+                suppress_block_surface(block);
+            }
         }
         previous_wrapper_text_edit =
             is_owned_empty_wrapper_edit_block(block) && block_has_modified_signature(block);
@@ -4762,14 +4779,17 @@ fn slot_labels_owned(node: &AnnotatedContent) -> Vec<SlotStep> {
         .collect()
 }
 
-fn semantic_edit_claim_key(node: &AnnotatedContent) -> String {
-    format!(
-        "{:?}|{:?}|{}|{}",
-        node.annotation.semantic_kind,
-        slot_labels(node),
-        effective_text_content(node).plain_text(),
-        content_signature(&effective_render_content(node))
-    )
+fn owner_already_recursed(
+    recursed: &HashSet<SemanticOwnerKey>,
+    key: &Option<SemanticOwnerKey>,
+) -> bool {
+    key.as_ref().is_some_and(|key| recursed.contains(key))
+}
+
+fn mark_recursed_owner(recursed: &mut HashSet<SemanticOwnerKey>, key: &Option<SemanticOwnerKey>) {
+    if let Some(key) = key {
+        recursed.insert(key.clone());
+    }
 }
 
 fn resolved_slots(node: &AnnotatedContent) -> Vec<(&SemanticSlot, &AnnotatedContent)> {
