@@ -124,10 +124,36 @@ blue. This reduces visual noise when many individual words change at once.
 - **Math equations** are atomic. Changes inside an equation appear as a
   whole-expression delete + insert. Deleted equations are rendered with Typst's
   `math.cancel` mark.
-- **Code blocks** are atomic. Changes appear as a whole-block delete + insert.
+- **Code blocks** are line-diffed, not word-diffed. Changed lines appear as
+  deleted old lines plus inserted new lines; typst-diff does not currently
+  highlight individual token changes inside a code line.
 - **Opaque visuals** such as raw graphics, SVGs, and text-empty shapes are not
   diffed word-by-word. Structural visual changes are shown as an old visual
   replacement framed in red plus a new visual replacement framed in green.
+- **Document styles can override edit colours.** typst-diff represents
+  insertions and deletions by adding Typst styles to the annotated content, then
+  renders the result as a normal Typst document. Page styles and show rules in
+  the document can still win in the final cascade, so an edit may be detected
+  but not appear with the expected red/green fill. Page background content,
+  styled headings, styled strong text, and styled figure captions can recolor or
+  otherwise restyle the annotation output. Check `diff/final-edits.yml` or
+  `output/annotated-content.yml` with `--debug` to distinguish a missed edit from
+  an edit whose visual colour was overridden.
+- **Context-opaque package or function output** can hide changed text from the
+  semantic diff. typst-diff works on Typst's evaluated and realized `Content`
+  tree; if a package macro or user-defined function returns `context`-dependent
+  content whose visible body is not exposed as ordinary realized `Content`, the
+  diff may see only empty `context`, `tag`, or layout artifacts and produce no
+  edit. This is known to affect packages such as `@preview/showybox`, where box
+  body text changes can be hidden behind `context` expansion; see the
+  [technical example](docs/technical.md#context-opaque-body-content) for the
+  general shape. This does not mean
+  all `context` usage is unsupported: direct body `context` for state, counters,
+  or references can still diff correctly when the realized text appears in the
+  content tree. To diagnose this class of issue, run with `--debug` or
+  `--debug-trace` and inspect `normalized.yml`, `realized-tree.yml`, and
+  `final-edits.yml` for empty `plain_text`, missing slots, or
+  `changed_block_count: 0`.
 - **Ambiguous footnote identity** is not guessed. If one version has a different
   number of authored footnotes in the same paragraph, typst-diff treats the
   bodies as separate inserted and deleted footnotes instead of matching them by

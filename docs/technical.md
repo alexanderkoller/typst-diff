@@ -160,6 +160,51 @@ The realized pipeline is heavier but produces more accurate diffs for documents
 that use Typst's document structure features (chapter counters, auto-generated
 headings, etc.).
 
+#### Context-opaque body content
+
+One important limitation of this pipeline is context-opaque body content.
+Functions and packages that return normal content or recognized containers
+(`block`, `box`, `rect`, `figure`, tables, lists, and similar slot-bearing
+structures) usually remain diffable because annotation can attach semantic
+owners and slots to the realized tree. By contrast, if meaningful body text is
+produced only by evaluating a `context` thunk, the tree visible to typst-diff
+may contain empty `context` nodes, tags, or layout artifacts rather than the
+ordinary text/content children that block and word diffing consume. In that
+case the old and new realized blocks can compare as unchanged or text-empty, so
+no recursive slot diff or word diff is produced.
+
+This is not a blanket limitation on `context`. Direct body contexts, such as
+state/counter/reference text, can still work when realization leaves the final
+text in the `Content` tree. The risky shape is a wrapper whose meaningful body
+is only produced inside a context-dependent expansion, for example:
+
+```typst
+#let contextual-card(title, body) = context {
+  // Layout/state/query-dependent code decides how to build the box.
+  // The returned document node may remain an empty `context` from the
+  // semantic Content tree's point of view.
+  block(stroke: 0.5pt, inset: 6pt)[
+    *#title*
+
+    #body
+  ]
+}
+
+#contextual-card("Goal")[
+  This body text changes between document versions.
+]
+```
+
+If realization exposes the final `block[...]` and its text children, this is
+diffable. If it leaves typst-diff with an empty `context`/layout artifact
+instead, the body has no slot-bearing owner and no visible `plain_text` for the
+block or word diff. Packages such as `@preview/showybox` can produce this kind
+of shape: changed box body text may be hidden behind `context` expansion. When
+diagnosing similar cases, run with `--debug` or `--debug-trace` and compare
+`old/normalized.yml`, `old/realized-tree.yml`, `new/realized-tree.yml`, and
+`diff/final-edits.yml` for empty `plain_text`, missing slots, or
+`changed_block_count: 0`.
+
 ### annotated and container_ops
 
 `annotated.rs` defines `AnnotatedContent`: Typst's realized content plus
@@ -432,7 +477,7 @@ Within `collect_blocks_from_children`, each child is classified:
 | `SequenceElem` that is inline-only | Accumulated into current paragraph |
 | `SequenceElem` with block children | Recurse (`collect_blocks_from_children`) |
 | `ParbreakElem` | Flush paragraph; emit as its own `DiffBlock` |
-| `HeadingElem`, `RawElem`, display `EquationElem` | Flush paragraph; emit as atomic block |
+| `HeadingElem`, `RawElem`, display `EquationElem` | Flush paragraph; emit as a standalone block unit |
 | `TableElem` | Flush paragraph; emit as atomic block; cell bodies are handled later by table-specific replacement logic |
 | Known inline nodes | Append to current paragraph |
 | Unknown nodes | Flush paragraph; emit as atomic block |
@@ -707,6 +752,17 @@ If no suitable container is found (e.g. a `HeadingElem` without a bare inner
 sequence), `replace_text_container` returns `None` and the annotated content is
 used directly without structural wrapping.
 
+The red/green/blue annotation styles are ordinary Typst styles, not a renderer
+overlay. They are inserted into the `Content` tree and then passed back through
+Typst layout. Document-authored page styles and show rules can therefore take
+precedence over the diagnostic fill or restructure the edited content after the
+edit script has been applied. Corpus cases 85, 86, 88, and 89 demonstrate this
+class: page background content, heading show rules, strong-text show rules, and
+figure-caption show rules can make a detected edit render without the expected
+red/green colour. In those cases, `diff/final-edits.yml` and
+`output/annotated-content.yml` are the right debug artifacts for separating
+"edit not detected" from "edit detected but restyled by the document."
+
 **Page-style grouping:** Blocks are batched by `page_styles` identity. Whenever
 `page_styles` changes between consecutive blocks, the accumulated batch is
 wrapped with `Content::sequence(...).styled_with_map(page_styles)` and added to
@@ -859,13 +915,31 @@ word-diffed). Inline equations are atomic tokens. Changes inside equations are
 shown as whole-equation delete + insert. Deleted equations use Typst's
 `math.cancel` element instead of text strikethrough.
 
-**Code blocks (`RawElem`):** Treated as atomic blocks. Source-level changes
-inside code blocks are shown as whole-block delete + insert.
+**Code blocks (`RawElem`):** Extracted as standalone block units, then diffed
+line-by-line when both sides are raw blocks. Changed lines are shown as deleted
+old lines plus inserted new lines; individual token changes inside a line are
+not word-diffed.
 
 **Opaque visual granularity:** Text-empty structural changes are shown as an
 old/new visual replacement. typst-diff does not attempt word-level or
 geometry-level diffs inside raw graphics, SVGs, shapes, or opaque package
 output.
+
+**Context-opaque content:** Package macros or user-defined functions whose
+visible body is produced only through `context` evaluation may leave the
+inspected tree with empty `context`/layout artifacts rather than ordinary
+realized text or semantic slots. Changes inside those bodies can be missed.
+For example, a context-dependent card/box function can hide its body text if
+realization does not expose the final box content as ordinary `Content`.
+Packages such as `@preview/showybox` can exhibit this behavior. Direct `context`
+in document body is not inherently unsupported; it remains diffable when
+realization exposes the final text as ordinary `Content`.
+
+**Document styles can override annotation colours:** Inserted/deleted/modified
+content is marked with ordinary Typst fill and strikethrough styles before the
+final Typst render. Later page styles or show rules can recolor or restyle that
+content, so a detected edit may not appear red or green in the PDF. Known
+examples are corpus cases 85, 86, 88, and 89.
 
 **Slot insertion/deletion ambiguity:** Changed slot labels are handled by LCS
 over slot text. This keeps ordinary item/caption/cell insertions localized, but
