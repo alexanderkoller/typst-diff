@@ -154,6 +154,20 @@ blue. This reduces visual noise when many individual words change at once.
   `--debug-trace` and inspect `normalized.yml`, `realized-tree.yml`, and
   `final-edits.yml` for empty `plain_text`, missing slots, or
   `changed_block_count: 0`.
+- **Some show-rule-generated body text is not yet diffed as authored text.**
+  typst-diff expands show rules through Typst's evaluated and realized content
+  pipeline, and many show-rule changes are visible there. However, some text
+  created only during final layout can be absent from the realized `Content`
+  tree used for semantic diffing. For example, a custom
+  `#show figure.caption` rule that changes a visible caption prefix from
+  `Figure:` to `Exhibit:` may typeset the new prefix, while the semantic diff
+  can still see only the underlying caption body and Typst's caption object
+  metadata. In those cases typst-diff does not currently have a general,
+  provenance-tracked way to attribute the rendered layout text back to the
+  owning semantic slot, so it may omit the show-rule-generated prefix edit or
+  fall back to less precise caption-object text. Use `--debug` or
+  `--debug-trace` and compare `realized-tree.yml` with the rendered output when
+  diagnosing this class of issue.
 - **Ambiguous footnote identity** is not guessed. If one version has a different
   number of authored footnotes in the same paragraph, typst-diff treats the
   bodies as separate inserted and deleted footnotes instead of matching them by

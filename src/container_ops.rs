@@ -19,6 +19,7 @@ use typst::model::{
     EnumElem, EnumItem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem, ListElem, ListItem,
     ParElem, ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermsElem,
 };
+use typst::text::StrikeElem;
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +55,7 @@ impl ContainerKind {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SlotPart {
     pub(crate) label: SlotStep,
     pub(crate) pre_content: Content,
@@ -472,6 +474,11 @@ impl ContainerOps for FigureOps {
     ) -> Option<()> {
         let figure = content.to_packed_mut::<FigureElem>()?;
         if index == 0 && !before && figure.caption.get_cloned(StyleChain::default()).is_none() {
+            let insertion = unwrap_figure_caption_payload(insertion);
+            if contains_strike(&insertion) {
+                figure.body = Content::sequence([figure.body.clone(), insertion]);
+                return Some(());
+            }
             figure
                 .caption
                 .set(Some(Packed::new(FigureCaption::new(insertion))));
@@ -483,7 +490,7 @@ impl ContainerOps for FigureOps {
     fn map_slots(
         &self,
         pre_container: &Content,
-        _realized: &Content,
+        realized: &Content,
         parts: Vec<SlotPart>,
     ) -> Option<SlotMapping> {
         // Figure slots are authored positions on FigureElem; realized v/caption
@@ -492,12 +499,65 @@ impl ContainerOps for FigureOps {
         if paths.len() != parts.len() {
             return None;
         }
+        if let Some(mapping) = map_figure_realized_patch_surface(realized, parts.clone()) {
+            return Some(mapping);
+        }
         Some(map_explicit_patch_surface(
             pre_container.clone(),
             parts,
             paths,
         ))
     }
+}
+
+fn unwrap_figure_caption_payload(content: Content) -> Content {
+    let mut content = content;
+
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return caption.body.clone();
+    }
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        styled.child = unwrap_figure_caption_payload(styled.child.clone());
+        return content;
+    }
+
+    if let Some(strike) = content.to_packed_mut::<StrikeElem>() {
+        strike.body = unwrap_figure_caption_payload(strike.body.clone());
+        return content;
+    }
+
+    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
+        seq.children = seq
+            .children
+            .iter()
+            .cloned()
+            .map(unwrap_figure_caption_payload)
+            .collect();
+        return content;
+    }
+
+    content
+}
+
+fn contains_strike(content: &Content) -> bool {
+    if content.is::<StrikeElem>() {
+        return true;
+    }
+
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return contains_strike(&styled.child);
+    }
+
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq.children.iter().any(contains_strike);
+    }
+
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return contains_strike(&caption.body);
+    }
+
+    false
 }
 
 impl ContainerOps for QuoteOps {
@@ -562,6 +622,7 @@ impl ContainerOps for WrapperOps {
             slots: vec![SemanticSlot {
                 label: SlotStep::WrapperBody,
                 path,
+                patch_path: None,
             }],
         })
     }
@@ -807,6 +868,7 @@ fn map_slot_parts(
             slots.push(SemanticSlot {
                 label: part.label,
                 path,
+                patch_path: None,
             });
         }
     }
@@ -830,6 +892,140 @@ fn figure_slot_paths(parts: &[SlotPart]) -> Vec<Vec<usize>> {
     paths
 }
 
+fn map_figure_realized_patch_surface(
+    realized: &Content,
+    parts: Vec<SlotPart>,
+) -> Option<SlotMapping> {
+    let caption_path = find_realized_figure_caption_path(realized)?;
+    let body_part = parts
+        .iter()
+        .find(|part| matches!(part.label, SlotStep::FigureBody))?;
+    let body_path = find_realized_figure_body_path(
+        realized,
+        &caption_path,
+        &normalize_list_item_runs(body_part.pre_content.clone()),
+    )?;
+
+    let tree = anonymous_realized_tree(realized);
+    let mut children = Vec::new();
+    let mut slots = Vec::new();
+    for (index, part) in parts.into_iter().enumerate() {
+        let (path, patch_path) = match part.label {
+            SlotStep::FigureBody => (vec![index], Some(body_path.clone())),
+            SlotStep::FigureCaption => (vec![index], Some(caption_path.clone())),
+            _ => return None,
+        };
+        let realized_child = patch_path
+            .as_ref()
+            .and_then(|path| tree.get_path(path).map(|child| child.realized.clone()))
+            .unwrap_or_else(|| part.pre_content.clone());
+        let pre_content = normalize_list_item_runs(part.pre_content);
+        children.push(annotate_realized(&pre_content, &realized_child));
+        slots.push(SemanticSlot {
+            label: part.label,
+            path,
+            patch_path,
+        });
+    }
+
+    Some(SlotMapping {
+        patch_surface: realized.clone(),
+        children,
+        slots,
+    })
+}
+
+fn find_realized_figure_caption_path(content: &Content) -> Option<Vec<usize>> {
+    find_realized_path(content, &mut |child| child.is::<FigureCaption>())
+}
+
+fn find_realized_figure_body_path(
+    content: &Content,
+    caption_path: &[usize],
+    pre_body: &Content,
+) -> Option<Vec<usize>> {
+    if let Some(path) = find_realized_slot_surface_path(content, caption_path, pre_body) {
+        return Some(path);
+    }
+
+    collect_leaf_block_child_paths(content)
+        .into_iter()
+        .filter(|path| !path_is_under(path, caption_path))
+        .find(|path| {
+            content_at_realized_path(content, path)
+                .is_some_and(|child| !child.is::<ParbreakElem>() && child.func().name() != "v")
+        })
+}
+
+fn find_realized_slot_surface_path(
+    content: &Content,
+    exclude_path: &[usize],
+    pre_slot: &Content,
+) -> Option<Vec<usize>> {
+    let pre_kind = ContainerKind::of(pre_slot)?;
+    find_realized_descendant_path_outside(content, exclude_path, &mut |child| {
+        ContainerKind::of(child).as_ref() == Some(&pre_kind)
+    })
+}
+
+fn path_is_under(path: &[usize], ancestor: &[usize]) -> bool {
+    !ancestor.is_empty() && path.starts_with(ancestor)
+}
+
+fn find_realized_descendant_path_outside(
+    content: &Content,
+    exclude_path: &[usize],
+    predicate: &mut impl FnMut(&Content) -> bool,
+) -> Option<Vec<usize>> {
+    fn walk(
+        content: &Content,
+        prefix: &[usize],
+        exclude_path: &[usize],
+        predicate: &mut impl FnMut(&Content) -> bool,
+    ) -> Option<Vec<usize>> {
+        for (index, child) in realized_child_contents(content).into_iter().enumerate() {
+            let mut path = prefix.to_vec();
+            path.push(index);
+            if path_is_under(&path, exclude_path) {
+                continue;
+            }
+            if predicate(&child) {
+                return Some(path);
+            }
+            if let Some(found) = walk(&child, &path, exclude_path, predicate) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    walk(content, &[], exclude_path, predicate)
+}
+
+fn find_realized_path(
+    content: &Content,
+    predicate: &mut impl FnMut(&Content) -> bool,
+) -> Option<Vec<usize>> {
+    if predicate(content) {
+        return Some(vec![]);
+    }
+    for (index, child) in realized_child_contents(content).into_iter().enumerate() {
+        if let Some(mut path) = find_realized_path(&child, predicate) {
+            path.insert(0, index);
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn content_at_realized_path(content: &Content, path: &[usize]) -> Option<Content> {
+    let mut current = content.clone();
+    for index in path {
+        current = realized_child_contents(&current).get(*index)?.clone();
+    }
+    Some(current)
+}
+
 fn map_explicit_patch_surface(
     patch_surface: Content,
     parts: Vec<SlotPart>,
@@ -845,6 +1041,7 @@ fn map_explicit_patch_surface(
             slots.push(SemanticSlot {
                 label: part.label,
                 path,
+                patch_path: None,
             });
         }
     }
@@ -889,6 +1086,7 @@ fn map_unique_partial_item_container(
         slots: vec![SemanticSlot {
             label: part.label,
             path,
+            patch_path: None,
         }],
     })
 }

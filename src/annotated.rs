@@ -169,6 +169,7 @@ pub enum SlotStep {
 pub struct SemanticSlot {
     pub label: SlotStep,
     pub path: Vec<usize>,
+    pub patch_path: Option<Vec<usize>>,
 }
 
 #[derive(Clone)]
@@ -197,6 +198,25 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             realized: realized.clone(),
             annotation: Annotation {
                 patch_surface: patch_surface.filter(|surface| surface != realized),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+            children: inner.children,
+        };
+    }
+
+    // Symmetric root/wrapper mismatch: normalization can leave the pre tree
+    // styled while realization has already pushed or discarded that wrapper.
+    // Treat the pre-only style wrapper as transparent so semantic children are
+    // still recovered from the authored body.
+    if let Some(styled) = pre.to_packed::<StyledElem>()
+        && realized.to_packed::<StyledElem>().is_none()
+    {
+        let inner = annotate_realized(&styled.child, realized);
+        return AnnotatedContent {
+            realized: realized.clone(),
+            annotation: Annotation {
+                patch_surface: inner.annotation.patch_surface,
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -455,6 +475,7 @@ fn annotate_footnote_element(pre: &Content, realized: &Content) -> AnnotatedCont
             slots: vec![SemanticSlot {
                 label: SlotStep::FootnoteBody,
                 path: vec![0],
+                patch_path: None,
             }],
             span: pre.span(),
             ..Annotation::default()
@@ -507,6 +528,7 @@ fn collect_promoted_footnote_slots(
             out.push(SemanticSlot {
                 label: SlotStep::FootnoteBody,
                 path: slot_path,
+                patch_path: None,
             });
         }
     }

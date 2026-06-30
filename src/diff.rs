@@ -33,7 +33,8 @@ use typst::layout::{
 };
 use typst::math::EquationElem;
 use typst::model::{
-    EmphElem, FootnoteBody, FootnoteElem, HeadingElem, LinkElem, ParElem, ParbreakElem, StrongElem,
+    EmphElem, FigureCaption, FootnoteBody, FootnoteElem, HeadingElem, LinkElem, ParElem,
+    ParbreakElem, StrongElem,
 };
 use typst::text::{
     HighlightElem, OverlineElem, RawElem, SpaceElem, StrikeElem, SubElem, SuperElem, TextElem,
@@ -655,6 +656,8 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
         let before = out.len();
         collect_tokens(&heading.body, out);
         wrap_tokens_with_context(content, before, out);
+    } else if let Some(caption) = content.to_packed::<FigureCaption>() {
+        collect_tokens(&caption.body, out);
     } else if let Some(link) = content.to_packed::<LinkElem>() {
         collect_tokens(&link.body, out);
     } else if let Some(equation) = content.to_packed::<EquationElem>() {
@@ -708,6 +711,8 @@ fn collect_tokens_with_equation_origins<'a>(
         let before = out.len();
         collect_tokens_with_equation_origins(&heading.body, origins, out);
         wrap_tokens_with_context(content, before, out);
+    } else if let Some(caption) = content.to_packed::<FigureCaption>() {
+        collect_tokens_with_equation_origins(&caption.body, origins, out);
     } else if let Some(link) = content.to_packed::<LinkElem>() {
         collect_tokens_with_equation_origins(&link.body, origins, out);
     } else if let Some(block) = content.to_packed::<BlockElem>() {
@@ -797,6 +802,10 @@ fn inline_token_content_for_diff(content: &Content, text: &str) -> Content {
 
     if let Some(heading) = content.to_packed::<HeadingElem>() {
         return inline_token_content_for_diff(&heading.body, text);
+    }
+
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return inline_token_content_for_diff(&caption.body, text);
     }
 
     if let Some(block) = content.to_packed::<BlockElem>()
@@ -1507,6 +1516,10 @@ fn collect_word_op_text(word_ops: &[WordOp], select: fn(&WordOp) -> Option<&Vec<
 }
 
 fn content_log_text(content: &Content) -> String {
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return content_log_text(&caption.body);
+    }
+
     let plain = content.plain_text();
     if plain.chars().any(|ch| !ch.is_whitespace()) {
         return plain.to_string();
@@ -1890,7 +1903,7 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
                     index,
                     "modify",
                     &[
-                        ("block", content_log_text(base)),
+                        ("block", modified_block_log_text(base, word_ops)),
                         ("deleted", deletes),
                         ("inserted", inserts),
                     ],
@@ -1903,6 +1916,19 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
             }
         }
     }
+}
+
+fn modified_block_log_text(base: &Content, word_ops: &[WordOp]) -> String {
+    if base.is::<FigureCaption>() {
+        let text = collect_word_op_text(word_ops, |op| match op {
+            WordOp::Equal(tokens) | WordOp::Insert(tokens) => Some(tokens),
+            WordOp::Delete(_) => None,
+        });
+        if text.chars().any(|ch| !ch.is_whitespace()) {
+            return text;
+        }
+    }
+    content_log_text(base)
 }
 
 fn prepare_diff_inputs(
@@ -5082,7 +5108,7 @@ fn push_deleted_child_sequence_edit(
     new_children: &[(usize, &AnnotatedContent)],
     new_index: usize,
 ) {
-    let content = deleted_edit(effective_render_content(old_child));
+    let content = deleted_edit(effective_text_content(old_child));
     if let Some((path_index, _)) = new_children.get(new_index) {
         edits.push(RealizedEdit::InsertBefore {
             anchor: vec![*path_index],
@@ -5824,7 +5850,7 @@ fn push_deleted_slot_edit(
     new_slots: &[(&SemanticSlot, &AnnotatedContent)],
     new_index: usize,
 ) {
-    let content = deleted_edit(effective_text_content(old_child));
+    let content = deleted_edit(effective_render_content(old_child));
     if let Some((slot, _)) = new_slots.get(new_index) {
         edits.push(RealizedEdit::InsertBefore {
             anchor: slot.path.clone(),
@@ -5946,6 +5972,7 @@ mod tests {
                     slots: vec![SemanticSlot {
                         label: SlotStep::WrapperBody,
                         path: vec![0],
+                        patch_path: None,
                     }],
                     ..Annotation::default()
                 },
@@ -5972,6 +5999,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -5998,6 +6026,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6026,6 +6055,7 @@ mod tests {
                     .map(|(i, _)| SemanticSlot {
                         label: SlotStep::ListItem(i),
                         path: vec![i],
+                        patch_path: None,
                     })
                     .collect(),
                 ..Annotation::default()
@@ -6061,6 +6091,7 @@ mod tests {
                     .map(|(i, _)| SemanticSlot {
                         label: SlotStep::ListItem(i),
                         path: vec![i],
+                        patch_path: None,
                     })
                     .collect(),
                 ..Annotation::default()
@@ -6092,6 +6123,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6113,6 +6145,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6135,6 +6168,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6166,10 +6200,12 @@ mod tests {
                     SemanticSlot {
                         label: SlotStep::ListItem(0),
                         path: vec![0],
+                        patch_path: None,
                     },
                     SemanticSlot {
                         label: SlotStep::ListItem(1),
                         path: vec![1],
+                        patch_path: None,
                     },
                 ],
                 ..Annotation::default()
@@ -6238,6 +6274,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6263,6 +6300,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::ListItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6312,6 +6350,7 @@ mod tests {
                     slots: vec![SemanticSlot {
                         label: SlotStep::ListItem(0),
                         path: vec![0],
+                        patch_path: None,
                     }],
                     ..Annotation::default()
                 },
@@ -6329,6 +6368,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::TableCell(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6378,6 +6418,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::EnumItem(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6394,6 +6435,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::WrapperBody,
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },
@@ -6446,10 +6488,12 @@ mod tests {
                     SemanticSlot {
                         label: SlotStep::Term(0),
                         path: vec![0],
+                        patch_path: None,
                     },
                     SemanticSlot {
                         label: SlotStep::TermDescription(0),
                         path: vec![1],
+                        patch_path: None,
                     },
                 ],
                 ..Annotation::default()
@@ -6474,6 +6518,7 @@ mod tests {
                 slots: vec![SemanticSlot {
                     label: SlotStep::TableCell(0),
                     path: vec![0],
+                    patch_path: None,
                 }],
                 ..Annotation::default()
             },

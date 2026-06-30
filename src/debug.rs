@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use typst::foundations::{Content, SequenceElem, StyledElem};
 use typst::layout::{BlockBody, BlockElem};
-use typst::model::ParElem;
+use typst::model::{FigureCaption, ParElem};
 use typst::syntax::Span;
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind};
@@ -705,12 +705,13 @@ struct ContentSummary {
 fn summarize_content(content: &Content, depth: usize) -> ContentSummary {
     let children = content_children(content);
     let children_omitted = depth >= CONTENT_DEPTH_LIMIT && !children.is_empty();
+    let plain_text = summary_plain_text(content);
     ContentSummary {
         kind: content_kind(content),
         content_hash: content_hash(content),
-        plain_text_len: content.plain_text().chars().count(),
-        plain_text: content.plain_text().to_string(),
-        plain_text_preview: preview(content.plain_text().as_str()),
+        plain_text_len: plain_text.chars().count(),
+        plain_text_preview: preview(&plain_text),
+        plain_text,
         child_count: children.len(),
         source_span: has_source_span(content.span()),
         children_omitted,
@@ -723,6 +724,38 @@ fn summarize_content(content: &Content, depth: usize) -> ContentSummary {
                 .collect()
         },
     }
+}
+
+fn summary_plain_text(content: &Content) -> String {
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .map(summary_plain_text)
+            .collect::<Vec<_>>()
+            .join("");
+    }
+
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return summary_plain_text(&styled.child);
+    }
+
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return summary_plain_text(&par.body);
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block
+            .body
+            .get_cloned(typst::foundations::StyleChain::default())
+    {
+        return summary_plain_text(&body);
+    }
+
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return summary_plain_text(&caption.body);
+    }
+    content.plain_text().to_string()
 }
 
 fn content_children(content: &Content) -> Vec<Content> {

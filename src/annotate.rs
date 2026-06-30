@@ -23,8 +23,8 @@ use typst::introspection::TagElem;
 use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{
-    EmphElem, EnumElem, EnumItem, FootnoteBody, FootnoteElem, HeadingElem, ListElem, ListItem,
-    ParElem, ParbreakElem, TermItem, TermsElem,
+    EmphElem, EnumElem, EnumItem, FigureCaption, FootnoteBody, FootnoteElem, HeadingElem, ListElem,
+    ListItem, ParElem, ParbreakElem, TermItem, TermsElem,
 };
 use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
@@ -268,6 +268,10 @@ fn inline_token_content(content: &Content, text: &str) -> Content {
         return inline_token_content(&heading.body, text);
     }
 
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return inline_token_content(&caption.body, text);
+    }
+
     if let Some(block) = content.to_packed::<BlockElem>()
         && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
     {
@@ -307,6 +311,11 @@ fn replace_text_container(template: &Content, replacement: &Content) -> Option<C
 
     if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
         heading.body = replacement.clone();
+        return Some(content);
+    }
+
+    if let Some(caption) = content.to_packed_mut::<FigureCaption>() {
+        caption.body = replacement.clone();
         return Some(content);
     }
 
@@ -1192,11 +1201,24 @@ fn replace_annotated_path_content(
     path: &[usize],
     replacement: Content,
 ) -> Option<Content> {
+    let path = patch_path_for_logical_path(node, path).unwrap_or_else(|| path.to_vec());
+    let path = path.as_slice();
     let Some((index, _)) = path.split_first() else {
         return apply_path_edit(render_surface(node), path, PathEdit::Replace(replacement));
     };
     let surface = patchable_surface_for_index(node, *index)?;
     apply_path_edit(&surface, path, PathEdit::Replace(replacement))
+}
+
+fn patch_path_for_logical_path(
+    node: &crate::annotated::AnnotatedContent,
+    path: &[usize],
+) -> Option<Vec<usize>> {
+    node.annotation
+        .slots
+        .iter()
+        .find(|slot| slot.path == path)
+        .and_then(|slot| slot.patch_path.clone())
 }
 
 fn insert_annotated_path_content(

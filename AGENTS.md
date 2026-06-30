@@ -18,3 +18,5 @@ Never read PDF files directly.
 When diagnosing a complex bug, think through the program pipeline step by step
 and formulate actionable expectations for the output of each step; then probe
 whether the outputs match the expectations.
+
+Never update the reference for the corpus tests - let me do it myself.

@@ -1021,6 +1021,72 @@ fn figure_caption_slot_paths_ignore_realized_layout_scaffolding() {
 }
 
 #[test]
+fn figure_caption_label_renders_once_around_body_edit() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let case = "89-show-figure-caption-template-changed";
+    let result = diff_annotated_corpus(case);
+    let figure = only_changed_figure_block(&result, case);
+    assert_figure_slots_are_patch_surface_paths(figure);
+    assert_edit_paths_resolve_for_base(&figure.base, &figure.edits);
+
+    assert!(matches!(
+        figure.edits.as_slice(),
+        [RealizedEdit::ReplaceAt {
+            path,
+            content: EditContent::Modified { .. },
+        }] if path.as_slice() == [1]
+    ));
+
+    let log = result.modification_log();
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(deleted.contains("Measurements"), "{log}");
+    assert!(inserted.contains("Updated measurements"), "{log}");
+    assert!(!log.contains("MeasurementsFigure"), "{log}");
+    assert!(!log.contains("measurementsFigure"), "{log}");
+    assert!(!log.contains("Figure -> Exhibit"), "{log}");
+
+    let modified = collect_replace_at_modified_paths_and_bases(&result.blocks);
+    assert!(
+        modified.iter().any(|(path, _base)| path.as_slice() == [1]),
+        "caption body edit should target [1]: {modified:?}"
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let world = corpus_world(&format!("{case}/new.typ"));
+    let document = typst_diff::eval::layout_document(&world, &annotated).unwrap();
+    let rendered = normalize_whitespace(
+        rendered_text_runs(&document.pages[0].frame)
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+            .as_str(),
+    );
+
+    assert!(
+        rendered.contains("Figure") || rendered.contains("Exhibit"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Figure 2"), "{rendered}");
+    assert!(
+        rendered.contains("Figure 1") || rendered.contains("Exhibit"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Measurements"), "{rendered}");
+    assert!(rendered.contains("Updated measurements"), "{rendered}");
+    assert!(
+        !rendered.contains("Figure: Measurements Figure: Updated measurements"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("Exhibit: Measurements Exhibit: Updated measurements"),
+        "{rendered}"
+    );
+    assert_contains_in_order(&rendered, &["Measurements", "Updated measurements"]);
+}
+
+#[test]
 fn figure_caption_add_delete_pair_by_semantic_owner_not_text() {
     use typst_diff::diff::{EditContent, RealizedEdit};
 
@@ -1082,14 +1148,61 @@ fn ownership_noise_does_not_steal_figure_or_duplicate_caption_text() {
             1,
             "{case} should not leave both a plain new caption and a patched caption"
         );
+
+        if case == "72-figure-caption-deleted" {
+            let world = corpus_world(&format!("{case}/new.typ"));
+            let document = typst_diff::eval::layout_document(&world, &rendered).unwrap();
+            let rendered_text = normalize_whitespace(
+                rendered_text_runs(&document.pages[0].frame)
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+                    .as_str(),
+            );
+            assert!(!rendered_text.contains("Figure 2"), "{rendered_text}");
+            assert!(!rendered_text.contains("FigureFigure"), "{rendered_text}");
+            assert!(
+                !rendered_text.contains("Figure: Distribution of measurements Figure"),
+                "{rendered_text}"
+            );
+        }
     }
 }
 
 #[test]
 fn figure_body_word_diff_does_not_renumber_caption() {
+    use typst::visualize::RectElem;
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
     let result = diff_annotated_corpus("63-figure-body-changed");
     let figure = only_changed_figure_block(&result, "63-figure-body-changed");
     assert_figure_slots_are_patch_surface_paths(figure);
+    match figure.edits.as_slice() {
+        [
+            RealizedEdit::ReplaceAt {
+                path,
+                content: EditContent::Nested { base, edits },
+            },
+        ] => {
+            assert_eq!(path.as_slice(), [0], "figure body edit should target [0]");
+            assert!(
+                base.realized.is::<RectElem>(),
+                "figure body edit should preserve the realized rectangle boundary"
+            );
+            assert!(
+                matches!(
+                    edits.as_slice(),
+                    [RealizedEdit::ReplaceAt {
+                        path,
+                        content: EditContent::Modified { .. },
+                    }] if path.as_slice() == [0]
+                ),
+                "rectangle body should receive the word modification"
+            );
+        }
+        _ => panic!("figure body edit should be a nested rectangle edit"),
+    }
 
     let (_inserted, _deleted, modified_inserted, modified_deleted) =
         collect_edit_texts(&result.blocks);
@@ -1105,8 +1218,12 @@ fn figure_body_word_diff_does_not_renumber_caption() {
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let plain = normalize_whitespace(annotated.plain_text().as_str());
     assert!(
-        plain.contains("Old New figure body labelStable caption"),
+        plain.contains("Old New figure body label"),
         "annotated figure should preserve the body word diff without opaque replacement:\n{plain}"
+    );
+    assert!(
+        plain.contains("Stable caption"),
+        "annotated figure should retain the caption body:\n{plain}"
     );
 
     let world = corpus_world("63-figure-body-changed/new.typ");
