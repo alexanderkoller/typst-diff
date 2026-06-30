@@ -2083,7 +2083,10 @@ fn replace_block_edit(
         }
     }
 
-    if let Some(edit) = raw_block_modified_edit(old_ann, new_ann, &new_block.content) {
+    if let Some(content) =
+        raw_block_modified_content(&old_block.content, &new_block.content, old_ann, new_ann)
+    {
+        let edit = RealizedEdit::WholeBlock(content);
         emit_pipeline_trace_event(
             debug_events,
             PipelineTraceEvent::new("diff/replace-block", "selected")
@@ -2218,14 +2221,38 @@ fn word_or_opaque_replacement_edits(
     old_equation_origins: &[Content],
     new_equation_origins: &[Content],
 ) -> Vec<RealizedEdit> {
+    modified_fragment_edit_content(
+        &old_block.content,
+        &new_block.content,
+        old_ann,
+        new_ann,
+        old_equation_origins,
+        new_equation_origins,
+    )
+    .map(|content| vec![RealizedEdit::WholeBlock(content)])
+    .unwrap_or_default()
+}
+
+fn modified_fragment_edit_content(
+    old_content: &Content,
+    new_content: &Content,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
+) -> Option<EditContent> {
+    if let Some(content) = raw_block_modified_content(old_content, new_content, old_ann, new_ann) {
+        return Some(content);
+    }
+
     let (old_word_ann, new_word_ann) = balanced_word_annotations(old_ann, new_ann);
     let old_tokens = extract_words_for_annotated_with_equation_origins(
-        &old_block.content,
+        old_content,
         old_word_ann,
         old_equation_origins,
     );
     let new_tokens = extract_words_for_annotated_with_equation_origins(
-        &new_block.content,
+        new_content,
         new_word_ann,
         new_equation_origins,
     );
@@ -2239,55 +2266,105 @@ fn word_or_opaque_replacement_edits(
         }
     }
     if has_textual_word_change(&word_ops) {
-        return vec![RealizedEdit::WholeBlock(EditContent::Modified {
-            base: new_block.content.clone(),
+        return Some(EditContent::Modified {
+            base: new_content.clone(),
             word_ops,
-        })];
+        });
     }
 
-    if old_block.content != new_block.content
-        && old_block.content.plain_text().is_empty()
-        && new_block.content.plain_text().is_empty()
+    if old_content != new_content
+        && old_content.plain_text().is_empty()
+        && new_content.plain_text().is_empty()
     {
-        return vec![RealizedEdit::WholeBlock(EditContent::OpaqueReplacement {
-            old: old_block.content.clone(),
-            new: new_block.content.clone(),
-        })];
+        return Some(EditContent::OpaqueReplacement {
+            old: old_content.clone(),
+            new: new_content.clone(),
+        });
     }
 
-    vec![]
+    None
 }
 
-fn raw_block_modified_edit(
+fn raw_block_modified_content(
+    old_content: &Content,
+    new_content: &Content,
     old_ann: Option<&AnnotatedContent>,
     new_ann: Option<&AnnotatedContent>,
-    new_base: &Content,
-) -> Option<RealizedEdit> {
-    let old_ann =
-        old_ann.filter(|node| node.annotation.semantic_kind == Some(SemanticKind::RawBlock))?;
-    let new_ann =
-        new_ann.filter(|node| node.annotation.semantic_kind == Some(SemanticKind::RawBlock))?;
-    let old_text = raw_block_text(old_ann)?;
-    let new_text = raw_block_text(new_ann)?;
+) -> Option<EditContent> {
+    let old_text = raw_fragment_text(old_ann, old_content)?;
+    let new_text = raw_fragment_text(new_ann, new_content)?;
     if old_text == new_text {
         return None;
     }
     let word_ops = diff_raw_block_lines(&old_text, &new_text);
-    Some(RealizedEdit::WholeBlock(EditContent::Modified {
-        base: new_base.clone(),
+    Some(EditContent::Modified {
+        base: new_content.clone(),
         word_ops,
-    }))
+    })
+}
+
+fn raw_fragment_text(node: Option<&AnnotatedContent>, fallback: &Content) -> Option<String> {
+    if let Some(text) = node.and_then(raw_block_text) {
+        return Some(text);
+    }
+    if let Some(node) = node {
+        let mut texts = Vec::new();
+        collect_annotated_raw_block_texts(node, &mut texts);
+        if texts.len() == 1 {
+            return texts.pop();
+        }
+    }
+    single_raw_content_text(fallback)
 }
 
 fn raw_block_text(node: &AnnotatedContent) -> Option<String> {
+    if node.annotation.semantic_kind != Some(SemanticKind::RawBlock) {
+        return None;
+    }
     let surface = node
         .annotation
         .patch_surface
         .as_ref()
         .unwrap_or(&node.realized);
-    (surface.to_packed::<RawElem>().is_some()
-        || node.annotation.semantic_kind == Some(SemanticKind::RawBlock))
-    .then(|| surface.plain_text().to_string())
+    Some(surface.plain_text().to_string())
+}
+
+fn collect_annotated_raw_block_texts(node: &AnnotatedContent, out: &mut Vec<String>) {
+    if let Some(text) = raw_block_text(node) {
+        out.push(text);
+        return;
+    }
+    for child in &node.children {
+        collect_annotated_raw_block_texts(child, out);
+    }
+}
+
+fn single_raw_content_text(content: &Content) -> Option<String> {
+    let mut texts = Vec::new();
+    collect_raw_content_texts(content, &mut texts);
+    (texts.len() == 1).then(|| texts.remove(0))
+}
+
+fn collect_raw_content_texts(content: &Content, out: &mut Vec<String>) {
+    if content.to_packed::<RawElem>().is_some() {
+        out.push(content.plain_text().to_string());
+        return;
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        for child in &seq.children {
+            collect_raw_content_texts(child, out);
+        }
+        return;
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        collect_raw_content_texts(&styled.child, out);
+        return;
+    }
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        collect_raw_content_texts(&body, out);
+    }
 }
 
 fn diff_raw_block_lines(old_text: &str, new_text: &str) -> Vec<WordOp> {
@@ -3447,19 +3524,16 @@ fn diff_region_edits(old: &AnnotatedContent, new: &AnnotatedContent) -> Vec<Real
 
     let old_effective = effective_text_content(old);
     let new_effective = effective_text_content(new);
-    let old_tokens = extract_words_for_annotated(&old_effective, Some(old));
-    let new_tokens = extract_words_for_annotated(&new_effective, Some(new));
-    let word_ops = diff_words(&old_tokens, &new_tokens);
-    if has_textual_word_change(&word_ops) {
-        vec![RealizedEdit::WholeBlock(EditContent::Modified {
-            base: new_effective,
-            word_ops,
-        })]
-    } else if let Some(content) = opaque_replacement_content(old, new) {
-        vec![RealizedEdit::WholeBlock(content)]
-    } else {
-        vec![]
-    }
+    modified_fragment_edit_content(
+        &old_effective,
+        &new_effective,
+        Some(old),
+        Some(new),
+        &[],
+        &[],
+    )
+    .map(|content| vec![RealizedEdit::WholeBlock(content)])
+    .unwrap_or_default()
 }
 
 fn diff_rendered_root_page_regions(
@@ -4995,9 +5069,10 @@ fn is_structural_separator_child(child: &AnnotatedContent) -> bool {
 
 fn structural_child_key(child: &AnnotatedContent) -> String {
     format!(
-        "{:?}:{}",
+        "{:?}:{}:{}",
         child.annotation.semantic_kind,
-        effective_text_content(child).plain_text()
+        effective_text_content(child).plain_text(),
+        presentation_key(&effective_render_content(child))
     )
 }
 
@@ -5037,17 +5112,15 @@ fn owned_surface_modified_edit(
         return None;
     }
 
-    let old_tokens = extract_words(&old_effective);
-    let new_tokens = extract_words(&new_effective);
-    let word_ops = diff_words(&old_tokens, &new_tokens);
-    if has_textual_word_change(&word_ops) {
-        return Some(RealizedEdit::WholeBlock(EditContent::Modified {
-            base: new_effective,
-            word_ops,
-        }));
-    }
-
-    opaque_replacement_content(old_ann, new_ann).map(RealizedEdit::WholeBlock)
+    modified_fragment_edit_content(
+        &old_effective,
+        &new_effective,
+        Some(old_ann),
+        Some(new_ann),
+        &[],
+        &[],
+    )
+    .map(RealizedEdit::WholeBlock)
 }
 
 fn slot_labels(node: &AnnotatedContent) -> Vec<&SlotStep> {
@@ -5145,17 +5218,14 @@ fn modified_edit_content(
 ) -> Option<EditContent> {
     let old_effective = effective_text_content(old_child);
     let new_effective = effective_text_content(new_child);
-    let old_tokens = extract_words_for_annotated(&old_effective, Some(old_child));
-    let new_tokens = extract_words_for_annotated(&new_effective, Some(new_child));
-    let word_ops = diff_words(&old_tokens, &new_tokens);
-    if has_textual_word_change(&word_ops) {
-        return Some(EditContent::Modified {
-            base: new_effective,
-            word_ops,
-        });
-    }
-
-    opaque_replacement_content(old_child, new_child)
+    modified_fragment_edit_content(
+        &old_effective,
+        &new_effective,
+        Some(old_child),
+        Some(new_child),
+        &[],
+        &[],
+    )
 }
 
 #[derive(Clone)]
@@ -5182,11 +5252,11 @@ fn footnote_visible_text_edits(
     };
     let old_keys = old_units
         .iter()
-        .map(|unit| unit.text.clone())
+        .map(visible_footnote_unit_key)
         .collect::<Vec<_>>();
     let new_keys = new_units
         .iter()
-        .map(|unit| unit.text.clone())
+        .map(visible_footnote_unit_key)
         .collect::<Vec<_>>();
     let ops = capture_diff_slices(Algorithm::Myers, &old_keys, &new_keys);
 
@@ -5224,16 +5294,17 @@ fn footnote_visible_text_edits(
                         continue;
                     }
                     if let Some(path) = &new_unit.path {
-                        let old_tokens = extract_words(&old_unit.content);
-                        let new_tokens = extract_words(&new_unit.content);
-                        let word_ops = diff_words(&old_tokens, &new_tokens);
-                        if has_textual_word_change(&word_ops) {
+                        if let Some(content) = modified_fragment_edit_content(
+                            &old_unit.content,
+                            &new_unit.content,
+                            None,
+                            None,
+                            &[],
+                            &[],
+                        ) {
                             edits.push(RealizedEdit::ReplaceAt {
                                 path: path.clone(),
-                                content: EditContent::Modified {
-                                    base: new_unit.content.clone(),
-                                    word_ops,
-                                },
+                                content,
                             });
                         }
                     }
@@ -5249,6 +5320,14 @@ fn footnote_visible_text_edits(
     }
 
     edits
+}
+
+fn visible_footnote_unit_key(unit: &VisibleFootnoteUnit) -> String {
+    if unit.is_footnote {
+        format!("footnote:{}", unit.text)
+    } else {
+        format!("visible:{}:{}", unit.text, presentation_key(&unit.content))
+    }
 }
 
 fn push_visible_insert_edit(edits: &mut Vec<RealizedEdit>, unit: &VisibleFootnoteUnit) {
@@ -5437,24 +5516,6 @@ fn maybe_map_realized_children(
     Some(mapped)
 }
 
-fn opaque_replacement_content(
-    old_child: &AnnotatedContent,
-    new_child: &AnnotatedContent,
-) -> Option<EditContent> {
-    let old_visual = effective_render_content(old_child);
-    let new_visual = effective_render_content(new_child);
-    if old_visual != new_visual
-        && old_visual.plain_text().is_empty()
-        && new_visual.plain_text().is_empty()
-    {
-        return Some(EditContent::OpaqueReplacement {
-            old: old_visual,
-            new: new_visual,
-        });
-    }
-    None
-}
-
 fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {
     if all_slots_are_footnote_bodies(old_ann) && all_slots_are_footnote_bodies(new_ann) {
         return diff_footnote_body_slot_edits(old_ann, new_ann);
@@ -5639,14 +5700,14 @@ fn diff_slot_edits_lcs(
         .slots
         .iter()
         .filter_map(|slot| old_ann.get_path(&slot.path))
-        .map(|child| effective_text_content(child).plain_text().to_string())
+        .map(slot_child_match_key)
         .collect();
     let new_h: Vec<String> = new_ann
         .annotation
         .slots
         .iter()
         .filter_map(|slot| new_ann.get_path(&slot.path))
-        .map(|child| effective_text_content(child).plain_text().to_string())
+        .map(slot_child_match_key)
         .collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_h, &new_h);
 
@@ -5747,6 +5808,14 @@ fn diff_slot_edits_lcs(
         }
     }
     edits
+}
+
+fn slot_child_match_key(child: &AnnotatedContent) -> String {
+    format!(
+        "{}:{}",
+        effective_text_content(child).plain_text(),
+        presentation_key(&effective_render_content(child))
+    )
 }
 
 fn push_deleted_slot_edit(

@@ -437,6 +437,52 @@ fn collect_modified_bases(blocks: &[typst_diff::diff::DiffBlockEdit]) -> Vec<Str
     bases
 }
 
+fn collect_replace_at_modified_paths_and_bases(
+    blocks: &[typst_diff::diff::DiffBlockEdit],
+) -> Vec<(Vec<usize>, String)> {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    fn walk_content(prefix: &[usize], content: &EditContent, out: &mut Vec<(Vec<usize>, String)>) {
+        match content {
+            EditContent::Modified { base, .. } => {
+                out.push((prefix.to_vec(), base.plain_text().to_string()));
+            }
+            EditContent::Nested { edits, .. } => {
+                for edit in edits {
+                    walk_edit(prefix, edit, out);
+                }
+            }
+            EditContent::Inserted(_)
+            | EditContent::Deleted(_)
+            | EditContent::OpaqueReplacement { .. } => {}
+        }
+    }
+
+    fn walk_edit(prefix: &[usize], edit: &RealizedEdit, out: &mut Vec<(Vec<usize>, String)>) {
+        match edit {
+            RealizedEdit::ReplaceAt { path, content } => {
+                let mut full_path = prefix.to_vec();
+                full_path.extend(path.iter().copied());
+                walk_content(&full_path, content, out);
+            }
+            RealizedEdit::InsertBefore { content, .. }
+            | RealizedEdit::InsertAfter { content, .. }
+            | RealizedEdit::Append { content }
+            | RealizedEdit::WholeBlock(content) => {
+                walk_content(prefix, content, out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for block in blocks {
+        for edit in &block.edits {
+            walk_edit(&[], edit, &mut out);
+        }
+    }
+    out
+}
+
 fn count_edits(
     blocks: &[typst_diff::diff::DiffBlockEdit],
     matches_edit: fn(&typst_diff::diff::RealizedEdit) -> bool,
@@ -2402,6 +2448,97 @@ fn table_row_inserted_middle_includes_inserted_cells() {
 }
 
 #[test]
+fn table_cell_same_text_style_only_change_is_slot_modified_edit() {
+    let (_dir, result, _annotated) = diff_temp_sources(
+        r#"#table(columns: 2, [Metric], [#emph[Same]], [Other], [Stable])
+
+Body unchanged.
+"#,
+        r#"#table(columns: 2, [Metric], [#strong[Same]], [Other], [Stable])
+
+Body unchanged.
+"#,
+    );
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        deleted.contains("Same") && inserted.contains("Same"),
+        "style-only table cell change should be represented as modified words; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        result.blocks.iter().any(|block| {
+            block
+                .edits
+                .iter()
+                .any(realized_edit_contains_replace_at_modified)
+        }),
+        "style-only table cell change should remain a slot-level ReplaceAt Modified edit"
+    );
+}
+
+#[test]
+fn table_raw_cell_change_uses_raw_line_diff_not_whole_cell_replacement() {
+    let (_dir, result, _annotated) = diff_temp_sources(
+        r#"#table(columns: 1, [
+```txt
+alpha
+old line
+omega
+```
+])
+"#,
+        r#"#table(columns: 1, [
+```txt
+alpha
+new line
+omega
+```
+])
+"#,
+    );
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        deleted.contains("old line") && inserted.contains("new line"),
+        "raw table cell should report changed raw lines; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        !deleted.contains("alpha") && !inserted.contains("alpha"),
+        "raw table cell should not report unchanged prefix line as changed; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        !deleted.contains("omega") && !inserted.contains("omega"),
+        "raw table cell should not report unchanged suffix line as changed; deleted={deleted:?}; inserted={inserted:?}"
+    );
+}
+
+#[test]
+fn repeated_same_text_table_style_change_targets_one_cell() {
+    let (_dir, result, _annotated) = diff_temp_sources(
+        r#"#table(columns: 2, [Same], [Same], [Other], [Stable])
+
+Body unchanged.
+"#,
+        r#"#table(columns: 2, [Same], [#strong[Same]], [Other], [Stable])
+
+Body unchanged.
+"#,
+    );
+    let modified = collect_replace_at_modified_paths_and_bases(&result.blocks);
+    let same_modified = modified
+        .iter()
+        .filter(|(_path, base)| base.contains("Same"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_modified.len(),
+        1,
+        "exactly one repeated Same cell should be modified; modified={modified:?}"
+    );
+    assert!(
+        same_modified[0].0.last().is_some_and(|index| *index == 1),
+        "the second Same cell should be targeted, not an arbitrary repeated text cell; modified={modified:?}"
+    );
+}
+
+#[test]
 fn opaque_wrapper_changes_are_reported_once() {
     for name in [
         "54-align-changed",
@@ -2637,6 +2774,25 @@ The rest of the paragraph is unchanged.
     assert!(footer.contains("New"), "footer={footer}");
     assert!(footer.contains("deployers"), "footer={footer}");
     assert!(footer.contains("operators"), "footer={footer}");
+}
+
+#[test]
+fn footnote_visible_text_same_text_style_only_change_is_modified_edit() {
+    let (_dir, result, _annotated) = diff_temp_sources(
+        r#"#emph[Stable term]#footnote[Existing note remains unchanged.] stays visible.
+"#,
+        r#"#strong[Stable term]#footnote[Existing note remains unchanged.] stays visible.
+"#,
+    );
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    assert!(
+        deleted.contains("Stable term") && inserted.contains("Stable term"),
+        "style-only visible text beside a footnote should be represented as modified words; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        count_edits(&result.blocks, realized_edit_contains_replace_at_modified) >= 1,
+        "style-only visible text beside a footnote should not be swallowed by the footnote-special path"
+    );
 }
 
 #[test]
@@ -3139,6 +3295,88 @@ fn header_footer_add_delete_change_are_page_region_edits() {
     has_region("82-header-deleted", PageRegionKind::Header, |content| {
         matches!(content, EditContent::Deleted(_))
     });
+}
+
+#[test]
+fn static_header_same_text_style_only_change_is_region_modified_edit() {
+    use typst_diff::diff::{EditContent, PageRegionKind, RegionPath, WordOp};
+
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set page(header: align(right, emph[Same Header]))
+
+Body unchanged.
+"#,
+        r#"#set page(header: align(right, strong[Same Header]))
+
+Body unchanged.
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let header = result
+        .regions
+        .iter()
+        .find(|region| region.path == RegionPath::RootPage(PageRegionKind::Header))
+        .expect("expected static header region edit");
+
+    assert!(
+        header.edits.iter().any(|edit| {
+            realized_edit_content_or_nested_matches(edit, |content| {
+                matches!(content, EditContent::Modified { word_ops, .. } if word_ops.iter().any(|op| {
+                    matches!(op, WordOp::Delete(tokens) if tokens.iter().map(|token| token.text.as_str()).collect::<String>().contains("Same Header"))
+                }) && word_ops.iter().any(|op| {
+                    matches!(op, WordOp::Insert(tokens) if tokens.iter().map(|token| token.text.as_str()).collect::<String>().contains("Same Header"))
+                }))
+            })
+        }),
+        "style-only static header change should produce modified delete/insert word ops"
+    );
+}
+
+#[test]
+fn static_header_raw_change_uses_raw_line_diff_not_whole_region_replacement() {
+    use typst_diff::diff::{PageRegionKind, RegionPath};
+
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set page(header: ```txt
+alpha
+old line
+omega
+```)
+
+Body unchanged.
+"#,
+        r#"#set page(header: ```txt
+alpha
+new line
+omega
+```)
+
+Body unchanged.
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let header = result
+        .regions
+        .iter()
+        .find(|region| region.path == RegionPath::RootPage(PageRegionKind::Header))
+        .expect("expected static header region edit");
+    let (deleted, inserted) = collect_region_modified_word_texts(std::slice::from_ref(header));
+    assert!(
+        deleted.contains("old line") && inserted.contains("new line"),
+        "raw static header should report changed raw lines; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        !deleted.contains("alpha") && !inserted.contains("alpha"),
+        "raw static header should not report unchanged prefix line as changed; deleted={deleted:?}; inserted={inserted:?}"
+    );
+    assert!(
+        !deleted.contains("omega") && !inserted.contains("omega"),
+        "raw static header should not report unchanged suffix line as changed; deleted={deleted:?}; inserted={inserted:?}"
+    );
 }
 
 #[test]
