@@ -7,7 +7,20 @@ license = "MIT"
 repository = "https://github.com/alexanderkoller/typst-diff"
 keywords = ["typst", "diff", "pdf"]
 categories = ["command-line-utilities", "text-processing"]
-exclude = ["tests/", "docs/", "*.md", "**/*.md", "*.orig", "**/*.orig", ".*"]
+exclude = [
+    "tests/",
+    "docs/",
+    "tmp/",
+    "output/",
+    "*.md",
+    "**/*.md",
+    "*.orig",
+    "**/*.orig",
+    "*.pdf",
+    "**/*.pdf",
+    "key.txt",
+    ".*",
+]
 
 [lib]
 name = "typst_diff"
@@ -27,6 +40,9 @@ similar = "2"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
 
 [dev-dependencies]
 
@@ -41,3 +57,6 @@ strip = true
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"

@@ -36,8 +36,11 @@ def start_job(cmd: list) -> str:
 
     def _run() -> None:
         p = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
         assert p.stdout
         for line in iter(p.stdout.readline, ""):
@@ -59,10 +62,15 @@ def poll_job(jid: str) -> Optional[dict]:
 
 # ── data ──────────────────────────────────────────────────────────────────────
 
+
 def _parse_result(path: Path) -> dict:
     r: dict = {
-        "status": "not_run", "elapsed_s": 0, "modifications": 0,
-        "pdf_bytes": 0, "visual_status": "-", "failure_reason": "",
+        "status": "not_run",
+        "elapsed_s": 0,
+        "modifications": 0,
+        "pdf_bytes": 0,
+        "visual_status": "-",
+        "failure_reason": "",
     }
     if not path.exists():
         return r
@@ -86,16 +94,23 @@ def _parse_result(path: Path) -> dict:
 
 def get_tests() -> List[dict]:
     tests = []
-    for d in sorted(CORPUS_DIR.iterdir(), key=lambda p: p.name):
+
+    def _sort_key(p: Path) -> int:
+        m = re.match(r"^(\d+)", p.name)
+        return int(m.group(1)) if m else 0
+
+    for d in sorted(CORPUS_DIR.iterdir(), key=_sort_key):
         if not d.is_dir():
             continue
         name = d.name
         m = re.match(r"^(\d+)-", name)
-        tests.append({
-            "id": int(m.group(1)) if m else 0,
-            "name": name,
-            **_parse_result(OUTPUT_DIR / name / "result.txt"),
-        })
+        tests.append(
+            {
+                "id": int(m.group(1)) if m else 0,
+                "name": name,
+                **_parse_result(OUTPUT_DIR / name / "result.txt"),
+            }
+        )
     return tests
 
 
@@ -107,7 +122,9 @@ def do_compare(test_name: str) -> Tuple[Optional[bytes], Optional[str]]:
     out_png = Path(f"/tmp/compare-{test_name}.png")
     res = subprocess.run(
         ["bash", str(SCRIPT_DIR / "compare_corpus.sh"), tid, "--no-open"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     if out_png.exists():
         return out_png.read_bytes(), None
@@ -147,6 +164,7 @@ header h1{font-size:15px;font-weight:700;letter-spacing:.4px;color:#cba6f7;flex:
 .btn.sm{padding:4px 10px;font-size:12px;border-radius:5px}
 .btn.run{background:#89b4fa;color:#1e1e2e}
 .btn.cmp{background:#cba6f7;color:#1e1e2e}
+.btn.upd{background:#a6e3a1;color:#1e1e2e}
 
 /* ── controls ── */
 #controls{background:#181825;border-bottom:1px solid rgba(205,214,244,.08);padding:10px 20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -172,7 +190,7 @@ tr:hover td{background:rgba(255,255,255,.03)}
 .tc-id{color:#45475a;text-align:right;width:44px;font-variant-numeric:tabular-nums}
 .tc-name{font-family:ui-monospace,monospace;font-size:12px;color:#cdd6f4}
 .tc-num{text-align:right;width:60px;color:#585b70;font-variant-numeric:tabular-nums}
-.tc-act{width:150px}
+.tc-act{width:220px}
 
 /* ── badges ── */
 .badge{display:inline-block;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}
@@ -327,6 +345,7 @@ function renderTable() {
       <td class="tc-act">
         <button class="btn sm run" onclick="runTest('${t.name}')">Rerun</button>
         <button class="btn sm cmp" onclick="showCompare('${t.name}')">Compare</button>
+        <button class="btn sm upd" onclick="updateTest('${t.name}')">Update ref</button>
       </td>
     </tr>`;
   }).join('');
@@ -369,6 +388,18 @@ async function runTest(name) {
   const {job_id} = await r.json();
   openLog('Running ' + name + '…', job_id, () => loadTests());
 }
+
+async function updateTest(name) {
+  const r = await fetch('/api/update/' + encodeURIComponent(name), {method: 'POST'});
+  if (!r.ok) {
+    const msg = await r.text();
+    alert('Update failed: ' + msg);
+    return;
+  }
+  const {job_id} = await r.json();
+  openLog('Updating ref for ' + name + '…', job_id, () => loadTests());
+}
+
 
 // ── log panel ─────────────────────────────────────────────────────────────────
 
@@ -474,6 +505,7 @@ loadTests();
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_: object) -> None:
         pass
@@ -503,23 +535,62 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         p = unquote(urlparse(self.path).path)
         if p == "/api/build":
-            jid = start_job([
-                "cargo", "build", "--release",
-                "--manifest-path", str(CARGO_TOML),
-            ])
+            jid = start_job(
+                [
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--manifest-path",
+                    str(CARGO_TOML),
+                ]
+            )
             self._json({"job_id": jid})
         elif p == "/api/run-all":
-            jid = start_job([
-                "bash", str(SCRIPT_DIR / "run_corpus.sh"),
-                "--release", "--no-build",
-            ])
+            jid = start_job(
+                [
+                    "bash",
+                    str(SCRIPT_DIR / "run_corpus.sh"),
+                    "--release",
+                    "--no-build",
+                ]
+            )
             self._json({"job_id": jid})
         elif p.startswith("/api/run/"):
             name = p[9:]
-            jid = start_job([
-                "bash", str(SCRIPT_DIR / "run_corpus.sh"),
-                "--release", "--no-build", "--filter", name,
-            ])
+            jid = start_job(
+                [
+                    "bash",
+                    str(SCRIPT_DIR / "run_corpus.sh"),
+                    "--release",
+                    "--no-build",
+                    "--filter",
+                    name,
+                ]
+            )
+            self._json({"job_id": jid})
+        elif p.startswith("/api/update/"):
+            name = p[12:]
+            actual_dir = OUTPUT_DIR / name / "actual"
+            ref_dir = CORPUS_DIR / name / "ref"
+            actual_pngs = (
+                sorted(actual_dir.glob("page-*.png")) if actual_dir.exists() else []
+            )
+            if not actual_pngs:
+                self._err(400, b"no actual PNGs found; run the test first")
+                return
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            for f in actual_pngs:
+                (ref_dir / f.name).write_bytes(f.read_bytes())
+            jid = start_job(
+                [
+                    "bash",
+                    str(SCRIPT_DIR / "run_corpus.sh"),
+                    "--release",
+                    "--no-build",
+                    "--filter",
+                    name,
+                ]
+            )
             self._json({"job_id": jid})
         else:
             self._err(404)
@@ -544,6 +615,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     port = 8787

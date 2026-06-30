@@ -197,7 +197,8 @@ while IFS= read -r test_dir; do
 
   mod_count=0
   if [[ -s "$out_mods" ]]; then
-    mod_count=$(grep -c '^## [0-9]' "$out_mods" 2>/dev/null || echo 0)
+    mod_count=$(grep -c '^## [0-9]' "$out_mods" 2>/dev/null || true)
+    mod_count=${mod_count:-0}
   fi
 
   # ── visual comparison ──────────────────────────────────────────────────────

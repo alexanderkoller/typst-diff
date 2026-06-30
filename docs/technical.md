@@ -12,6 +12,7 @@
    - [annotate](#annotate)
    - [render](#render)
    - [diag](#diag)
+   - [debug and trace](#debug-and-trace)
 5. [Key data structures](#key-data-structures)
 6. [Algorithms in depth](#algorithms-in-depth)
    - [Block extraction](#block-extraction)
@@ -23,8 +24,9 @@
 7. [Annotation strategy](#annotation-strategy)
 8. [Rendering and layout convergence](#rendering-and-layout-convergence)
 9. [Git revision mode](#git-revision-mode)
-10. [Performance notes](#performance-notes)
-11. [Limitations and known edge cases](#limitations-and-known-edge-cases)
+10. [Debugging and tracing](#debugging-and-tracing)
+11. [Performance notes](#performance-notes)
+12. [Limitations and known edge cases](#limitations-and-known-edge-cases)
 
 ---
 
@@ -56,11 +58,14 @@ src/
 ├── main.rs            — CLI binary: argument parsing + orchestration
 ├── world.rs           — World trait implementation (filesystem + fonts)
 ├── eval.rs            — Content tree extraction from a World
-├── diff.rs            — Two-level block+word diff
-├── content_slots.rs   — Named sub-positions inside structured elements
+├── annotated.rs       — Realized tree plus semantic annotations
+├── container_ops.rs   — Container-owned slot mapping and patch surfaces
+├── diff.rs            — Block, semantic-owner, slot, word, and region diff
 ├── annotate.rs        — Build annotated Content from a DiffResult
 ├── render.rs          — layout_document + typst_pdf → Vec<u8>
-└── diag.rs            — Diagnostic formatting (file:line:col messages)
+├── diag.rs            — Diagnostic formatting (file:line:col messages)
+├── debug.rs           — YAML debug bundle and JSONL trace serialization
+└── trace.rs           — Trace event types and sink trait
 ```
 
 The crate is both a library and a binary. `src/lib.rs` exports the public API
@@ -68,6 +73,9 @@ so integration tests in `tests/` can call into individual pipeline stages.
 
 See [Container Diff Regions](container-diff-regions.md) for a design note on
 the next step after the current slot abstraction.
+See [Figure and Opaque Diffs](figure-and-opaque-diffs.md) for the figure and
+caption regression cluster as a worked example of semantic owners and patch
+surfaces.
 
 ---
 
@@ -136,18 +144,12 @@ Used by the CLI. Runs two additional passes over the Content tree:
    counter steps, and document structure into a flat sequence of `(Content,
    StyleChain)` pairs.
 
-Before realization, `collect_preserved_by_span` records every `EquationElem`
-and every node that `content_slots::is_slot_container` recognises (lists,
-tables, figures, etc.). These nodes would become opaque layout output after
-realization. The preserved index is `HashMap<Span, VecDeque<Content>>`, not
-`HashMap<Span, Content>`, because repeated calls to a Typst function can expand
-the same function-body expression multiple times with the same source span. In
-that case each invocation must restore its own pre-realization container; a
-single map entry would overwrite earlier invocations and make all realized
-blocks restore as the last one. After realization, `restore_preserved`
-substitutes preserved nodes back by span and consumes one queued replacement per
-realized node in document order, recursing through `SequenceElem`, `StyledElem`,
-and `ParElem`.
+Before realization, evaluation keeps both authored and realized structure. The
+authored tree is normalized and later used to annotate Typst's realized tree
+with semantic owners, slots, patch surfaces, equation origins, and footnote
+bodies. A repeated macro expansion can reuse the same source span, so any
+span-based preservation or pairing is queued in document order rather than
+stored as a single `Span -> Content` entry.
 
 The realized output is then re-wrapped into a `Content::sequence` where each
 item carries its inline styles (non-page styles), and the whole sequence is
@@ -158,33 +160,75 @@ The realized pipeline is heavier but produces more accurate diffs for documents
 that use Typst's document structure features (chapter counters, auto-generated
 headings, etc.).
 
-### content_slots
+#### Context-opaque body content
 
-Defines the *slot* abstraction: a named, text-bearing sub-position inside a
-structured `Content` element, identified by a `Vec<SlotStep>` path from the
-element root.
+One important limitation of this pipeline is context-opaque body content.
+Functions and packages that return normal content or recognized containers
+(`block`, `box`, `rect`, `figure`, tables, lists, and similar slot-bearing
+structures) usually remain diffable because annotation can attach semantic
+owners and slots to the realized tree. By contrast, if meaningful body text is
+produced only by evaluating a `context` thunk, the tree visible to typst-diff
+may contain empty `context` nodes, tags, or layout artifacts rather than the
+ordinary text/content children that block and word diffing consume. In that
+case the old and new realized blocks can compare as unchanged or text-empty, so
+no recursive slot diff or word diff is produced.
 
-**`extract_slots(content)`** walks a `Content` tree and returns every leaf slot
-in document order. Returns an empty `Vec` for elements with no addressable slots
-(plain text, headings, raw blocks, etc.). The full set of handled containers is:
-`ListElem` / `ListItem`, `EnumElem` / `EnumItem`, `TermsElem` / `TermItem`,
-`FigureElem` (body + caption), `FootnoteElem`, `QuoteElem`, `TableElem`,
-`GridElem`, `StackElem`, and single-body wrappers (`AlignElem`, `PadElem`,
-`PlaceElem`, `ColumnsElem`, `BoxElem`, `BlockElem`, `RectElem`, `CircleElem`,
-`EllipseElem`).
+This is not a blanket limitation on `context`. Direct body contexts, such as
+state/counter/reference text, can still work when realization leaves the final
+text in the `Content` tree. The risky shape is a wrapper whose meaningful body
+is only produced inside a context-dependent expansion, for example:
 
-**`is_slot_container(content)`** returns `true` for all of the above types. Used
-in `eval.rs` to identify nodes that must be captured before realization (see
-[eval](#eval)).
+```typst
+#let contextual-card(title, body) = context {
+  // Layout/state/query-dependent code decides how to build the box.
+  // The returned document node may remain an empty `context` from the
+  // semantic Content tree's point of view.
+  block(stroke: 0.5pt, inset: 6pt)[
+    *#title*
 
-**`replace_slot(template, path, replacement)`** writes a new `Content` value
-into the addressed slot of a cloned tree, returning `None` if the path doesn't
-match.
+    #body
+  ]
+}
 
-**`normalize_list_item_runs(content)`** wraps consecutive bare `ListItem` /
-`EnumItem` / `TermItem` nodes into their container elements. The Typst evaluator
-sometimes emits items as siblings in a `SequenceElem`; this normalisation ensures
-the tree always uses the container form before `extract_slots` runs.
+#contextual-card("Goal")[
+  This body text changes between document versions.
+]
+```
+
+If realization exposes the final `block[...]` and its text children, this is
+diffable. If it leaves typst-diff with an empty `context`/layout artifact
+instead, the body has no slot-bearing owner and no visible `plain_text` for the
+block or word diff. Packages such as `@preview/showybox` can produce this kind
+of shape: changed box body text may be hidden behind `context` expansion. When
+diagnosing similar cases, run with `--debug` or `--debug-trace` and compare
+`old/normalized.yml`, `old/realized-tree.yml`, `new/realized-tree.yml`, and
+`diff/final-edits.yml` for empty `plain_text`, missing slots, or
+`changed_block_count: 0`.
+
+### annotated and container_ops
+
+`annotated.rs` defines `AnnotatedContent`: Typst's realized content plus
+semantic metadata recovered from the authored tree. The realized content is
+kept verbatim. Annotation supplies the semantic kind, slots, patch surface,
+equation origins, footnote body metadata, and source span.
+
+`container_ops.rs` is the only module that knows container internals. Each
+`ContainerOps` implementation owns four contracts:
+
+- identify the container kind;
+- extract authored slot parts;
+- return the patch surface and slot paths for that container;
+- replace or insert children on that patch surface.
+
+The handled containers are lists, enums, terms, tables, grids, stacks, figures,
+footnotes, quotes, and single-body wrappers (`align`, `pad`, `place`,
+`columns`, `box`, `block`, `rect`, `circle`, `ellipse`).
+
+`SemanticSlot.path` is relative to the node's patch surface. It is not a promise
+about incidental realized layout children. This distinction matters for figures:
+Typst realizes a captioned figure through body, vertical spacing, caption, and
+paragraph-break scaffolding, but the authored figure patch surface has body path
+`[0]` and caption path `[1]`.
 
 ### diff
 
@@ -250,6 +294,30 @@ newline-joined string of `path:line:col: message` entries.
 The path is the virtual path (e.g. `chapter.typ`), not the absolute disk path,
 so it matches what the user wrote in their `.typ` source.
 
+### debug and trace
+
+`debug.rs` owns the on-disk diagnostic formats. It writes:
+
+- YAML snapshots for `--debug`;
+- `diff/pipeline-events.jsonl` for `--debug-trace`;
+- `diff/rendered-region-frame-traces.jsonl` lazily when rendered page-region
+  frame walking runs.
+
+`trace.rs` owns the trace API used by the pipeline:
+
+- `DebugEventSink` is the shared sink trait for both whole-pipeline events and
+  rendered-region frame events.
+- `PipelineTraceEvent` is the compact decision-event type. It stores stage,
+  event name, optional reason, content hash/preview summaries, block indexes,
+  slot paths, similarity score, threshold, and selected edit kind.
+- `RenderedRegionTraceStart`, `FrameTraceEvent`, and
+  `RenderedRegionTraceEnd` describe the existing low-level frame-walk trace for
+  contextual page regions.
+
+Keeping these types out of `diff.rs` prevents tracing from becoming part of the
+diff algorithm's conceptual model. Diff, annotation, and the CLI emit events;
+`debug.rs` decides how those events become files.
+
 ---
 
 ## Key data structures
@@ -297,46 +365,53 @@ Produced first as `Equal`/`Delete`/`Insert` by the LCS diff, then
 `Delete`/`Insert` pairs within edit zones are upgraded to `Replace` by the
 similarity matcher.
 
-### `DiffResult` / `DiffResultOp`
+### `DiffResult`, `RealizedEdit`, and `EditContent`
 
 ```rust
-pub enum DiffResultOp {
-    Equal(DiffBlock),
-    Deleted(DiffBlock),
-    Inserted(DiffBlock),
-    Modified(DiffBlock, Vec<WordOp>),          // new block + word-level diff
-    ModifiedSlots(DiffBlock, Vec<SlotDiff>),   // structured container, slots changed
-}
-
 pub struct DiffResult {
-    pub block_ops: Vec<DiffResultOp>,
-    pub root_styles: Styles,                   // document-level page styles
+    pub blocks: Vec<DiffBlockEdit>,
+    pub root_styles: Styles,
+    pub regions: Vec<DiffRegionEdit>,
+    pub rendered_regions: Vec<RenderedRegionEdit>,
+}
+
+pub struct DiffBlockEdit {
+    pub base: AnnotatedContent,
+    pub edits: Vec<RealizedEdit>,
+    pub page_styles: Styles,
+}
+
+pub enum RealizedEdit {
+    ReplaceAt { path: Vec<usize>, content: EditContent },
+    InsertBefore { anchor: Vec<usize>, content: EditContent },
+    InsertAfter { anchor: Vec<usize>, content: EditContent },
+    Append { content: EditContent },
+    WholeBlock(EditContent),
 }
 ```
 
-`root_styles` is extracted from the outermost `StyledElem` in the new
-document's realized content. It carries document-level page styles, such as
-default margins and headers/footers, and is applied to the entire annotated
-output.
+`DiffResult` is a structured edit script over annotated Typst content. Body
+edits live in `blocks`; semantic page-region edits live in `regions`; rendered
+header/footer changes live in `rendered_regions`.
 
-`ModifiedSlots` takes priority over `Modified`: when a `Replace` block pair
-has the same slot shape (same number of slots at the same paths), `diff_content`
-diffs corresponding slots word-by-word. If no slots are found or the shape
-differs, it falls back to whole-block word diffing (`Modified`).
-
-### `SlotDiff`
+`RealizedEdit` paths are patch-surface paths. `ReplaceAt([1], ...)` on a figure
+means "replace the authored caption slot", even if Typst's realized layout tree
+has inserted spacing or tags between the body and caption.
 
 ```rust
-pub struct SlotDiff {
-    pub path: Vec<SlotStep>,
-    pub word_ops: Vec<WordOp>,
+pub enum EditContent {
+    Inserted(Content),
+    Deleted(Content),
+    Modified { base: Content, word_ops: Vec<WordOp> },
+    OpaqueReplacement { old: Content, new: Content },
+    Nested { base: AnnotatedContent, edits: Vec<RealizedEdit> },
 }
 ```
 
-Identifies one changed slot within a structured container. `path` is the
-`Vec<SlotStep>` address returned by `extract_slots`; `word_ops` is the
-word-level diff for that slot's content. Only slots with at least one textual
-change are included — unchanged slots are omitted from the `Vec<SlotDiff>`.
+`OpaqueReplacement` is used when old and new content are structurally different
+but both are text-empty. This covers changed shapes, SVG/raw graphics, and
+opaque figure bodies. It renders as an old visual framed in red followed by a
+new visual framed in green.
 
 ### `Token`
 
@@ -402,7 +477,7 @@ Within `collect_blocks_from_children`, each child is classified:
 | `SequenceElem` that is inline-only | Accumulated into current paragraph |
 | `SequenceElem` with block children | Recurse (`collect_blocks_from_children`) |
 | `ParbreakElem` | Flush paragraph; emit as its own `DiffBlock` |
-| `HeadingElem`, `RawElem`, display `EquationElem` | Flush paragraph; emit as atomic block |
+| `HeadingElem`, `RawElem`, display `EquationElem` | Flush paragraph; emit as a standalone block unit |
 | `TableElem` | Flush paragraph; emit as atomic block; cell bodies are handled later by table-specific replacement logic |
 | Known inline nodes | Append to current paragraph |
 | Unknown nodes | Flush paragraph; emit as atomic block |
@@ -425,83 +500,96 @@ the top of a section applies to all blocks within that section.
 
 ### Slots and regions
 
-The current container algorithm is slot-based. It works when a block is a
-structured element whose text-bearing children are available as normal `Content`
-fields.
+The current container algorithm is owner- and slot-based. Its main distinction
+is between semantic structure and realized layout structure.
 
-Example: a same-shape table change.
+Definitions:
+
+- **Semantic owner:** the authored container that owns a change, such as a
+  figure, list, table, quote, footnote, equation, or wrapper.
+- **Semantic owner key:** the semantic kind plus stable document-order owner
+  identity used to pair old and new owners before plain-text similarity.
+- **Patch surface:** the `Content` tree that edits are applied to for a node.
+  It may be Typst's realized tree, or an authored container when realized
+  layout scaffolding is not a safe edit target.
+- **Slot mapping:** the container-owned mapping from semantic slot labels to
+  patch-surface paths.
+- **Realized layout scaffolding:** Typst-generated `tag`, `v`, `parbreak`,
+  styled/block wrappers, and similar nodes that help layout but should not
+  claim semantic ownership.
+- **Ownership noise:** any realized scaffolding or text-only similarity signal
+  that competes with the semantic owner and would duplicate or misplace an edit
+  if accepted.
+
+Example: a captioned figure.
 
 ```text
-old TableElem                         new TableElem
-├── TableCell(0): Method              ├── TableCell(0): Method
-├── TableCell(1): Precision           ├── TableCell(1): Precision
-├── TableCell(2): Recall              ├── TableCell(2): Recall
-├── TableCell(3): Proposed            ├── TableCell(3): Proposed v1
-└── ...                               └── ...
-
-extract_slots(old) == [TableCell(0), TableCell(1), ...]
-extract_slots(new) == [TableCell(0), TableCell(1), ...]
-
-result: diff_slots pairs matching cells and annotates only changed cells.
+authored patch surface                realized layout scaffolding
+FigureElem                            Sequence / Block
+├── body        path [0]              ├── rect
+└── caption     path [1]              ├── v
+                                      ├── caption
+                                      └── parbreak
 ```
 
-This is a clean abstraction for direct child fields: `extract_slots` finds the
-regions, `diff_slots` compares matching paths, and `replace_slot` writes the
-annotated content back into the same container.
+The caption slot path is `[1]` because the figure owns the patch surface. It is
+not `[0, 0, 1]`, even if that path happens to reach the realized caption after
+Typst inserts a vertical spacer.
 
-The abstraction breaks down when the meaningful region is not a direct child
-field, or when a container's shape changes:
+For direct containers, the mapping is straightforward:
+
+```text
+ListElem       ListItem(0) -> [0], ListItem(1) -> [1], ...
+TableElem      TableCell(0) -> [0], TableCell(1) -> [1], ...
+FigureElem     FigureBody -> [0], FigureCaption -> [1]
+Wrapper(Box)   WrapperBody -> [0]
+```
+
+Wrappers are single-slot containers, but their realized body may be wrapped by
+Typst styling before the actual wrapper element appears. `WrapperOps` therefore
+computes the direct realized wrapper-body path rather than reusing the generic
+leaf-path mapping:
+
+- bare realized wrappers use body path `[0]`;
+- styled realized wrappers prefix through each `StyledElem`, for example
+  `[0, 0]`;
+- the path stops at the wrapper body itself and never descends into a first
+  text leaf, paragraph child, or block child.
+
+That last rule is what keeps replacements over compound wrapper bodies
+well-formed. A body such as `*Definition* -- old text` must be tokenized as the
+whole body so the word diff can emit both the deleted `old` side and the
+inserted replacement side.
+
+Slot diff has two paths:
 
 ```mermaid
 flowchart TD
-    A["Replace(old block, new block)"] --> B{"same slot paths?"}
-    B -->|"yes"| C["ModifiedSlots: preserve container"]
-    B -->|"no"| D["Modified: flat word diff"]
-    D --> E["replace_text_container"]
-    E --> F{"inline text target exists?"}
-    F -->|"yes"| G["graft inline annotations"]
-    F -->|"no"| H["emit flat annotated content"]
+    A["Paired semantic owners"] --> B{"same slot labels?"}
+    B -->|"yes"| C["Pair slots by position"]
+    B -->|"no"| D["LCS over slot child text"]
+    C --> E["Recursive slot edit or word/opaque edit"]
+    D --> E
+    E --> F["Patch owner surface"]
 ```
 
-Corpus 35 follows the `no` branch: the new table has an extra row, so the cell
-paths no longer match. The diff falls back to a flat word diff and the table
-structure is lost.
+Changed labels model slot insertion/deletion. The old and new semantic owners
+remain paired even when the slot shape changes, which is what makes caption
+add/delete a figure-owned edit rather than a whole-block delete/insert.
 
-Headers/footers and package-generated boxes expose a second limitation. Their
-text may live in styles or generated layout fields rather than normal document
-children:
+Page headers, footers, background, and foreground are handled as root regions
+rather than body slots:
 
 ```text
-document Content blocks
-├── Heading
-├── Paragraph
-└── Paragraph
-
 root/page styles
-└── PageElem::header: Content("New Report Title --- Final")
+├── PageElem::header
+├── PageElem::footer
+├── PageElem::background
+└── PageElem::foreground
 ```
 
-The current block diff only compares document blocks. It carries page styles
-forward for rendering, but it does not diff old header content against new
-header content.
-
-The proposed generalization is a "diff region" abstraction:
-
-```mermaid
-flowchart LR
-    A["Content fields"] --> D["DiffRegion"]
-    B["StyledElem styles"] --> D
-    C["Page styles"] --> D
-    D --> E["word diff"]
-    D --> F["structured fallback"]
-    D --> G["opaque replace"]
-```
-
-A slot is then just one kind of region: a text-bearing child field inside a
-structured container. Page headers, style-backed block bodies, and opaque
-package output can use the same lifecycle: extract region, compare region,
-replace region. This keeps the model generic while widening the places where
-regions can be found.
+They follow the same lifecycle: identify the semantic region, diff it, produce
+a renderable edit script, and apply it to the appropriate surface.
 
 ### Block-level LCS diff
 
@@ -536,6 +624,13 @@ each zone, it attempts to pair each deleted block with an inserted block.
 Replaced pairs appear in the output in the original order of their deleted
 halves, with unpaired inserts appended afterwards. This keeps the output
 readable when there are more inserts than deletes (or vice versa).
+
+After edit-zone matching, `diff_annotated` can still promote a neighboring
+delete/insert pair to a replacement if both blocks claim the same semantic
+owner key. This owner-aware pairing runs before the delete/insert fallback and
+is intentionally independent of `plain_text()`. A figure with no caption and
+the same figure with a caption have misleading text (`""` versus caption text),
+but they are the same semantic owner and should produce one figure edit block.
 
 ### Word-level diff
 
@@ -605,28 +700,33 @@ would lose, such as scripts, fractions, and other math structure. The current
 granularity is expression-level: symbols inside a single equation are not yet
 diffed independently.
 
-**Slot containers:** `diff_slots` handles structured-container-vs-container
-replacements. It calls `extract_slots` on both sides and, if the slot count
-and paths match, word-diffs each slot pair. Only slots with textual changes
-become `SlotDiff` entries. The slot mechanism covers tables (cell-by-cell),
-lists (item-by-item), figures (body + caption), footnotes, quotes, grids, and
-most layout wrappers. If the slot shape differs (structure changed), `diff_slots`
-returns `None` and the block falls back to whole-block word diffing.
+**Slot containers:** structured-container replacements recurse through
+`AnnotatedContent` slots. Same-label slots are compared pairwise; changed slot
+labels use Myers LCS over each slot child's effective text so insertions and
+deletions remain container-owned. If a matched slot has no textual word change
+but the effective rendered content differs, the edit becomes
+`OpaqueReplacement` rather than disappearing.
 
 ---
 
 ## Annotation strategy
 
-`build_annotated_content(result)` iterates over `DiffResultOp` values and
-produces annotated `Content`:
+`build_annotated_content_from_tree(result, compact_substitutions)` iterates
+over `DiffBlockEdit` values and applies each block's `RealizedEdit` script to
+its annotated base.
 
-| Op | Strategy |
+| Edit content | Strategy |
 |---|---|
-| `Equal(block)` | Emit `block.content` unchanged. |
-| `Inserted(block)` | Wrap `block.content` with `.styled(TextElem::fill.set(green()))`. All text inside inherits green fill. |
-| `Deleted(block)` | Flatten the block to plain text via `plain_content()`, apply red fill, wrap in `StrikeElem`. Using plain text avoids re-rendering structural side effects (e.g. a deleted `HeadingElem` would otherwise still add a chapter number to the document). |
-| `Modified(new_block, word_ops)` | Build inline annotated content from `word_ops` (see below), then use `replace_text_container` to graft it into the original block structure. |
-| `ModifiedSlots(new_block, slot_diffs)` | For each changed slot: build annotated inline content from the slot's `word_ops`, use `replace_inline_content` to graft it into the slot body, then use `replace_slot` to write the slot back into a clone of `new_block.content`. |
+| `Inserted(content)` | Apply green text fill inside the content while preserving structural wrappers. |
+| `Deleted(content)` | Apply red fill and strikethrough inside visible text. Text-empty visual content is preserved as-is. |
+| `Modified { base, word_ops }` | Build inline annotated content from `word_ops`, then use `replace_text_container` to graft it into the original block or slot structure. |
+| `OpaqueReplacement { old, new }` | Render the old visual payload in a red-framed block followed by the new visual payload in a green-framed block. |
+| `Nested { base, edits }` | Recursively apply an edit script to the nested annotated base. |
+
+`ReplaceAt`, `InsertBefore`, and `InsertAfter` edits are applied to the base
+node's patch surface when one exists. This is why a figure caption edit at path
+`[1]` updates `FigureElem.caption` rather than the realized `v` spacer that
+Typst inserted before the caption.
 
 **Word-op inline rendering:**
 
@@ -651,6 +751,17 @@ tree looking for the node to replace the inline children:
 If no suitable container is found (e.g. a `HeadingElem` without a bare inner
 sequence), `replace_text_container` returns `None` and the annotated content is
 used directly without structural wrapping.
+
+The red/green/blue annotation styles are ordinary Typst styles, not a renderer
+overlay. They are inserted into the `Content` tree and then passed back through
+Typst layout. Document-authored page styles and show rules can therefore take
+precedence over the diagnostic fill or restructure the edited content after the
+edit script has been applied. Corpus cases 85, 86, 88, and 89 demonstrate this
+class: page background content, heading show rules, strong-text show rules, and
+figure-caption show rules can make a detected edit render without the expected
+red/green colour. In those cases, `diff/final-edits.yml` and
+`output/annotated-content.yml` are the right debug artifacts for separating
+"edit not detected" from "edit detected but restyled by the document."
 
 **Page-style grouping:** Blocks are batched by `page_styles` identity. Whenever
 `page_styles` changes between consecutive blocks, the accumulated batch is
@@ -714,6 +825,63 @@ when `main()` returns.
 
 ---
 
+## Debugging and tracing
+
+The CLI has two diagnostic flags:
+
+**`--debug`**
+Writes a YAML bundle next to the output PDF. If the output is `diff.pdf`, the
+bundle directory is `diff.debug/`. The bundle captures coarse stage snapshots:
+
+- raw eval: `old/raw-eval.yml`, `new/raw-eval.yml`;
+- normalized authored content: `old/normalized.yml`, `new/normalized.yml`;
+- realized annotated trees: `old/realized-tree.yml`,
+  `new/realized-tree.yml`;
+- block extraction: `old/blocks.yml`, `new/blocks.yml`;
+- raw and matched block ops: `diff/block-raw.yml`,
+  `diff/block-matched.yml`;
+- final edit script and page-region summaries: `diff/final-edits.yml`,
+  `diff/rendered-regions.yml`;
+- final render input and modification log:
+  `output/annotated-content.yml`, `output/modification-log.txt`.
+
+**`--debug-trace`**
+Implies `--debug` and adds JSONL traces. It always writes
+`diff/pipeline-events.jsonl`. It writes
+`diff/rendered-region-frame-traces.jsonl` only if rendered page-region frame
+walking actually runs.
+
+The two JSONL files answer different questions:
+
+- `pipeline-events.jsonl` is the whole-pipeline decision trace. It covers block
+  extraction counts, raw Myers ops, edit-zone similarity candidates and
+  selected replacements, semantic owner claims, slot recursion mode, opaque
+  fallback decisions, duplicate-pruning counts, footnote-body append counts,
+  semantic/rendered page-region decisions, annotation grouping, and render
+  start/end events.
+- `rendered-region-frame-traces.jsonl` is narrower. It records the frame-walk
+  used to extract contextual header/footer/background/foreground text from
+  rendered Typst pages. It is expected to be absent for ordinary text, figure,
+  caption, list, equation, and opaque visual bugs.
+
+Debug and trace modes must not change the semantic result. Normal mode,
+`--debug`, and `--debug-trace` all use the same evaluation, diff, annotation,
+and render pipeline. The flags only control whether snapshots are retained and
+whether trace events are emitted. When tracing is disabled, the hot path pays
+only cheap `Option` checks around trace emission points.
+
+When diagnosing a complex bug, prefer this order:
+
+1. Use `--debug` to find the first snapshot whose invariant is wrong.
+2. Use `--debug-trace` when the snapshots are plausible but a decision is
+   surprising.
+3. For contextual page-region bugs, inspect `rendered-regions.yml` first, then
+   the frame trace if rendered extraction ran.
+4. Avoid reading PDFs directly; inspect source, content trees, edit scripts,
+   layout frame text runs, and rendered images instead.
+
+---
+
 ## Performance notes
 
 **Evaluation:** Each `eval_to_realized_content` call performs a full Typst
@@ -747,14 +915,36 @@ word-diffed). Inline equations are atomic tokens. Changes inside equations are
 shown as whole-equation delete + insert. Deleted equations use Typst's
 `math.cancel` element instead of text strikethrough.
 
-**Code blocks (`RawElem`):** Treated as atomic blocks. Source-level changes
-inside code blocks are shown as whole-block delete + insert.
+**Code blocks (`RawElem`):** Extracted as standalone block units, then diffed
+line-by-line when both sides are raw blocks. Changed lines are shown as deleted
+old lines plus inserted new lines; individual token changes inside a line are
+not word-diffed.
 
-**Slot shape matching:** `diff_slots` only proceeds when the old and new
-container have the same number of slots at the same paths. If the list or
-table structure itself changes (items added/removed, columns inserted), the
-whole container falls back to plain word diffing or whole-block
-delete + insert.
+**Opaque visual granularity:** Text-empty structural changes are shown as an
+old/new visual replacement. typst-diff does not attempt word-level or
+geometry-level diffs inside raw graphics, SVGs, shapes, or opaque package
+output.
+
+**Context-opaque content:** Package macros or user-defined functions whose
+visible body is produced only through `context` evaluation may leave the
+inspected tree with empty `context`/layout artifacts rather than ordinary
+realized text or semantic slots. Changes inside those bodies can be missed.
+For example, a context-dependent card/box function can hide its body text if
+realization does not expose the final box content as ordinary `Content`.
+Packages such as `@preview/showybox` can exhibit this behavior. Direct `context`
+in document body is not inherently unsupported; it remains diffable when
+realization exposes the final text as ordinary `Content`.
+
+**Document styles can override annotation colours:** Inserted/deleted/modified
+content is marked with ordinary Typst fill and strikethrough styles before the
+final Typst render. Later page styles or show rules can recolor or restyle that
+content, so a detected edit may not appear red or green in the PDF. Known
+examples are corpus cases 85, 86, 88, and 89.
+
+**Slot insertion/deletion ambiguity:** Changed slot labels are handled by LCS
+over slot text. This keeps ordinary item/caption/cell insertions localized, but
+large structural rewrites inside repeated text-empty slots may still need an
+owner-level opaque replacement.
 
 **Block similarity threshold:** The 0.3 threshold is a fixed constant.
 Completely rewritten paragraphs will sometimes exceed 0.3 similarity and be

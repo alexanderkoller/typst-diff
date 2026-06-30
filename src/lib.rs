@@ -3,12 +3,12 @@
 //! # Pipeline
 //!
 //! ```text
-//! old.typ ──► SystemWorld ──► eval_to_realized_content ──► old_content: Content
-//! new.typ ──► SystemWorld ──► eval_to_realized_content ──► new_content: Content
+//! old.typ ──► SystemWorld ──► eval_to_realized_content ──► old: AnnotatedContent
+//! new.typ ──► SystemWorld ──► eval_to_realized_content ──► new: AnnotatedContent
 //!                                       │
-//!                          diff::diff_content(old, new) ──► DiffResult
+//!                          diff::diff_annotated(old, new) ──► DiffResult
 //!                                       │
-//!               annotate::build_annotated_content(result) ──► Content
+//!               annotate::build_annotated_content_from_tree(result) ──► Content
 //!                                       │
 //!                render::render_to_pdf(content, new_world) ──► Vec<u8>
 //! ```
@@ -17,13 +17,18 @@
 //! the old world is discarded after evaluation.
 
 pub mod annotate;
-pub mod content_slots;
+pub mod annotated;
+pub mod build_info;
+mod container_ops;
+pub mod debug;
 pub mod diag;
 pub mod diff;
 pub mod eval;
+mod normalize;
 pub mod render;
+pub mod trace;
 pub mod world;
 
-pub use annotate::build_annotated_content;
+pub use annotated::AnnotatedContent;
 pub use eval::{eval_to_content, eval_to_realized_content};
 pub use render::render_to_pdf;
