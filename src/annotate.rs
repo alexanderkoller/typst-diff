@@ -993,7 +993,11 @@ fn render_edit_content(content: &EditContent, compact: bool) -> Content {
     }
 }
 
-fn render_raw_block_modified(base: &Content, word_ops: &[WordOp], compact: bool) -> Option<Content> {
+fn render_raw_block_modified(
+    base: &Content,
+    word_ops: &[WordOp],
+    compact: bool,
+) -> Option<Content> {
     if !contains_raw_line(base) {
         return None;
     }
@@ -1056,7 +1060,11 @@ fn raw_line_diff_sequence(word_ops: &[WordOp], compact: bool) -> Content {
     for run in word_render_runs(word_ops, compact) {
         match run {
             WordRenderRun::Equal(tokens) => {
-                lines.extend(tokens.iter().map(|token| raw_line_body(token.text.as_str())));
+                lines.extend(
+                    tokens
+                        .iter()
+                        .map(|token| raw_line_body(token.text.as_str())),
+                );
             }
             WordRenderRun::Insert { tokens, color, .. } => {
                 lines.extend(tokens.iter().map(|token| {

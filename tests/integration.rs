@@ -2887,6 +2887,85 @@ fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
 }
 
 #[test]
+fn corpus_41_contextual_header_style_change_is_rendered_region_edit() {
+    use typst_diff::diff::{PageRegionKind, WordOp};
+
+    let old_world = corpus_world("41-running-header-query/old.typ");
+    let new_world = corpus_world("41-running-header-query/new.typ");
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+    let header = result
+        .rendered_regions
+        .iter()
+        .find(|region| region.kind == PageRegionKind::Header)
+        .expect("expected contextual header rendered region edit");
+    let first_page = header
+        .pages
+        .iter()
+        .find(|page| page.page == 1)
+        .expect("expected page 1 header edit");
+
+    assert!(
+        first_page.changed,
+        "page 1 should be changed by emph-to-bold header styling"
+    );
+    assert_eq!(first_page.base.plain_text().as_str(), "First Chapter");
+    assert!(
+        first_page.word_ops.iter().any(|op| {
+            matches!(op, WordOp::Delete(tokens) if tokens
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<String>()
+                .contains("First Chapter"))
+        }),
+        "expected deleted styled First Chapter token: {:?}",
+        first_page.word_ops
+    );
+    assert!(
+        first_page.word_ops.iter().any(|op| {
+            matches!(op, WordOp::Insert(tokens) if tokens
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<String>()
+                .contains("First Chapter"))
+        }),
+        "expected inserted styled First Chapter token: {:?}",
+        first_page.word_ops
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let page_height = document.pages[0].frame.height().to_pt();
+    let header_runs = rendered_text_runs(&document.pages[0].frame)
+        .into_iter()
+        .filter(|run| run.y < page_height * 0.2)
+        .collect::<Vec<_>>();
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let green = typst::visualize::Color::from_u8(0, 180, 0, 255).into();
+    let red_header_text = header_runs
+        .iter()
+        .filter(|run| run.fill == red)
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    let green_header_text = header_runs
+        .iter()
+        .filter(|run| run.fill == green)
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    assert!(
+        red_header_text.contains("First Chapter"),
+        "expected deleted page-1 running header in red: {header_runs:?}"
+    );
+    assert!(
+        green_header_text.contains("First Chapter"),
+        "expected inserted page-1 running header in green: {header_runs:?}"
+    );
+}
+
+#[test]
 fn corpus_43_contextual_alternating_headers_are_rendered_region_edits() {
     use typst_diff::diff::PageRegionKind;
 

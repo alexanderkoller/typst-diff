@@ -2263,12 +2263,10 @@ fn raw_block_modified_edit(
     new_ann: Option<&AnnotatedContent>,
     new_base: &Content,
 ) -> Option<RealizedEdit> {
-    let old_ann = old_ann.filter(|node| {
-        node.annotation.semantic_kind == Some(SemanticKind::RawBlock)
-    })?;
-    let new_ann = new_ann.filter(|node| {
-        node.annotation.semantic_kind == Some(SemanticKind::RawBlock)
-    })?;
+    let old_ann =
+        old_ann.filter(|node| node.annotation.semantic_kind == Some(SemanticKind::RawBlock))?;
+    let new_ann =
+        new_ann.filter(|node| node.annotation.semantic_kind == Some(SemanticKind::RawBlock))?;
     let old_text = raw_block_text(old_ann)?;
     let new_text = raw_block_text(new_ann)?;
     if old_text == new_text {
@@ -3563,9 +3561,10 @@ fn diff_rendered_region_texts(
         .enumerate()
         .map(|(index, new_page)| {
             let old_page = old_pages.get(index);
-            let old_text = old_page.map(|page| page.text.as_str()).unwrap_or("");
-            let new_content = TextElem::packed(new_page.text.as_str());
-            let old_content = TextElem::packed(old_text);
+            let new_content = rendered_region_page_content(new_page);
+            let old_content = old_page
+                .map(rendered_region_page_content)
+                .unwrap_or_else(|| TextElem::packed(""));
             let old_tokens = extract_words(&old_content);
             let new_tokens = extract_words(&new_content);
             let word_ops = diff_words(&old_tokens, &new_tokens);
@@ -3616,6 +3615,10 @@ fn diff_rendered_region_segments(
             }
         })
         .collect()
+}
+
+fn rendered_region_page_content(page: &RenderedRegionText) -> Content {
+    Content::sequence(page.clusters.iter().map(|cluster| cluster.content.clone()))
 }
 
 fn rendered_region_wrapper(world: &dyn World, content: &Content) -> RenderedRegionWrapper {
@@ -4898,10 +4901,8 @@ fn child_sequence_structural_edit_content(
                     if annotated_subtree_equal(old_grandchild, new_grandchild) {
                         continue;
                     }
-                    let content =
-                        recursive_slot_edit_content(old_grandchild, new_grandchild).or_else(
-                            || modified_edit_content(old_grandchild, new_grandchild),
-                        )?;
+                    let content = recursive_slot_edit_content(old_grandchild, new_grandchild)
+                        .or_else(|| modified_edit_content(old_grandchild, new_grandchild))?;
                     edits.push(RealizedEdit::ReplaceAt {
                         path: vec![new_children[new_index + i].0],
                         content,
@@ -4943,10 +4944,8 @@ fn child_sequence_structural_edit_content(
                 for i in 0..paired {
                     let old_grandchild = old_children[old_index + i].1;
                     let new_grandchild = new_children[new_index + i].1;
-                    let content =
-                        recursive_slot_edit_content(old_grandchild, new_grandchild).or_else(
-                            || modified_edit_content(old_grandchild, new_grandchild),
-                        )?;
+                    let content = recursive_slot_edit_content(old_grandchild, new_grandchild)
+                        .or_else(|| modified_edit_content(old_grandchild, new_grandchild))?;
                     edits.push(RealizedEdit::ReplaceAt {
                         path: vec![new_children[new_index + i].0],
                         content,
@@ -4988,7 +4987,10 @@ fn meaningful_child_sequence(node: &AnnotatedContent) -> Vec<(usize, &AnnotatedC
 fn is_structural_separator_child(child: &AnnotatedContent) -> bool {
     child.annotation.slots.is_empty()
         && slot_bearing_descendants(child).is_empty()
-        && effective_render_content(child).plain_text().trim().is_empty()
+        && effective_render_content(child)
+            .plain_text()
+            .trim()
+            .is_empty()
 }
 
 fn structural_child_key(child: &AnnotatedContent) -> String {
