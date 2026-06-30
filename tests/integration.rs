@@ -1086,6 +1086,50 @@ fn ownership_noise_does_not_steal_figure_or_duplicate_caption_text() {
 }
 
 #[test]
+fn figure_body_word_diff_does_not_renumber_caption() {
+    let result = diff_annotated_corpus("63-figure-body-changed");
+    let figure = only_changed_figure_block(&result, "63-figure-body-changed");
+    assert_figure_slots_are_patch_surface_paths(figure);
+
+    let (_inserted, _deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    assert!(
+        modified_inserted.iter().any(|text| text == "New"),
+        "figure body should keep word-level inserted text, got modified_inserted={modified_inserted:?}"
+    );
+    assert!(
+        modified_deleted.iter().any(|text| text == "Old"),
+        "figure body should keep word-level deleted text, got modified_deleted={modified_deleted:?}"
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let plain = normalize_whitespace(annotated.plain_text().as_str());
+    assert!(
+        plain.contains("Old New figure body labelStable caption"),
+        "annotated figure should preserve the body word diff without opaque replacement:\n{plain}"
+    );
+
+    let world = corpus_world("63-figure-body-changed/new.typ");
+    let document = typst_diff::eval::layout_document(&world, &annotated).unwrap();
+    let rendered = normalize_whitespace(
+        rendered_text_runs(&document.pages[0].frame)
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+            .as_str(),
+    );
+    assert!(
+        rendered.contains("Figure 1: Stable caption"),
+        "patched figure should keep the source figure number:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Figure 2: Stable caption"),
+        "patched figure should not inherit duplicate realization state:\n{rendered}"
+    );
+}
+
+#[test]
 fn opaque_figure_body_and_caption_change_share_one_owner_block() {
     use typst_diff::diff::{EditContent, RealizedEdit};
 

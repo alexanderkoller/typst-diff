@@ -19,6 +19,7 @@
 
 use typst::foundations::{Content, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
+use typst::introspection::TagElem;
 use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{
@@ -28,7 +29,7 @@ use typst::model::{
 use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
-use crate::annotated::effective_render_content;
+use crate::annotated::{SemanticKind, effective_render_content};
 use crate::container_ops;
 use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
@@ -579,12 +580,18 @@ fn build_annotated_content_from_tree_inner(
             .reason(format!("count={}", page_region_updates.len())),
     )?;
 
-    for (index, mut annotated_block) in result
-        .blocks
-        .iter()
-        .map(|block| annotate_block_edit(block, compact_substitutions))
-        .enumerate()
-    {
+    for (index, block) in result.blocks.iter().enumerate() {
+        if should_skip_realization_scaffold(&result.blocks, index) {
+            emit_pipeline_trace_event(
+                debug_events,
+                PipelineTraceEvent::new("annotate/block", "skipped")
+                    .new_block_index(index)
+                    .reason("realization scaffold for patched semantic owner"),
+            )?;
+            continue;
+        }
+
+        let mut annotated_block = annotate_block_edit(block, compact_substitutions);
         apply_page_region_updates(
             &mut annotated_block.page_styles,
             &page_region_updates,
@@ -620,6 +627,77 @@ fn build_annotated_content_from_tree_inner(
     Ok(crate::normalize::normalize_list_item_runs(
         Content::sequence(groups).styled_with_map(root_styles),
     ))
+}
+
+fn should_skip_realization_scaffold(blocks: &[DiffBlockEdit], index: usize) -> bool {
+    let Some(block) = blocks.get(index) else {
+        return false;
+    };
+    block.edits.is_empty()
+        && is_tag_only_scaffold(&block.base.realized)
+        && has_adjacent_patched_locatable_owner(blocks, index)
+}
+
+fn has_adjacent_patched_locatable_owner(blocks: &[DiffBlockEdit], index: usize) -> bool {
+    let mut left = index;
+    while let Some(next) = left.checked_sub(1) {
+        let block = &blocks[next];
+        if is_patched_locatable_owner(block) {
+            return true;
+        }
+        if !block.edits.is_empty() || !is_tag_only_scaffold(&block.base.realized) {
+            break;
+        }
+        left = next;
+    }
+
+    let mut right = index + 1;
+    while let Some(block) = blocks.get(right) {
+        if is_patched_locatable_owner(block) {
+            return true;
+        }
+        if !block.edits.is_empty() || !is_tag_only_scaffold(&block.base.realized) {
+            break;
+        }
+        right += 1;
+    }
+
+    false
+}
+
+fn is_patched_locatable_owner(block: &DiffBlockEdit) -> bool {
+    is_body_only_figure_patch(block)
+}
+
+fn is_body_only_figure_patch(block: &DiffBlockEdit) -> bool {
+    !block.edits.is_empty()
+        && block.base.annotation.patch_surface.is_some()
+        && matches!(
+            block.base.annotation.semantic_kind,
+            Some(SemanticKind::Figure)
+        )
+        && block.edits.iter().all(|edit| {
+            matches!(
+                edit,
+                RealizedEdit::ReplaceAt { path, .. } if path.as_slice() == [0]
+            )
+        })
+}
+
+fn is_tag_only_scaffold(content: &Content) -> bool {
+    if !content.plain_text().is_empty() {
+        return false;
+    }
+    if content.is::<TagElem>() {
+        return true;
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return is_tag_only_scaffold(&styled.child);
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return !seq.children.is_empty() && seq.children.iter().all(is_tag_only_scaffold);
+    }
+    false
 }
 
 fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
