@@ -16,7 +16,26 @@ by word.
 
 ## Install
 
-Requires [Rust 1.85 or later](https://rustup.rs).
+### Prebuilt binaries
+
+Prebuilt binaries are attached to each
+[GitHub release](https://github.com/alexanderkoller/typst-diff/releases) for
+Linux, macOS, and Windows.
+
+### With cargo-binstall
+
+If you have Rust installed, the fastest install path is
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall). It downloads
+the matching release binary when one is available:
+
+```sh
+cargo binstall typst-diff
+```
+
+### From source
+
+You can also build from source with Cargo. This requires
+[Rust 1.85 or later](https://rustup.rs).
 
 ```sh
 cargo install typst-diff

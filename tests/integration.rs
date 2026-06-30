@@ -193,6 +193,15 @@ fn diff_annotated_corpus(name: &str) -> typst_diff::diff::DiffResult {
     typst_diff::diff::diff_annotated(&old, &new)
 }
 
+fn diff_annotated_corpus_with_rendered_regions(name: &str) -> typst_diff::diff::DiffResult {
+    let old_world = corpus_world(&format!("{name}/old.typ"));
+    let new_world = corpus_world(&format!("{name}/new.typ"));
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+        .unwrap()
+}
+
 fn annotated_tree_corpus(name: &str) -> Content {
     let result = diff_annotated_corpus(name);
     typst_diff::annotate::build_annotated_content_from_tree(&result, false)
@@ -222,6 +231,17 @@ fn text_is_struck(content: &Content, needle: &str) -> bool {
         std::ops::ControlFlow::Continue(())
     });
     found
+}
+
+fn struck_texts(content: &Content) -> Vec<String> {
+    let mut out = Vec::new();
+    let _ = content.traverse::<_, ()>(&mut |c| {
+        if let Some(strike) = c.to_packed::<typst::text::StrikeElem>() {
+            out.push(strike.body.plain_text().to_string());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    out
 }
 
 fn collect_modified_word_texts(blocks: &[typst_diff::diff::DiffBlockEdit]) -> (String, String) {
@@ -1125,6 +1145,64 @@ fn figure_caption_add_delete_pair_by_semantic_owner_not_text() {
             content: EditContent::Deleted(_),
         }] if anchor.as_slice() == [0]
     ));
+}
+
+#[test]
+fn deleted_figure_caption_uses_rendered_label_as_one_deleted_payload() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let case = "72-figure-caption-deleted";
+    let expected = "Figure 1: Distribution of measurements";
+    let result = diff_annotated_corpus_with_rendered_regions(case);
+    let figure = only_changed_figure_block(&result, case);
+    assert!(matches!(
+        figure.edits.as_slice(),
+        [RealizedEdit::InsertAfter {
+            anchor,
+            content: EditContent::Deleted(content),
+        }] if anchor.as_slice() == [0] && content.plain_text().as_str() == expected
+    ));
+
+    let (_inserted, deleted, _modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    assert_eq!(deleted, vec![expected.to_string()]);
+    assert!(
+        modified_deleted.is_empty(),
+        "deleted caption label must not be represented as token-level modified deletes: {modified_deleted:?}"
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let struck = struck_texts(&annotated);
+    assert_eq!(
+        struck
+            .iter()
+            .filter(|text| text.as_str() == expected)
+            .count(),
+        1,
+        "expected exactly one full struck caption label, got {struck:?}"
+    );
+
+    let world = corpus_world(&format!("{case}/new.typ"));
+    let document = typst_diff::eval::layout_document(&world, &annotated).unwrap();
+    let rendered_text = normalize_whitespace(
+        rendered_text_runs(&document.pages[0].frame)
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+            .as_str(),
+    );
+
+    assert!(rendered_text.contains(expected), "{rendered_text}");
+    assert_eq!(
+        rendered_text
+            .matches("Distribution of measurements")
+            .count(),
+        1,
+        "{rendered_text}"
+    );
+    assert!(!rendered_text.contains("Figure 2"), "{rendered_text}");
+    assert!(!rendered_text.contains("FigureFigure"), "{rendered_text}");
 }
 
 #[test]

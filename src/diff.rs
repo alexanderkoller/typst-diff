@@ -3443,6 +3443,7 @@ fn diff_annotated_with_rendered_regions_inner(
     let new_source = crate::eval::eval_to_content(new_world)?;
     let old_doc = crate::eval::layout_document(old_world, &old_source)?;
     let new_doc = crate::eval::layout_document(new_world, &new_source)?;
+    enrich_deleted_figure_caption_labels(&mut result, &old_doc);
     let old_styles = document_page_styles_raw(&old.realized, &extract_block_units(&old.realized));
     let new_styles = document_page_styles_raw(&new.realized, &extract_block_units(&new.realized));
     let new_source_styles =
@@ -3458,6 +3459,119 @@ fn diff_annotated_with_rendered_regions_inner(
         debug_events,
     )?;
     Ok((result, debug))
+}
+
+fn enrich_deleted_figure_caption_labels(result: &mut DiffResult, old_doc: &PagedDocument) {
+    let lines = rendered_document_text_lines(old_doc);
+    if lines.is_empty() {
+        return;
+    }
+
+    for block in &mut result.blocks {
+        for edit in &mut block.edits {
+            enrich_deleted_figure_caption_label_edit(edit, &lines);
+        }
+    }
+}
+
+fn enrich_deleted_figure_caption_label_edit(edit: &mut RealizedEdit, lines: &[String]) {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content } => {
+            enrich_deleted_figure_caption_label_content(content, lines);
+        }
+        RealizedEdit::WholeBlock(_) => {}
+    }
+}
+
+fn enrich_deleted_figure_caption_label_content(content: &mut EditContent, lines: &[String]) {
+    match content {
+        EditContent::Deleted(deleted) => {
+            if let Some(rendered) = deleted_figure_caption_rendered_line(deleted, lines) {
+                *deleted = TextElem::packed(rendered.as_str());
+            }
+        }
+        EditContent::Nested { edits, .. } => {
+            for edit in edits {
+                enrich_deleted_figure_caption_label_edit(edit, lines);
+            }
+        }
+        EditContent::Inserted(_)
+        | EditContent::OpaqueReplacement { .. }
+        | EditContent::Modified { .. } => {}
+    }
+}
+
+fn deleted_figure_caption_rendered_line(content: &Content, lines: &[String]) -> Option<String> {
+    let caption = content.to_packed::<FigureCaption>()?;
+    let body = caption.body.plain_text();
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut candidates = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| *line != body && line.matches(body).count() == 1);
+    let rendered = candidates.next()?;
+    candidates
+        .next()
+        .is_none()
+        .then(|| rendered.replace('\u{a0}', " "))
+}
+
+fn rendered_document_text_lines(document: &PagedDocument) -> Vec<String> {
+    let mut lines = Vec::new();
+    for page in &document.pages {
+        let mut runs = Vec::new();
+        let mut tag_stack = Vec::new();
+        collect_positioned_text_runs(&page.frame, Point::zero(), &mut tag_stack, &mut runs);
+        let page_text = RenderedRegionText::from_runs(runs, page.frame.width().to_pt());
+        lines.extend(
+            page_text
+                .clusters
+                .into_iter()
+                .map(|cluster| cluster.text)
+                .filter(|text| !text.trim().is_empty()),
+        );
+    }
+    lines
+}
+
+fn collect_positioned_text_runs(
+    frame: &Frame,
+    origin: Point,
+    tag_stack: &mut Vec<FrameTag>,
+    out: &mut Vec<RenderedRegionRun>,
+) {
+    for (pos, item) in frame.items() {
+        let absolute = origin + *pos;
+        match item {
+            FrameItem::Text(text) => out.push(RenderedRegionRun {
+                x: absolute.x.to_pt(),
+                y: absolute.y.to_pt(),
+                width: text.width().to_pt(),
+                text: text.text.to_string(),
+                content: rendered_region_run_content(text.text.as_str(), tag_stack),
+            }),
+            FrameItem::Group(group) => {
+                collect_positioned_text_runs(&group.frame, absolute, tag_stack, out);
+            }
+            FrameItem::Tag(Tag::Start(content, _)) => {
+                tag_stack.push(FrameTag {
+                    is_artifact: content.elem().name() == "artifact",
+                    elem_name: content.elem().name().to_string(),
+                });
+            }
+            FrameItem::Tag(Tag::End(_, _, _)) => {
+                tag_stack.pop();
+            }
+            FrameItem::Shape(_, _) | FrameItem::Image(_, _, _) | FrameItem::Link(_, _) => {}
+        }
+    }
 }
 
 fn diff_root_page_regions(old_styles: &Styles, new_styles: &Styles) -> Vec<DiffRegionEdit> {

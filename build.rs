@@ -1,15 +1,31 @@
+use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    let unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_secs();
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    let unix = build_unix_timestamp();
     println!("cargo:rustc-env=TYPST_DIFF_BUILD_UNIX={unix}");
     println!(
         "cargo:rustc-env=TYPST_DIFF_BUILD_UTC={}",
         utc_timestamp(unix)
     );
+}
+
+fn build_unix_timestamp() -> u64 {
+    if let Some(value) = env::var_os("SOURCE_DATE_EPOCH") {
+        let value = value
+            .to_str()
+            .expect("SOURCE_DATE_EPOCH must contain valid UTF-8");
+        return value
+            .parse()
+            .expect("SOURCE_DATE_EPOCH must be an unsigned Unix timestamp");
+    }
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_secs()
 }
 
 fn utc_timestamp(unix: u64) -> String {
