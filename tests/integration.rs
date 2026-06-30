@@ -2283,6 +2283,87 @@ fn nested_list_item_inserted_uses_nested_changed_descendants() {
         .expect("expected changed outer list block");
 
     assert!(!list_block.edits.is_empty());
+
+    let (inserted, _deleted, modified_inserted, _modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    assert!(
+        inserted.iter().any(|text| text.contains("Review risks")),
+        "nested inserted list item should be represented as inserted content, got inserted={inserted:?}"
+    );
+    assert!(
+        modified_inserted
+            .iter()
+            .all(|text| !text.contains("Review risks")),
+        "nested inserted list item should not be flattened into a parent word insertion, got modified_inserted={modified_inserted:?}"
+    );
+}
+
+#[test]
+fn nested_list_item_inserted_does_not_synthesize_leading_parbreak() {
+    use typst::foundations::SequenceElem;
+    use typst::model::{ListElem, ParbreakElem};
+
+    fn has_sequence_starting_with_parbreak_list(content: &Content) -> bool {
+        let mut found = false;
+        let _ = content.traverse::<_, ()>(&mut |node| {
+            if let Some(seq) = node.to_packed::<SequenceElem>()
+                && seq.children.len() >= 2
+                && seq.children[0].is::<ParbreakElem>()
+                && seq.children[1].is::<ListElem>()
+            {
+                found = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        found
+    }
+
+    let annotated = annotated_tree_corpus("69-nested-list-item-inserted");
+
+    assert!(
+        !has_sequence_starting_with_parbreak_list(&annotated),
+        "nested list insertion must not synthesize a leading ParbreakElem before a list"
+    );
+}
+
+#[test]
+fn nested_list_item_inserted_preserves_nested_list_layout() {
+    let result = diff_annotated_corpus("69-nested-list-item-inserted");
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let new_world = corpus_world("69-nested-list-item-inserted/new.typ");
+
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let runs = rendered_text_runs(&document.pages[0].frame);
+    let review = runs
+        .iter()
+        .find(|run| run.text.contains("Review risks"))
+        .expect("inserted nested list item should render");
+    let notify = runs
+        .iter()
+        .find(|run| run.text.contains("Notify team"))
+        .expect("following nested list item should render");
+
+    let normal = typst_diff::eval_to_realized_content(&new_world)
+        .unwrap()
+        .realized;
+    let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
+    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let normal_review = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Review risks"))
+        .expect("normal inserted nested list item should render");
+    let normal_notify = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Notify team"))
+        .expect("normal following nested list item should render");
+
+    let annotated_gap = notify.y - review.y;
+    let normal_gap = normal_notify.y - normal_review.y;
+    assert!(
+        annotated_gap <= normal_gap + 0.5,
+        "inserted nested list item should keep tight spacing; annotated_gap={annotated_gap}, normal_gap={normal_gap}, review={review:?}, notify={notify:?}, normal_review={normal_review:?}, normal_notify={normal_notify:?}"
+    );
 }
 
 #[test]

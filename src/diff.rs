@@ -4824,13 +4824,16 @@ fn unique_changed_child_edit_content(
     old_child: &AnnotatedContent,
     new_child: &AnnotatedContent,
 ) -> Option<EditContent> {
-    if old_child.children.is_empty() || old_child.children.len() != new_child.children.len() {
+    if old_child.children.is_empty() || new_child.children.is_empty() {
         return None;
     }
     if slot_bearing_descendants(old_child).is_empty()
         && slot_bearing_descendants(new_child).is_empty()
     {
         return None;
+    }
+    if old_child.children.len() != new_child.children.len() {
+        return child_sequence_structural_edit_content(old_child, new_child);
     }
 
     let mut changed = None;
@@ -4859,6 +4862,167 @@ fn unique_changed_child_edit_content(
             content,
         }],
     })
+}
+
+fn child_sequence_structural_edit_content(
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+) -> Option<EditContent> {
+    let old_children = meaningful_child_sequence(old_child);
+    let new_children = meaningful_child_sequence(new_child);
+    if old_children.is_empty() || new_children.is_empty() {
+        return None;
+    }
+
+    let old_keys: Vec<String> = old_children
+        .iter()
+        .map(|(_, child)| structural_child_key(child))
+        .collect();
+    let new_keys: Vec<String> = new_children
+        .iter()
+        .map(|(_, child)| structural_child_key(child))
+        .collect();
+    let ops = capture_diff_slices(Algorithm::Myers, &old_keys, &new_keys);
+
+    let mut edits = Vec::new();
+    for op in ops {
+        match op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
+                for i in 0..len {
+                    let old_grandchild = old_children[old_index + i].1;
+                    let new_grandchild = new_children[new_index + i].1;
+                    if annotated_subtree_equal(old_grandchild, new_grandchild) {
+                        continue;
+                    }
+                    let content =
+                        recursive_slot_edit_content(old_grandchild, new_grandchild).or_else(
+                            || modified_edit_content(old_grandchild, new_grandchild),
+                        )?;
+                    edits.push(RealizedEdit::ReplaceAt {
+                        path: vec![new_children[new_index + i].0],
+                        content,
+                    });
+                }
+            }
+            DiffOp::Delete {
+                old_index,
+                old_len,
+                new_index,
+            } => {
+                for i in 0..old_len {
+                    push_deleted_child_sequence_edit(
+                        &mut edits,
+                        old_children[old_index + i].1,
+                        &new_children,
+                        new_index,
+                    );
+                }
+            }
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                for i in 0..new_len {
+                    let (path_index, child) = new_children[new_index + i];
+                    edits.push(RealizedEdit::ReplaceAt {
+                        path: vec![path_index],
+                        content: EditContent::Inserted(effective_render_content(child)),
+                    });
+                }
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                let paired = old_len.min(new_len);
+                for i in 0..paired {
+                    let old_grandchild = old_children[old_index + i].1;
+                    let new_grandchild = new_children[new_index + i].1;
+                    let content =
+                        recursive_slot_edit_content(old_grandchild, new_grandchild).or_else(
+                            || modified_edit_content(old_grandchild, new_grandchild),
+                        )?;
+                    edits.push(RealizedEdit::ReplaceAt {
+                        path: vec![new_children[new_index + i].0],
+                        content,
+                    });
+                }
+                for i in paired..old_len {
+                    push_deleted_child_sequence_edit(
+                        &mut edits,
+                        old_children[old_index + i].1,
+                        &new_children,
+                        new_index + paired,
+                    );
+                }
+                for i in paired..new_len {
+                    let (path_index, child) = new_children[new_index + i];
+                    edits.push(RealizedEdit::ReplaceAt {
+                        path: vec![path_index],
+                        content: EditContent::Inserted(effective_render_content(child)),
+                    });
+                }
+            }
+        }
+    }
+
+    (!edits.is_empty()).then(|| EditContent::Nested {
+        base: new_child.clone(),
+        edits,
+    })
+}
+
+fn meaningful_child_sequence(node: &AnnotatedContent) -> Vec<(usize, &AnnotatedContent)> {
+    node.children
+        .iter()
+        .enumerate()
+        .filter(|(_, child)| !is_structural_separator_child(child))
+        .collect()
+}
+
+fn is_structural_separator_child(child: &AnnotatedContent) -> bool {
+    child.annotation.slots.is_empty()
+        && slot_bearing_descendants(child).is_empty()
+        && effective_render_content(child).plain_text().trim().is_empty()
+}
+
+fn structural_child_key(child: &AnnotatedContent) -> String {
+    format!(
+        "{:?}:{}",
+        child.annotation.semantic_kind,
+        effective_text_content(child).plain_text()
+    )
+}
+
+fn push_deleted_child_sequence_edit(
+    edits: &mut Vec<RealizedEdit>,
+    old_child: &AnnotatedContent,
+    new_children: &[(usize, &AnnotatedContent)],
+    new_index: usize,
+) {
+    let content = deleted_edit(effective_render_content(old_child));
+    if let Some((path_index, _)) = new_children.get(new_index) {
+        edits.push(RealizedEdit::InsertBefore {
+            anchor: vec![*path_index],
+            content,
+        });
+    } else if new_index > 0 {
+        if let Some((path_index, _)) = new_children.get(new_index - 1) {
+            edits.push(RealizedEdit::InsertAfter {
+                anchor: vec![*path_index],
+                content,
+            });
+        } else {
+            edits.push(RealizedEdit::Append { content });
+        }
+    } else {
+        edits.push(RealizedEdit::Append { content });
+    }
 }
 
 fn owned_surface_modified_edit(

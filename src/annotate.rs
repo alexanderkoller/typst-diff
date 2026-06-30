@@ -22,7 +22,8 @@ use typst::foundations::{SequenceElem, StyleChain, StyledElem};
 use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{
-    EmphElem, EnumElem, FootnoteBody, FootnoteElem, HeadingElem, ListElem, ParElem, ParbreakElem,
+    EmphElem, EnumElem, EnumItem, FootnoteBody, FootnoteElem, HeadingElem, ListElem, ListItem,
+    ParElem, ParbreakElem, TermItem, TermsElem,
 };
 use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
@@ -458,6 +459,22 @@ fn map_transparent_children(
         return Some(content);
     }
 
+    if let Some(item) = content.to_packed_mut::<ListItem>() {
+        item.body = map_child(&item.body);
+        return Some(content);
+    }
+
+    if let Some(item) = content.to_packed_mut::<EnumItem>() {
+        item.body = map_child(&item.body);
+        return Some(content);
+    }
+
+    if let Some(item) = content.to_packed_mut::<TermItem>() {
+        item.term = map_child(&item.term);
+        item.description = map_child(&item.description);
+        return Some(content);
+    }
+
     if let Some(list) = content.to_packed_mut::<ListElem>() {
         for item in &mut list.children {
             item.body = map_child(&item.body);
@@ -468,6 +485,14 @@ fn map_transparent_children(
     if let Some(enm) = content.to_packed_mut::<EnumElem>() {
         for item in &mut enm.children {
             item.body = map_child(&item.body);
+        }
+        return Some(content);
+    }
+
+    if let Some(terms) = content.to_packed_mut::<TermsElem>() {
+        for item in &mut terms.children {
+            item.term = map_child(&item.term);
+            item.description = map_child(&item.description);
         }
         return Some(content);
     }
@@ -893,15 +918,13 @@ fn apply_realized_edit(
         RealizedEdit::InsertBefore { anchor, content } => {
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, true) {
-                node.annotation.patch_surface =
-                    Some(insertion_patch_surface(node, anchor, patched));
+                node.annotation.patch_surface = Some(patched);
             }
         }
         RealizedEdit::InsertAfter { anchor, content } => {
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, false) {
-                node.annotation.patch_surface =
-                    Some(insertion_patch_surface(node, anchor, patched));
+                node.annotation.patch_surface = Some(patched);
             }
         }
         RealizedEdit::Append { content } => {
@@ -943,68 +966,6 @@ fn strip_leading_parbreak(content: Content) -> Content {
         styled.child = strip_leading_parbreak(styled.child.clone());
     }
     content
-}
-
-fn insertion_patch_surface(
-    node: &crate::annotated::AnnotatedContent,
-    anchor: &[usize],
-    patched: Content,
-) -> Content {
-    let nested_list_insert = anchor.len() > 1
-        && !has_table_container(&patched)
-        && (matches!(
-            node.annotation.semantic_kind,
-            Some(crate::annotated::SemanticKind::List) | Some(crate::annotated::SemanticKind::Enum)
-        ) || has_any_list_container(&patched)
-            || node.annotation.semantic_kind.is_none());
-    if nested_list_insert || has_nested_list_container(&patched) {
-        Content::sequence([Content::new(ParbreakElem::new()), patched])
-    } else {
-        patched
-    }
-}
-
-fn has_any_list_container(content: &Content) -> bool {
-    let mut found = content.is::<ListElem>() || content.is::<EnumElem>();
-    let _ = content.traverse::<_, ()>(&mut |child| {
-        if child.is::<ListElem>() || child.is::<EnumElem>() {
-            found = true;
-            return std::ops::ControlFlow::Break(());
-        }
-        std::ops::ControlFlow::Continue(())
-    });
-    found
-}
-
-fn has_table_container(content: &Content) -> bool {
-    use typst::layout::GridElem;
-    use typst::model::TableElem;
-
-    let mut found = content.is::<TableElem>() || content.is::<GridElem>();
-    let _ = content.traverse::<_, ()>(&mut |child| {
-        if child.is::<TableElem>() || child.is::<GridElem>() {
-            found = true;
-            return std::ops::ControlFlow::Break(());
-        }
-        std::ops::ControlFlow::Continue(())
-    });
-    found
-}
-
-fn has_nested_list_container(content: &Content) -> bool {
-    let mut seen = false;
-    let mut nested = false;
-    let _ = content.traverse::<_, ()>(&mut |child| {
-        if child.is::<ListElem>() || child.is::<EnumElem>() {
-            if seen {
-                nested = true;
-                return std::ops::ControlFlow::Break(());
-            }
-            seen = true;
-        }
-        std::ops::ControlFlow::Continue(())
-    });
-    nested
 }
 
 fn render_edit_content(content: &EditContent, compact: bool) -> Content {
