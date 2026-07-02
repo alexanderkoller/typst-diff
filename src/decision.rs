@@ -17,9 +17,6 @@ pub enum FallbackCode {
     PositionalSequencePairing,
     ContextVisibleTextPairing,
     VisibleTextOwnerBlockMatching,
-    UniqueChangedSlotPair,
-    SlotBearingDescendantPair,
-    DuplicateEditPruningByTextSignature,
     UniqueWrapperBodyRecovery,
     UniquePartialItemContainerMapping,
     AnonymousOpaquePreSurfaceGrafting,
@@ -35,9 +32,6 @@ impl FallbackCode {
         Self::PositionalSequencePairing,
         Self::ContextVisibleTextPairing,
         Self::VisibleTextOwnerBlockMatching,
-        Self::UniqueChangedSlotPair,
-        Self::SlotBearingDescendantPair,
-        Self::DuplicateEditPruningByTextSignature,
         Self::UniqueWrapperBodyRecovery,
         Self::UniquePartialItemContainerMapping,
         Self::AnonymousOpaquePreSurfaceGrafting,
@@ -53,11 +47,6 @@ impl FallbackCode {
             Self::PositionalSequencePairing => "FB-001-positional-sequence-pairing",
             Self::ContextVisibleTextPairing => "FB-002-context-visible-text-pairing",
             Self::VisibleTextOwnerBlockMatching => "FB-003-visible-text-owner-block-matching",
-            Self::UniqueChangedSlotPair => "FB-004-unique-changed-slot-pair",
-            Self::SlotBearingDescendantPair => "FB-005-slot-bearing-descendant-pair",
-            Self::DuplicateEditPruningByTextSignature => {
-                "FB-006-duplicate-edit-pruning-by-text-signature"
-            }
             Self::UniqueWrapperBodyRecovery => "FB-007-unique-wrapper-body-recovery",
             Self::UniquePartialItemContainerMapping => {
                 "FB-008-unique-partial-item-container-mapping"
@@ -88,11 +77,6 @@ impl FallbackCode {
             }
             Self::ContextVisibleTextPairing => "paired context output by visible text",
             Self::VisibleTextOwnerBlockMatching => "matched owner/block by visible text",
-            Self::UniqueChangedSlotPair => "localized replacement through a unique changed slot",
-            Self::SlotBearingDescendantPair => "matched a unique slot-bearing descendant",
-            Self::DuplicateEditPruningByTextSignature => {
-                "suppressed duplicate edits using text signatures"
-            }
             Self::UniqueWrapperBodyRecovery => "recovered wrapper body through a unique wrapper",
             Self::UniquePartialItemContainerMapping => {
                 "mapped a partial item container through a unique visible item"

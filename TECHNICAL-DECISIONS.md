@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Edit Scripts Drive Slot And Child Recursion
+
+- Phase 8 introduces `edit_script` as the shared ordered edit-script builder for semantic children.
+- Slot diffs now use the same script consumer for same-shape and LCS modes. Same-shape mode pairs by position, while LCS mode pairs by slot child match keys.
+- Generic nested child-sequence diffs now use the same edit-script operation model as slot diffs instead of maintaining local Myers walking logic.
+- Nested wrapper/body recursion no longer depends on finding exactly one slot-bearing descendant. When a paired child contains slot-bearing descendants, its meaningful children are diffed by script, so multiple nested container changes can produce multiple nested edits.
+- The unique changed slot pair fallback, slot-bearing descendant pair fallback, and duplicate edit pruning by text signature have been removed from production code, and their warning codes have been retired from the fallback ledger.
+- Duplicate prevention for the tested repeated-container and opaque-wrapper cases now comes from owner/slot/script selection rather than a late text-signature pruning pass.
+
+Tradeoff: this phase unifies the script mechanics and removes the broad uniqueness/pruning fallbacks, but `ContainerOps` still exposes some stable children through existing slot mapping APIs rather than a fully generalized edit-script input trait. Table/grid shape changes remain covered by the current cell slot addressing and tests, with broader row/column addressing still a later cleanup target.
+
 ## Attributed Block Streams Carry Ownership Into Block Ops
 
 - Phase 7 introduces `attributed_block_stream` as the carrier for semantic block attribution.

@@ -60,12 +60,6 @@ pub(crate) fn visible_unit_key(text: &str, content: &Content) -> ContentKey {
     ContentKey(format!("visible:{}:{}", text, presentation_key(content)))
 }
 
-pub(crate) fn opaque_signature(content: &Content) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
-}
-
 pub(crate) fn normalized_visible_text_matches(left: &Content, right: &Content) -> bool {
     let left = normalized_visible_text(left);
     let right = normalized_visible_text(right);

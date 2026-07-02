@@ -30,6 +30,7 @@ pub mod diag;
 pub mod diff;
 mod diff_area;
 mod diff_surface;
+mod edit_script;
 pub mod eval;
 mod normalize;
 mod patch_surface;
