@@ -1,5 +1,17 @@
 # Technical Decisions
 
+## Page Regions Share Area And Surface Concepts
+
+- Phase 10 keeps semantic page regions and rendered page regions under the `DiffAreaKind` boundary introduced earlier: semantic header/footer/background/foreground edits use `SemanticPageRegion`, while contextual rendered text changes use `RenderedPageRegion`.
+- Rendered-region word and segment diffs continue to use explicit `DiffSurfaceKind::RenderedRegionText` and `RenderedRegionSegment` surfaces rather than anonymous word operations.
+- Rendered-region alignment preservation now reads `AlignElem` from the page-region content tree and maps its horizontal alignment directly before considering older recovery paths.
+- When an opaque `ContextElem` hides the authored wrapper body, rendered-region alignment may still use the source-span `align(...)` parser as a ledgered fallback. Extracted rendered text geometry is used only after structural and source-span wrapper recovery fail, and only when all non-empty rendered pages agree on the same left, center, or right placement.
+- Generated rendered-region Typst snippets still exist for the page-number-dependent context expression, but construction is now fallible and returns an error instead of panicking with `expect`.
+- Regression coverage includes rendered header text containing brackets, hashes, backslashes, quotes, and non-ASCII text, plus an assertion that alignment comes from the retained `AlignElem` wrapper.
+- The generated-snippet panic warning code has been retired from the fallback ledger. The source-string align parsing code remains active but partially replaced because contextual page-region closures do not expose their bodies as `Content`.
+
+Tradeoff: rendered page-region extraction remains layout-dependent because contextual headers and footers can differ per page only after layout. This phase removes the panic path and makes content-tree wrapper analysis the first route, but keeps the source parser visible in the ledger for opaque context output; direct `ContextElem` construction and inserted/deleted rendered-only page instances remain later cleanup work.
+
 ## Footnote And Equation Provenance In The Block Stream
 
 - Phase 9 extends `attributed_block_stream` so stream items carry footnote body content alongside existing owner and equation-origin metadata.

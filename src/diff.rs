@@ -30,8 +30,9 @@ use typst::foundations::{
 };
 use typst::introspection::{MetadataElem, StateUpdateElem, Tag, TagElem};
 use typst::layout::{
-    AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, Frame, FrameItem, GridChild, GridElem,
-    GridItem, PadElem, PageElem, PagebreakElem, PagedDocument, PlaceElem, Point, Rel,
+    AlignElem, Alignment, BlockBody, BlockElem, BoxElem, ColumnsElem, Frame, FrameItem, GridChild,
+    GridElem, GridItem, HAlignment, PadElem, PageElem, PagebreakElem, PagedDocument, PlaceElem,
+    Point, Rel,
 };
 use typst::math::EquationElem;
 use typst::model::{
@@ -4267,14 +4268,14 @@ fn diff_rendered_root_page_regions(
             )?;
             continue;
         }
+        let old_pages = rendered_region_texts("old", old_styles, old_doc, kind, &mut debug_events)?;
+        let new_pages = rendered_region_texts("new", new_styles, new_doc, kind, &mut debug_events)?;
         let wrapper = new_content
             .as_ref()
             .and_then(|_| page_region_content(new_source_styles, kind))
             .as_ref()
-            .map(|content| rendered_region_wrapper(new_world, content))
-            .unwrap_or_default();
-        let old_pages = rendered_region_texts("old", old_styles, old_doc, kind, &mut debug_events)?;
-        let new_pages = rendered_region_texts("new", new_styles, new_doc, kind, &mut debug_events)?;
+            .and_then(|content| rendered_region_structural_wrapper(new_world, content))
+            .unwrap_or_else(|| rendered_region_layout_wrapper(&new_pages));
         if let Some(region) = diff_rendered_region_texts(kind, wrapper, &old_pages, &new_pages) {
             emit_pipeline_trace_event(
                 &mut debug_events,
@@ -4382,21 +4383,56 @@ fn rendered_region_page_content(page: &RenderedRegionText) -> Content {
     Content::sequence(page.clusters.iter().map(|cluster| cluster.content.clone()))
 }
 
-fn rendered_region_wrapper(world: &dyn World, content: &Content) -> RenderedRegionWrapper {
+fn rendered_region_structural_wrapper(
+    world: &dyn World,
+    content: &Content,
+) -> Option<RenderedRegionWrapper> {
+    rendered_region_alignment(content)
+        .map(RenderedRegionWrapper::Align)
+        .or_else(|| rendered_region_source_wrapper(world, content))
+}
+
+fn rendered_region_alignment(content: &Content) -> Option<RenderedRegionAlignment> {
+    if let Some(align) = content.to_packed::<AlignElem>() {
+        return rendered_region_horizontal_alignment(align.alignment.get(StyleChain::default()));
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return rendered_region_alignment(&styled.child);
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        let mut found = None;
+        for child in &seq.children {
+            if let Some(alignment) = rendered_region_alignment(child)
+                && found.replace(alignment).is_some()
+            {
+                return None;
+            }
+        }
+        return found;
+    }
+    None
+}
+
+fn rendered_region_horizontal_alignment(alignment: Alignment) -> Option<RenderedRegionAlignment> {
+    match alignment.x()? {
+        HAlignment::Left => Some(RenderedRegionAlignment::Left),
+        HAlignment::Center => Some(RenderedRegionAlignment::Center),
+        HAlignment::Right => Some(RenderedRegionAlignment::Right),
+        HAlignment::Start => Some(RenderedRegionAlignment::Start),
+        HAlignment::End => Some(RenderedRegionAlignment::End),
+    }
+}
+
+fn rendered_region_source_wrapper(
+    world: &dyn World,
+    content: &Content,
+) -> Option<RenderedRegionWrapper> {
     let span = content.span();
-    let Some(id) = span.id() else {
-        return RenderedRegionWrapper::None;
-    };
-    let Ok(source) = world.source(id) else {
-        return RenderedRegionWrapper::None;
-    };
-    let Some(range) = source.range(span) else {
-        return RenderedRegionWrapper::None;
-    };
-    let Some(snippet) = source.text().get(range) else {
-        return RenderedRegionWrapper::None;
-    };
-    authored_align_wrapper(snippet).unwrap_or_default()
+    let id = span.id()?;
+    let source = world.source(id).ok()?;
+    let range = source.range(span)?;
+    let snippet = source.text().get(range)?;
+    authored_align_wrapper(snippet)
 }
 
 fn authored_align_wrapper(source: &str) -> Option<RenderedRegionWrapper> {
@@ -4437,6 +4473,58 @@ fn parse_align_call_alignment(after_align: &str) -> Option<RenderedRegionAlignme
         "end" => Some(RenderedRegionAlignment::End),
         _ => None,
     }
+}
+
+fn rendered_region_layout_wrapper(pages: &[RenderedRegionText]) -> RenderedRegionWrapper {
+    let mut found = None;
+    for page in pages {
+        let Some(alignment) = rendered_region_page_layout_alignment(page) else {
+            continue;
+        };
+        if found
+            .replace(alignment)
+            .is_some_and(|prev| prev != alignment)
+        {
+            return RenderedRegionWrapper::None;
+        }
+    }
+    found.map(RenderedRegionWrapper::Align).unwrap_or_default()
+}
+
+fn rendered_region_page_layout_alignment(
+    page: &RenderedRegionText,
+) -> Option<RenderedRegionAlignment> {
+    if page.clusters.is_empty() {
+        return None;
+    }
+    let x_start = page
+        .clusters
+        .iter()
+        .map(|cluster| cluster.x_start)
+        .fold(f64::INFINITY, f64::min);
+    let x_end = page
+        .clusters
+        .iter()
+        .map(|cluster| cluster.x_end)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let width = x_end - x_start;
+    if !x_start.is_finite() || !x_end.is_finite() || width <= 0.0 {
+        return None;
+    }
+
+    let page_width = page.page_width_pt;
+    let center = (x_start + x_end) / 2.0;
+    let tolerance = 12.0_f64.max(page_width * 0.03);
+    if (center - page_width / 2.0).abs() <= tolerance {
+        return Some(RenderedRegionAlignment::Center);
+    }
+    if x_start <= tolerance {
+        return Some(RenderedRegionAlignment::Left);
+    }
+    if (page_width - x_end).abs() <= tolerance {
+        return Some(RenderedRegionAlignment::Right);
+    }
+    None
 }
 
 fn rendered_region_texts(
@@ -4520,12 +4608,15 @@ fn rendered_region_text(
 struct RenderedRegionText {
     text: String,
     clusters: Vec<RenderedRegionCluster>,
+    page_width_pt: f64,
 }
 
 #[derive(Clone)]
 struct RenderedRegionCluster {
     text: String,
     content: Content,
+    x_start: f64,
+    x_end: f64,
 }
 
 #[derive(Clone)]
@@ -4543,6 +4634,7 @@ impl RenderedRegionText {
             return Self {
                 text: String::new(),
                 clusters: Vec::new(),
+                page_width_pt,
             };
         }
 
@@ -4573,6 +4665,7 @@ impl RenderedRegionText {
                 .map(|cluster| cluster.text.as_str())
                 .collect(),
             clusters,
+            page_width_pt,
         }
     }
 }
@@ -4589,6 +4682,7 @@ fn push_line_clusters(
 
     let mut current = String::new();
     let mut current_content = Vec::new();
+    let mut current_start = None;
     let mut previous_end = None;
     for run in line.drain(..) {
         if let Some(end) = previous_end {
@@ -4597,9 +4691,12 @@ fn push_line_clusters(
                 clusters.push(RenderedRegionCluster {
                     text: std::mem::take(&mut current),
                     content: Content::sequence(current_content.drain(..)),
+                    x_start: current_start.take().unwrap_or(end),
+                    x_end: end,
                 });
             }
         }
+        current_start.get_or_insert(run.x);
         current.push_str(&run.text);
         current_content.push(run.content);
         previous_end = Some(run.x + run.width);
@@ -4608,6 +4705,8 @@ fn push_line_clusters(
         clusters.push(RenderedRegionCluster {
             text: current,
             content: Content::sequence(current_content),
+            x_start: current_start.unwrap_or_default(),
+            x_end: previous_end.unwrap_or_default(),
         });
     }
 }

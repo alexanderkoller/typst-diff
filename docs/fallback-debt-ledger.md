@@ -117,25 +117,12 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-013 Rendered-Region Source-String Align Parsing
 
 - Warning code: `FB-013-rendered-region-source-string-align-parsing`
-- Status: `active`
-- Current source sites: rendered page-region wrapper parsing in `src/diff.rs`.
-- Why this is a guess: generated Typst snippets are inferred from source strings for alignment wrappers.
-- User-visible risk: unusual source formatting or nested wrappers can produce inaccurate page-region annotation.
+- Status: `partially-replaced`
+- Current source sites: `src/diff.rs` `rendered_region_source_wrapper`.
+- Why this is a guess: content-tree `AlignElem` analysis now handles visible wrappers first, but opaque `ContextElem` closures can still hide an authored `align(...)` wrapper from the content tree.
+- User-visible risk: unusual source formatting or nested contextual wrappers can produce inaccurate rendered-region annotation.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/rendered-region-source-string-align-parsing`.
-- Tests: page header/footer and rendered-region alignment tests.
-- Replacement abstraction: rendered-region source spans and semantic wrapper provenance.
-- Removal criteria: wrapper decisions come from retained semantic page-region structure, not source-string parsing.
-
-## FB-014 Generated Typst Snippet Panic Path
-
-- Warning code: `FB-014-generated-typst-snippet-panic-path`
-- Status: `active`
-- Current source sites: generated snippet construction in rendered-region handling.
-- Why this is a guess: dynamically generated Typst is parsed/compiled after escaping visible text.
-- User-visible risk: malformed generated snippets can panic or fail late instead of producing a typed diagnostic.
-- Runtime warning behavior: not yet instrumented.
-- Debug/debug-trace event names: planned `fallback/generated-typst-snippet-panic-path`.
-- Tests: add malformed/edge escaping tests when instrumented.
-- Replacement abstraction: direct `Content` construction for rendered-region edits.
-- Removal criteria: generated Typst snippets are removed or failures return typed diagnostics.
+- Tests: contextual page header/footer and rendered-region alignment tests.
+- Replacement abstraction: retained context-output wrapper provenance or direct content construction for rendered page-region contexts.
+- Removal criteria: contextual page-region wrapper decisions come from retained semantic/rendered provenance rather than source-string parsing.

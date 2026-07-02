@@ -5523,6 +5523,66 @@ fn corpus_41_contextual_header_style_change_is_rendered_region_edit() {
 }
 
 #[test]
+fn rendered_region_special_characters_do_not_panic() {
+    use typst_diff::diff::{PageRegionKind, RenderedRegionAlignment, RenderedRegionWrapper};
+
+    struct NoopSink;
+    impl typst_diff::trace::DebugEventSink for NoopSink {}
+
+    let old_source = r#"#let edge = "Edge [ # \ \" é"
+#set page(header: align(right, context [#edge #counter(page).final().first()]))
+
+Body.
+"#;
+    let new_source = r#"#let edge = "Edge [ # \ \" é"
+#set page(header: align(right, context [#edge #counter(page).final().first()]))
+
+Body.
+#pagebreak()
+More body.
+"#;
+    let (_dir, old_world, new_world) = temp_worlds(old_source, new_source);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+    let header = result
+        .rendered_regions
+        .iter()
+        .find(|region| region.kind == PageRegionKind::Header)
+        .expect("expected contextual header rendered region edit");
+    assert_eq!(
+        header.wrapper,
+        RenderedRegionWrapper::Align(RenderedRegionAlignment::Right),
+        "rendered header alignment should come from the AlignElem content tree"
+    );
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree_with_debug_events(
+        &result,
+        false,
+        &mut NoopSink,
+    )
+    .expect("special rendered-region characters should not fail annotation");
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let header_text = rendered_text_runs(&document.pages[0].frame)
+        .into_iter()
+        .filter(|run| run.y < document.pages[0].frame.height().to_pt() * 0.2)
+        .map(|run| run.text)
+        .collect::<String>();
+    for expected in ["Edge", "[", "#", "\\", "é"] {
+        assert!(
+            header_text.contains(expected),
+            "missing {expected:?} in rendered header text {header_text:?}"
+        );
+    }
+    assert!(
+        header_text.contains('"') || header_text.contains('“') || header_text.contains('”'),
+        "missing quote in rendered header text {header_text:?}"
+    );
+}
+
+#[test]
 fn corpus_43_contextual_alternating_headers_are_rendered_region_edits() {
     use typst_diff::diff::PageRegionKind;
 

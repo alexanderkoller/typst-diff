@@ -219,28 +219,30 @@ Suggested direction:
 - Keep any duplicate suppression local to the ownership conflict it resolves,
   not as a broad pass over finished edits.
 
-### 7. Rendered page-region diffing is a second diff pipeline with source-string parsing
+### 7. Rendered page-region diffing is a second diff pipeline
 
 Locations:
 
-- `src/diff.rs` `diff_rendered_root_page_regions`, lines 1785-1823.
-- `src/diff.rs` `rendered_region_wrapper` / `authored_align_wrapper`, lines
-  1860-1912.
-- `src/annotate.rs` `rendered_region_context_content`, lines 490-511.
+- `src/diff.rs` `diff_rendered_root_page_regions` and rendered-region text
+  extraction.
+- `src/annotate.rs` `rendered_region_context_content`.
 
 Rendered page regions are necessary for contextual headers/footers, but the
 current implementation has several special mechanisms:
 
 - it extracts text from laid-out frames using coordinate bands,
 - it only considers artifact-tagged text,
-- it scans source snippets for `align(...)`,
-- it synthesizes Typst source strings and evaluates them,
-- it uses `.expect("generated rendered region Typst is valid")`.
+- it synthesizes Typst source strings and evaluates them for page-specific
+  context output.
 
-This path is conceptually separate from the annotated-tree path. It can miss
-non-textual region changes, region text outside the 20 percent header/footer
-bands, custom wrappers other than simple `align`, and inserted pages because
-`changed` is false when the old page does not exist.
+Wrapper preservation now reads `AlignElem` from the content tree first, and
+snippet evaluation returns an error instead of panicking. Source-string
+`align(...)` parsing remains only as a ledgered fallback for opaque contextual
+page regions whose `ContextElem` body is not inspectable. The path is still
+conceptually separate from the annotated-tree path. It can miss non-textual
+region changes, region text outside the 20 percent header/footer bands, custom
+wrappers other than simple `align`, and inserted pages because `changed` is
+false when the old page does not exist.
 
 Invariant affected: page regions should obey the same provenance and edit-script
 contracts as body content, even when their final values are layout-contextual.
@@ -249,22 +251,22 @@ Suggested direction:
 
 - Model rendered regions as first-class diff regions with provenance, not as a
   page-style afterthought.
-- Replace source-string wrapper detection with content-tree wrapper analysis.
+- Replace the remaining contextual source-string wrapper detection with retained
+  context-output wrapper provenance.
 - Avoid string-generated Typst where possible; construct `Content` directly.
 - Add tests for:
   - inserted pages with new footer/header text,
-  - right/left aligned footers written through helper functions,
   - page regions containing shapes or images,
   - header/footer content outside the current coordinate thresholds.
 
-### 8. The generated Typst snippet path can panic from library code
+### 8. Rendered-region context output is still generated from Typst snippets
 
-Location: `src/annotate.rs`, line 511.
+Location: `src/annotate.rs` `rendered_region_context_content`.
 
-`rendered_region_context_content` calls `eval_snippet_to_content(&source)` and
-then `expect`s validity. The source is generated internally, but it includes
-escaped user-visible text and wrapper markup inferred from source snippets. A
-panic during annotation would be a poor failure mode for a CLI/library.
+`rendered_region_context_content` still calls `eval_snippet_to_content(&source)`.
+The source is generated internally and escaped, and failures now propagate as
+`anyhow` errors instead of panicking. The remaining debt is the extra parse/eval
+round-trip and the string representation of a page-specific context expression.
 
 Invariant affected: annotation/render preparation should return a renderable
 edit script or a diagnostic error, never panic from generated intermediary
@@ -272,12 +274,11 @@ source.
 
 Suggested direction:
 
-- Return `Result<Content>` from the rendered-region construction path and
-  propagate errors through the existing `anyhow` pipeline.
-- Better yet, build the context content with Typst `Content` constructors rather
-  than source strings.
-- Add a test with header/footer text containing brackets, hashes, backslashes,
-  quotes, and non-ASCII text to ensure the snippet path cannot panic.
+- Build the context content with Typst `Content` constructors rather than source
+  strings.
+- Keep tests with header/footer text containing brackets, hashes, backslashes,
+  quotes, and non-ASCII text so this path stays diagnostic rather than
+  panic-prone.
 
 ### 9. Equation-carrier detection is broad and can mis-assign equation origins
 

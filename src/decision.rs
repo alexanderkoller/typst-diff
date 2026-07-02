@@ -23,7 +23,6 @@ pub enum FallbackCode {
     WordDiffOrOpaqueReplacementLadder,
     FootnoteMarkerMatchingByVisibleNumber,
     RenderedRegionSourceStringAlignParsing,
-    GeneratedTypstSnippetPanicPath,
 }
 
 impl FallbackCode {
@@ -37,7 +36,6 @@ impl FallbackCode {
         Self::WordDiffOrOpaqueReplacementLadder,
         Self::FootnoteMarkerMatchingByVisibleNumber,
         Self::RenderedRegionSourceStringAlignParsing,
-        Self::GeneratedTypstSnippetPanicPath,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -61,7 +59,6 @@ impl FallbackCode {
             Self::RenderedRegionSourceStringAlignParsing => {
                 "FB-013-rendered-region-source-string-align-parsing"
             }
-            Self::GeneratedTypstSnippetPanicPath => "FB-014-generated-typst-snippet-panic-path",
         }
     }
 
@@ -87,9 +84,6 @@ impl FallbackCode {
             }
             Self::RenderedRegionSourceStringAlignParsing => {
                 "parsed rendered-region wrapper from source text"
-            }
-            Self::GeneratedTypstSnippetPanicPath => {
-                "built generated Typst snippets for rendered-region output"
             }
         }
     }

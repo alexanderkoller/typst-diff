@@ -529,7 +529,7 @@ fn build_annotated_content_from_tree_inner(
         &result.regions,
         &result.rendered_regions,
         compact_substitutions,
-    );
+    )?;
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("annotate/page-regions", "updates")
@@ -630,7 +630,7 @@ fn page_region_updates(
     regions: &[DiffRegionEdit],
     rendered_regions: &[RenderedRegionEdit],
     compact: bool,
-) -> Vec<PageRegionUpdate> {
+) -> anyhow::Result<Vec<PageRegionUpdate>> {
     let mut updates = Vec::new();
     for region in regions {
         let content = apply_edits_to_base(&region.base, &region.edits, compact);
@@ -638,11 +638,13 @@ fn page_region_updates(
             RegionPath::RootPage(kind) => updates.push(PageRegionUpdate { kind, content }),
         }
     }
-    updates.extend(rendered_regions.iter().map(|region| PageRegionUpdate {
-        kind: region.kind,
-        content: rendered_region_context_content(region, compact),
-    }));
-    updates
+    for region in rendered_regions {
+        updates.push(PageRegionUpdate {
+            kind: region.kind,
+            content: rendered_region_context_content(region, compact)?,
+        });
+    }
+    Ok(updates)
 }
 
 fn apply_page_region_updates(
@@ -685,7 +687,10 @@ fn set_page_region(styles: &mut Styles, kind: PageRegionKind, content: Content) 
     }
 }
 
-fn rendered_region_context_content(region: &RenderedRegionEdit, compact: bool) -> Content {
+fn rendered_region_context_content(
+    region: &RenderedRegionEdit,
+    compact: bool,
+) -> anyhow::Result<Content> {
     let mut source = String::from("#context {\n  let p = counter(page).get().first()\n");
     for page in &region.pages {
         source.push_str(&format!(
@@ -706,7 +711,7 @@ fn rendered_region_context_content(region: &RenderedRegionEdit, compact: bool) -
         source.push_str(" }\n");
     }
     source.push_str("}\n");
-    crate::eval::eval_snippet_to_content(&source).expect("generated rendered region Typst is valid")
+    crate::eval::eval_snippet_to_content(&source)
 }
 
 fn rendered_region_page_markup(
