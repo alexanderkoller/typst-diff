@@ -1,5 +1,17 @@
 # Technical Decisions
 
+## Attributed Block Streams Carry Ownership Into Block Ops
+
+- Phase 7 introduces `attributed_block_stream` as the carrier for semantic block attribution.
+- Diff construction now builds old/new attributed streams from the same non-parbreak realized blocks used by block LCS before walking `BlockOp`s.
+- Each stream item carries realized block content, the primary owner claim, a separate fallback owner, semantic owner key, owner metadata, equation origins, and footnote/patch-surface presence.
+- The block-op loop claims each old/new stream item at most once by realized block content and reads owner/equation provenance from stream items instead of probing `BlockOwnerCursor` and `EquationOriginBlockCursor` inside each op arm.
+- Delete/insert pairing can peek at a matching unconsumed new attributed item without consuming it, so semantic owner replacement remains available even when edit-zone matching pairs blocks out of side-local order.
+- Primary owner claims remain separate from fallback owners so deferred empty-carrier handoff still wins for invisible wrapper/equation/opaque owners.
+- The old exact/single-block owner recovery is still used inside stream construction as a compatibility bridge. It no longer appears at each edit-construction decision point, but it has not yet been fully replaced by retained owner paths.
+
+Tradeoff: this phase moves ownership consumption to an explicit stream boundary without changing realized extraction or renderer behavior. The stream is now the single place where sparse owner/equation claims are attached to matched blocks, but owner paths are still not retained from annotation, so fallback owner recovery remains in the builder until provenance is strong enough to delete it safely.
+
 ## Diff Surfaces And Areas Name The Diff Boundary
 
 - Phase 6 introduces `diff_surface` and `diff_area` as the first shared model for what is being diffed.

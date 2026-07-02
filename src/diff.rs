@@ -46,6 +46,9 @@ use crate::annotated::{
     AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind, annotate_realized,
     effective_render_content, effective_text_content,
 };
+use crate::attributed_block_stream::{
+    AttributedBlock, AttributedBlockClaim, AttributedBlockStream,
+};
 use crate::container_ops;
 use crate::content_key;
 use crate::content_tree;
@@ -2144,6 +2147,95 @@ fn prepare_diff_inputs(
     })
 }
 
+fn attributed_block_stream<'a>(
+    root: &'a AnnotatedContent,
+    blocks: &[DiffBlock],
+) -> AttributedBlockStream<'a, SemanticOwnerKey> {
+    let mut owners = BlockOwnerCursor::new(root);
+    let mut equation_origins = EquationOriginBlockCursor::new(root);
+    AttributedBlockStream::from_claims(blocks.iter().map(|block| {
+        let owner_claim = owners.take_claim_for(&block.content);
+        let fallback_owner = owner_claim
+            .owner
+            .is_none()
+            .then(|| find_annotated_block_owner(root, &block.content))
+            .flatten();
+        AttributedBlockClaim {
+            realized: block.content.clone(),
+            owner: owner_claim.owner,
+            fallback_owner,
+            owner_key: owner_claim.key,
+            owner_path: None,
+            equation_origins: equation_origins.take_for(&block.content),
+        }
+    }))
+}
+
+fn take_attributed_block<'a>(
+    stream: &'a AttributedBlockStream<'a, SemanticOwnerKey>,
+    consumed: &mut [bool],
+    target: &Content,
+) -> &'a AttributedBlock<'a, SemanticOwnerKey> {
+    let index = attributed_block_index(stream, consumed, target)
+        .expect("block op consumed a block that is missing from attributed stream");
+    consumed[index] = true;
+    stream.get(index).expect("attributed index was just found")
+}
+
+fn peek_attributed_block<'a>(
+    stream: &'a AttributedBlockStream<'a, SemanticOwnerKey>,
+    consumed: &[bool],
+    target: &Content,
+) -> &'a AttributedBlock<'a, SemanticOwnerKey> {
+    let index = attributed_block_index(stream, consumed, target)
+        .expect("block op peeked a block that is missing from attributed stream");
+    stream.get(index).expect("attributed index was just found")
+}
+
+fn attributed_block_index(
+    stream: &AttributedBlockStream<'_, SemanticOwnerKey>,
+    consumed: &[bool],
+    target: &Content,
+) -> Option<usize> {
+    (0..stream.len()).find(|index| {
+        !consumed.get(*index).copied().unwrap_or(true)
+            && stream
+                .get(*index)
+                .is_some_and(|item| item.realized() == target)
+    })
+}
+
+fn attributed_owner_match<'a>(
+    block: &AttributedBlock<'a, SemanticOwnerKey>,
+) -> BlockOwnerMatch<'a> {
+    BlockOwnerMatch {
+        owner: block.owner(),
+        key: block.cloned_owner_key(),
+    }
+}
+
+fn attributed_owner_trace(block: &AttributedBlock<'_, SemanticOwnerKey>) -> String {
+    if block.owner().or_else(|| block.fallback_owner()).is_none() {
+        return "none".to_string();
+    }
+    let kind = block
+        .owner_semantic_kind()
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "anonymous".to_string());
+    let path = block
+        .owner_path()
+        .map(|path| path.len().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "kind={kind} key={} fallback={} path_depth={path} slots={} footnote={} patch_surface={}",
+        block.owner_key().is_some(),
+        block.owner().is_none() && block.fallback_owner().is_some(),
+        block.owner_slot_labels().len(),
+        block.owner_has_footnote(),
+        block.owner_has_patch_surface()
+    )
+}
+
 pub fn diff_annotated(old: &AnnotatedContent, new: &AnnotatedContent) -> DiffResult {
     diff_annotated_inner(old, new, false)
         .expect("diff without trace cannot fail")
@@ -3309,10 +3401,14 @@ fn diff_annotated_inner_with_events(
     let root_styles = sanitize_page_styles(root_page_styles_raw(&new.realized));
 
     let mut layout = LayoutCursor::new(&prepared.new_layout_blocks);
-    let mut old_owners = BlockOwnerCursor::new(old);
-    let mut new_owners = BlockOwnerCursor::new(new);
-    let mut old_equation_origins = EquationOriginBlockCursor::new(old);
-    let mut new_equation_origins = EquationOriginBlockCursor::new(new);
+    let old_match_blocks = non_parbreak_blocks(&prepared.old_realized_blocks);
+    let new_match_blocks = non_parbreak_blocks(&prepared.new_realized_blocks);
+    let old_stream = attributed_block_stream(old, &old_match_blocks);
+    let new_stream = attributed_block_stream(new, &new_match_blocks);
+    debug_assert_eq!(old_stream.len(), old_match_blocks.len());
+    debug_assert_eq!(new_stream.len(), new_match_blocks.len());
+    let mut old_stream_consumed = vec![false; old_stream.len()];
+    let mut new_stream_consumed = vec![false; new_stream.len()];
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
     let mut recursed_display_surfaces = Vec::new();
@@ -3329,22 +3425,30 @@ fn diff_annotated_inner_with_events(
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
-                let old_claim = old_owners.take_claim_for(&old_block.content);
-                let new_claim = new_owners.take_claim_for(&new_block.content);
+                let old_attr = take_attributed_block(
+                    &old_stream,
+                    &mut old_stream_consumed,
+                    &old_block.content,
+                );
+                let new_attr = take_attributed_block(
+                    &new_stream,
+                    &mut new_stream_consumed,
+                    &new_block.content,
+                );
+                let old_claim = attributed_owner_match(old_attr);
+                let new_claim = attributed_owner_match(new_attr);
                 let new_claim_key = new_claim.key.clone();
-                let old_ann = old_claim
-                    .owner
-                    .or_else(|| find_annotated_block_owner(old, &old_block.content));
-                let new_ann = new_claim
-                    .owner
-                    .or_else(|| find_annotated_block_owner(new, &new_block.content));
+                let old_ann = old_claim.owner.or_else(|| old_attr.fallback_owner());
+                let new_ann = new_claim.owner.or_else(|| new_attr.fallback_owner());
                 emit_pipeline_trace_event(
                     debug_events,
                     PipelineTraceEvent::new("diff/owner-claim", "equal_block")
                         .reason(format!(
-                            "old_owner={} new_owner={}",
+                            "old_owner={} new_owner={} old_attr=({}) new_attr=({})",
                             old_ann.is_some(),
-                            new_ann.is_some()
+                            new_ann.is_some(),
+                            attributed_owner_trace(old_attr),
+                            attributed_owner_trace(new_attr)
                         ))
                         .old_content(&old_block.content)
                         .new_content(&new_block.content),
@@ -3394,8 +3498,8 @@ fn diff_annotated_inner_with_events(
                     });
                     continue;
                 }
-                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
-                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
+                let old_eq_origins = old_attr.equation_origins().to_vec();
+                let new_eq_origins = new_attr.equation_origins().to_vec();
                 if new_ann.is_none()
                     && consume_recursed_display_surface(
                         &mut recursed_display_surfaces,
@@ -3573,10 +3677,20 @@ fn diff_annotated_inner_with_events(
                 });
             }
             BlockOp::Delete(old_block) => {
-                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
-                let old_claim = old_owners.take_claim_for(&old_block.content);
+                let old_attr = take_attributed_block(
+                    &old_stream,
+                    &mut old_stream_consumed,
+                    &old_block.content,
+                );
+                let old_eq_origins = old_attr.equation_origins().to_vec();
+                let old_claim = attributed_owner_match(old_attr);
                 if let Some(BlockOp::Insert(new_block)) = matched_ops.get(op_index).cloned() {
-                    let new_claim = new_owners.peek_claim_for(&new_block.content);
+                    let new_attr = peek_attributed_block(
+                        &new_stream,
+                        &new_stream_consumed,
+                        &new_block.content,
+                    );
+                    let new_claim = attributed_owner_match(new_attr);
                     if semantic_owner_claims_match(&old_claim, &new_claim) {
                         emit_pipeline_trace_event(
                             debug_events,
@@ -3586,8 +3700,13 @@ fn diff_annotated_inner_with_events(
                                 .new_content(&new_block.content)
                                 .selected_edit_kind("replace"),
                         )?;
-                        let new_claim = new_owners.take_claim_for(&new_block.content);
-                        let new_eq_origins = new_equation_origins.take_for(&new_block.content);
+                        let new_attr = take_attributed_block(
+                            &new_stream,
+                            &mut new_stream_consumed,
+                            &new_block.content,
+                        );
+                        let new_claim = attributed_owner_match(new_attr);
+                        let new_eq_origins = new_attr.equation_origins().to_vec();
                         if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
                             blocks.extend(layout.take_before(&new_block.content));
                             op_index += 1;
@@ -3644,15 +3763,16 @@ fn diff_annotated_inner_with_events(
                                 .selected_edit_kind("noop"),
                         )?;
                         blocks.extend(layout.take_before(&new_block.content));
-                        new_owners.take_claim_for(&new_block.content);
-                        new_equation_origins.take_for(&new_block.content);
+                        take_attributed_block(
+                            &new_stream,
+                            &mut new_stream_consumed,
+                            &new_block.content,
+                        );
                         op_index += 1;
                         continue;
                     }
                 }
-                let old_ann = old_claim
-                    .owner
-                    .or_else(|| find_annotated_block_owner(old, &old_block.content));
+                let old_ann = old_claim.owner.or_else(|| old_attr.fallback_owner());
                 let old_base =
                     old_display_surface_for_annotated(&old_block.content, old_ann).content;
                 blocks.push(DiffBlockEdit {
@@ -3667,10 +3787,13 @@ fn diff_annotated_inner_with_events(
                 });
             }
             BlockOp::Insert(new_block) => {
-                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
-                let new_ann = new_owners
-                    .take_owner_for(&new_block.content)
-                    .or_else(|| find_annotated_block_owner(new, &new_block.content));
+                let new_attr = take_attributed_block(
+                    &new_stream,
+                    &mut new_stream_consumed,
+                    &new_block.content,
+                );
+                let new_eq_origins = new_attr.equation_origins().to_vec();
+                let new_ann = new_attr.owner().or_else(|| new_attr.fallback_owner());
                 blocks.extend(layout.take_before(&new_block.content));
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, new_ann),
@@ -3696,16 +3819,26 @@ fn diff_annotated_inner_with_events(
                 });
             }
             BlockOp::Replace(old_block, new_block) => {
-                let mut old_eq_origins = old_equation_origins.take_for(&old_block.content);
-                let mut new_eq_origins = new_equation_origins.take_for(&new_block.content);
+                let old_attr = take_attributed_block(
+                    &old_stream,
+                    &mut old_stream_consumed,
+                    &old_block.content,
+                );
+                let new_attr = take_attributed_block(
+                    &new_stream,
+                    &mut new_stream_consumed,
+                    &new_block.content,
+                );
+                let mut old_eq_origins = old_attr.equation_origins().to_vec();
+                let mut new_eq_origins = new_attr.equation_origins().to_vec();
                 if realized_equation_carrier_count_for_diff(&old_block.content) > 0 {
                     old_eq_origins.append(&mut deferred_old_equation_origins);
                 }
                 if realized_equation_carrier_count_for_diff(&new_block.content) > 0 {
                     new_eq_origins.append(&mut deferred_new_equation_origins);
                 }
-                let mut old_claim = old_owners.take_claim_for(&old_block.content);
-                let mut new_claim = new_owners.take_claim_for(&new_block.content);
+                let mut old_claim = attributed_owner_match(old_attr);
+                let mut new_claim = attributed_owner_match(new_attr);
                 if old_claim.owner.is_none()
                     && old_block.content.plain_text().trim().is_empty()
                     && let Some(deferred) = deferred_old_owner.take()
@@ -3718,12 +3851,8 @@ fn diff_annotated_inner_with_events(
                 {
                     new_claim = deferred;
                 }
-                let old_ann = old_claim
-                    .owner
-                    .or_else(|| find_annotated_block_owner(old, &old_block.content));
-                let new_ann = new_claim
-                    .owner
-                    .or_else(|| find_annotated_block_owner(new, &new_block.content));
+                let old_ann = old_claim.owner.or_else(|| old_attr.fallback_owner());
+                let new_ann = new_claim.owner.or_else(|| new_attr.fallback_owner());
                 if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
                     blocks.extend(layout.take_before(&new_block.content));
                     continue;
@@ -5242,10 +5371,6 @@ impl<'a> BlockOwnerCursor<'a> {
         Self { claims, index: 0 }
     }
 
-    fn take_owner_for(&mut self, target: &Content) -> Option<&'a AnnotatedContent> {
-        self.take_claim_for(target).owner
-    }
-
     fn take_claim_for(&mut self, target: &Content) -> BlockOwnerMatch<'a> {
         while let Some(claim) = self.claims.get(self.index) {
             if owned_block_matches(&claim.content, target) {
@@ -5262,29 +5387,6 @@ impl<'a> BlockOwnerCursor<'a> {
                 break;
             }
             self.index += 1;
-        }
-        BlockOwnerMatch {
-            owner: None,
-            key: None,
-        }
-    }
-
-    fn peek_claim_for(&self, target: &Content) -> BlockOwnerMatch<'a> {
-        let mut index = self.index;
-        while let Some(claim) = self.claims.get(index) {
-            if owned_block_matches(&claim.content, target) {
-                return BlockOwnerMatch {
-                    owner: claim.owner,
-                    key: claim.key.clone(),
-                };
-            }
-            if claim.owner.is_some_and(is_display_equation_owner) {
-                break;
-            }
-            if !claim.content.plain_text().trim().is_empty() {
-                break;
-            }
-            index += 1;
         }
         BlockOwnerMatch {
             owner: None,
@@ -5615,7 +5717,7 @@ fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) ->
     }
 }
 
-/// Find the annotated descendant whose realized content matches `target`.
+/// Find the annotated descendant whose realized content exactly matches `target`.
 fn find_annotated_child<'a>(
     root: &'a AnnotatedContent,
     target: &Content,

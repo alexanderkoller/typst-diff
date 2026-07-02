@@ -18,6 +18,7 @@
 
 pub mod annotate;
 pub mod annotated;
+mod attributed_block_stream;
 pub mod build_info;
 mod container_ops;
 mod content_key;
