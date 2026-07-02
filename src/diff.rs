@@ -3869,7 +3869,9 @@ fn diff_annotated_inner_with_events(
     }
     blocks.extend(layout.take_trailing());
     let before_footnote_blocks = blocks.len();
-    append_footnote_body_edits(old, new, &mut blocks);
+    let old_footnote_bodies = footnote_body_contents_from_stream(&old_stream);
+    let new_footnote_bodies = footnote_body_contents_from_stream(&new_stream);
+    append_footnote_body_edits(old_footnote_bodies, new_footnote_bodies, &mut blocks);
     prune_invisible_old_deletions(&mut blocks);
     emit_pipeline_trace_event(
         debug_events,
@@ -3949,13 +3951,25 @@ fn is_invisible_old_delete_content(content: &EditContent) -> bool {
     }
 }
 
+fn footnote_body_contents_from_stream(
+    stream: &AttributedBlockStream<'_, SemanticOwnerKey>,
+) -> Vec<Content> {
+    let mut bodies = Vec::new();
+    for item in stream.iter() {
+        for body in item.footnote_bodies() {
+            if !bodies.iter().any(|existing| existing == body) {
+                bodies.push(body.clone());
+            }
+        }
+    }
+    bodies
+}
+
 fn append_footnote_body_edits(
-    old: &AnnotatedContent,
-    new: &AnnotatedContent,
+    old_bodies: Vec<Content>,
+    new_bodies: Vec<Content>,
     blocks: &mut Vec<DiffBlockEdit>,
 ) {
-    let old_bodies = footnote_body_contents(old);
-    let new_bodies = footnote_body_contents(new);
     if old_bodies.is_empty() {
         return;
     }
@@ -3995,46 +4009,6 @@ fn append_deleted_footnote_body_edits(old_bodies: Vec<Content>, blocks: &mut Vec
             page_styles: Styles::new(),
         });
     }
-}
-
-fn footnote_body_contents(root: &AnnotatedContent) -> Vec<Content> {
-    let mut out = Vec::new();
-    collect_footnote_body_contents(root, &mut out);
-    out
-}
-
-fn collect_footnote_body_contents(node: &AnnotatedContent, out: &mut Vec<Content>) {
-    let slots = node
-        .annotation
-        .slots
-        .iter()
-        .filter(|slot| matches!(slot.label, SlotStep::FootnoteBody))
-        .collect::<Vec<_>>();
-    if !slots.is_empty() {
-        for slot in slots {
-            if let Some(body) = node.get_path(&slot.path) {
-                out.push(effective_text_content(body));
-            }
-        }
-        return;
-    }
-
-    if let Some(footnote) = &node.annotation.footnote
-        && let Some(body) = footnote_body_content(&footnote.body)
-    {
-        out.push(body);
-    }
-    for child in &node.children {
-        collect_footnote_body_contents(child, out);
-    }
-}
-
-fn footnote_body_content(content: &Content) -> Option<Content> {
-    let footnote = content.to_packed::<FootnoteElem>()?;
-    let FootnoteBody::Content(body) = &footnote.body else {
-        return None;
-    };
-    Some(body.clone())
 }
 
 pub fn diff_annotated_with_rendered_regions(
@@ -5174,26 +5148,19 @@ impl EquationOriginBlockCursor {
     }
 
     fn take_for(&mut self, target: &Content) -> Vec<Content> {
-        let mut deferred = Vec::new();
-        let target_has_equation_carrier = realized_equation_carrier_count_for_diff(target) > 0;
         while let Some(claim) = self.claims.get(self.index) {
             if claim.content == *target {
                 self.index += 1;
-                deferred.extend(claim.origins.clone());
-                return deferred;
+                return claim.origins.clone();
             }
-            if !claim.content.plain_text().trim().is_empty() {
+            if !claim.content.plain_text().trim().is_empty()
+                || !target.plain_text().trim().is_empty()
+            {
                 break;
-            }
-            if !claim.origins.is_empty() && !target_has_equation_carrier {
-                break;
-            }
-            if target_has_equation_carrier {
-                deferred.extend(claim.origins.clone());
             }
             self.index += 1;
         }
-        deferred
+        Vec::new()
     }
 }
 

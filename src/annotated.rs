@@ -1146,12 +1146,6 @@ fn is_footnote_marker_text(content: &Content, number: usize) -> bool {
     if let Some(styled) = content.to_packed::<StyledElem>() {
         return is_footnote_marker_text(&styled.child, number);
     }
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq
-            .children
-            .iter()
-            .any(|c| is_footnote_marker_text(c, number));
-    }
     false
 }
 

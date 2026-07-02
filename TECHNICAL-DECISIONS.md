@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Footnote And Equation Provenance In The Block Stream
+
+- Phase 9 extends `attributed_block_stream` so stream items carry footnote body content alongside existing owner and equation-origin metadata.
+- Deleted-footnote body recovery now reads from the attributed old/new streams instead of scanning the full annotated tree after block diffing.
+- Display equation origins no longer transfer to arbitrary text-empty target blocks. The equation-origin cursor only hands an origin to the exact realized block claim and skips empty unmatched claims without treating an empty target as proof.
+- The broad empty-block equation carrier warning code has been retired from the fallback ledger because empty equation shells are now represented through retained stream equation provenance.
+- Footnote marker annotation no longer accepts any visible matching number nested anywhere in a sequence. It accepts marker text directly, including transparent style wrappers around that marker.
+- Visible-number footnote marker matching remains an active ledger item because the remaining marker post-pass still uses the rendered marker number when no retained marker ID is available.
+
+Tradeoff: this phase moves deleted footnote bodies and equation carrier decisions onto the stream boundary without rewriting Typst's footnote marker realization. That removes the broad post-hoc equation carrier guess and narrows marker matching, while leaving the explicit visible-number marker debt visible until marker IDs can be retained at realization time.
+
 ## Edit Scripts Drive Slot And Child Recursion
 
 - Phase 8 introduces `edit_script` as the shared ordered edit-script builder for semantic children.

@@ -21,7 +21,6 @@ pub enum FallbackCode {
     UniquePartialItemContainerMapping,
     AnonymousOpaquePreSurfaceGrafting,
     WordDiffOrOpaqueReplacementLadder,
-    BroadEmptyBlockEquationCarrierRecognition,
     FootnoteMarkerMatchingByVisibleNumber,
     RenderedRegionSourceStringAlignParsing,
     GeneratedTypstSnippetPanicPath,
@@ -36,7 +35,6 @@ impl FallbackCode {
         Self::UniquePartialItemContainerMapping,
         Self::AnonymousOpaquePreSurfaceGrafting,
         Self::WordDiffOrOpaqueReplacementLadder,
-        Self::BroadEmptyBlockEquationCarrierRecognition,
         Self::FootnoteMarkerMatchingByVisibleNumber,
         Self::RenderedRegionSourceStringAlignParsing,
         Self::GeneratedTypstSnippetPanicPath,
@@ -56,9 +54,6 @@ impl FallbackCode {
             }
             Self::WordDiffOrOpaqueReplacementLadder => {
                 "FB-010-word-diff-or-opaque-replacement-ladder"
-            }
-            Self::BroadEmptyBlockEquationCarrierRecognition => {
-                "FB-011-broad-empty-block-equation-carrier-recognition"
             }
             Self::FootnoteMarkerMatchingByVisibleNumber => {
                 "FB-012-footnote-marker-matching-by-visible-number"
@@ -86,9 +81,6 @@ impl FallbackCode {
             }
             Self::WordDiffOrOpaqueReplacementLadder => {
                 "selected word diff or opaque replacement after structural routes failed"
-            }
-            Self::BroadEmptyBlockEquationCarrierRecognition => {
-                "recognized an empty block as an equation carrier"
             }
             Self::FootnoteMarkerMatchingByVisibleNumber => {
                 "matched footnote marker/body by visible number"

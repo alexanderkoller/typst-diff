@@ -101,31 +101,18 @@ When a code is instrumented, default CLI execution should warn unless
 - Replacement abstraction: `diff_surface` and `diff_area` with typed surface kinds and unsupported-surface diagnostics.
 - Removal criteria: replacement kind is selected from an explicit diff surface and unsupported structured content is diagnosed without the legacy word-or-opaque fallback warning.
 
-## FB-011 Broad Empty-Block Equation Carrier Recognition
-
-- Warning code: `FB-011-broad-empty-block-equation-carrier-recognition`
-- Status: `active`
-- Current source sites: equation owner/carrier handling in `src/diff.rs`.
-- Why this is a guess: text-empty blocks can be treated as equation carriers when stronger provenance is sparse.
-- User-visible risk: unrelated empty layout shells can borrow equation behavior.
-- Runtime warning behavior: not yet instrumented.
-- Debug/debug-trace event names: planned `fallback/broad-empty-block-equation-carrier-recognition`.
-- Tests: display equation and equation-reference regressions.
-- Replacement abstraction: equation origins carried in `attributed_block_stream`.
-- Removal criteria: empty equation shells are recognized only through retained equation owner/origin IDs.
-
 ## FB-012 Footnote Marker Matching By Visible Number
 
 - Warning code: `FB-012-footnote-marker-matching-by-visible-number`
 - Status: `active`
-- Current source sites: footnote marker/body pairing in `src/diff.rs`.
-- Why this is a guess: visible marker numbers are used when structural footnote provenance is insufficient.
+- Current source sites: `src/annotated.rs` `annotate_footnote_markers`.
+- Why this is a guess: visible marker numbers are used when structural footnote marker provenance is insufficient.
 - User-visible risk: nearby inserted/deleted footnotes can pair marker/body edits incorrectly.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/footnote-marker-matching-by-visible-number`.
 - Tests: footnote body and nearby-footnote insertion tests.
 - Replacement abstraction: footnote marker/body provenance in `attributed_block_stream`.
-- Removal criteria: marker/body matching uses retained footnote IDs or explicit unsupported diagnostics.
+- Removal criteria: marker/body matching uses retained marker IDs or explicit unsupported diagnostics.
 
 ## FB-013 Rendered-Region Source-String Align Parsing
 
