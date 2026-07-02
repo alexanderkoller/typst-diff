@@ -11,6 +11,7 @@ use crate::annotated::{
 };
 use crate::content_tree;
 use crate::normalize::normalize_list_item_runs;
+use crate::patch_surface::PatchSurface;
 use typst::foundations::{Content, Packed, SequenceElem, StyleChain, StyledElem, Styles};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridCell, GridChild, GridElem, GridItem,
@@ -63,7 +64,7 @@ pub(crate) struct SlotPart {
 }
 
 pub(crate) struct SlotMapping {
-    pub(crate) patch_surface: Content,
+    pub(crate) patch_surface: PatchSurface,
     pub(crate) children: Vec<AnnotatedContent>,
     pub(crate) slots: Vec<SemanticSlot>,
 }
@@ -504,7 +505,7 @@ impl ContainerOps for FigureOps {
             return Some(mapping);
         }
         Some(map_explicit_patch_surface(
-            pre_container.clone(),
+            PatchSurface::pre_container(pre_container.clone()),
             parts,
             paths,
         ))
@@ -622,7 +623,7 @@ impl ContainerOps for WrapperOps {
         let replacement = annotate_realized(&pre_content, &realized_body);
         content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| {
             SlotMapping {
-                patch_surface: tree.realized,
+                patch_surface: PatchSurface::grafted_block_body(tree.realized),
                 children: tree.children,
                 slots: vec![SemanticSlot {
                     label: SlotStep::WrapperBody,
@@ -980,10 +981,10 @@ fn map_slot_parts(
     let patch_surface = if use_pre_as_patch_surface {
         patch_surface_for_opaque_realization(realized, pre_container)
     } else {
-        realized.clone()
+        PatchSurface::pre_container(realized.clone())
     };
-    let mut tree = anonymous_realized_tree(&patch_surface);
-    let paths = collect_leaf_block_child_paths(&patch_surface);
+    let mut tree = anonymous_realized_tree(patch_surface.as_content());
+    let paths = collect_leaf_block_child_paths(patch_surface.as_content());
     let mut slots = Vec::new();
 
     for (idx, part) in parts.into_iter().enumerate() {
@@ -1009,7 +1010,7 @@ fn map_slot_parts(
     }
 
     SlotMapping {
-        patch_surface: tree.realized,
+        patch_surface: patch_surface.map_content(|_| tree.realized),
         children: tree.children,
         slots,
     }
@@ -1064,7 +1065,7 @@ fn map_figure_realized_patch_surface(
     }
 
     Some(SlotMapping {
-        patch_surface: realized.clone(),
+        patch_surface: PatchSurface::pre_container(realized.clone()),
         children,
         slots,
     })
@@ -1154,11 +1155,11 @@ fn find_realized_path(
 }
 
 fn map_explicit_patch_surface(
-    patch_surface: Content,
+    patch_surface: PatchSurface,
     parts: Vec<SlotPart>,
     paths: Vec<Vec<usize>>,
 ) -> SlotMapping {
-    let mut tree = anonymous_realized_tree(&patch_surface);
+    let mut tree = anonymous_realized_tree(patch_surface.as_content());
     let mut slots = Vec::new();
 
     for (part, path) in parts.into_iter().zip(paths) {
@@ -1174,7 +1175,7 @@ fn map_explicit_patch_surface(
     }
 
     SlotMapping {
-        patch_surface: tree.realized,
+        patch_surface: patch_surface.map_content(|_| tree.realized),
         children: tree.children,
         slots,
     }
@@ -1208,7 +1209,7 @@ fn map_unique_partial_item_container(
     let pre_content = normalize_list_item_runs(part.pre_content);
     let replacement = annotate_realized(&pre_content, realized);
     content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
-        patch_surface: tree.realized,
+        patch_surface: PatchSurface::layout_preserving_sequence(tree.realized),
         children: tree.children,
         slots: vec![SemanticSlot {
             label: part.label,
@@ -1271,15 +1272,21 @@ fn single_item_patch_surface(pre_container: &Content, part: &SlotPart) -> Option
 
 fn empty_mapping(realized: &Content) -> SlotMapping {
     SlotMapping {
-        patch_surface: realized.clone(),
+        patch_surface: PatchSurface::pre_container(realized.clone()),
         children: vec![],
         slots: vec![],
     }
 }
 
-fn patch_surface_for_opaque_realization(realized: &Content, pre_container: &Content) -> Content {
-    graft_opaque_patch_surface(realized, pre_container)
-        .unwrap_or_else(|| opaque_pre_surface(pre_container))
+fn patch_surface_for_opaque_realization(
+    realized: &Content,
+    pre_container: &Content,
+) -> PatchSurface {
+    if let Some(surface) = graft_opaque_patch_surface(realized, pre_container) {
+        PatchSurface::grafted_block_body(surface)
+    } else {
+        PatchSurface::opaque_visual(opaque_pre_surface(pre_container))
+    }
 }
 
 fn graft_opaque_patch_surface(realized: &Content, pre_container: &Content) -> Option<Content> {

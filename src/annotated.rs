@@ -7,6 +7,7 @@
 
 use crate::container_ops::{self, ContainerKind};
 use crate::content_tree;
+use crate::patch_surface::PatchSurface;
 use std::collections::VecDeque;
 use typst::foundations::{Content, ContextElem, SequenceElem, StyleChain, StyledElem};
 use typst::introspection::{Tag, TagElem};
@@ -66,6 +67,7 @@ pub(crate) fn effective_content_with(
         .annotation
         .patch_surface
         .as_ref()
+        .map(PatchSurface::as_content)
         .unwrap_or(&node.realized);
     if surface_is_sufficient(surface) || node.children.is_empty() {
         return surface.clone();
@@ -96,7 +98,7 @@ pub struct Annotation {
     pub footnote: Option<FootnoteInfo>,
     /// Structured content to use as the local edit surface when realization is
     /// opaque or when realized layout scaffolding differs from authored slots.
-    pub patch_surface: Option<Content>,
+    pub patch_surface: Option<PatchSurface>,
     /// Source equations whose realized math carriers live under this realized node.
     pub equation_origins: Vec<Content>,
     /// Source span for diagnostics (not used as a lookup key).
@@ -201,7 +203,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
-                patch_surface: patch_surface.filter(|surface| surface != realized),
+                patch_surface: patch_surface.filter(|surface| surface.as_content() != realized),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -252,7 +254,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             && realized.plain_text().trim().is_empty()
             && !semantic.plain_text().trim().is_empty()
         {
-            node.annotation.patch_surface = Some(semantic);
+            node.annotation.patch_surface = Some(PatchSurface::pre_container(semantic));
         }
         node.annotation.span = pre.span();
         return node;
@@ -278,7 +280,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             realized,
             Annotation {
                 semantic_kind: Some(SemanticKind::RawBlock),
-                patch_surface: (pre != realized).then_some(pre.clone()),
+                patch_surface: (pre != realized).then(|| PatchSurface::pre_container(pre.clone())),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -313,7 +315,8 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
-                patch_surface: has_layout_surface.then_some(patch_surface),
+                patch_surface: has_layout_surface
+                    .then(|| PatchSurface::layout_preserving_sequence(patch_surface)),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -347,7 +350,8 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
-                patch_surface: has_layout_surface.then_some(patch_surface),
+                patch_surface: has_layout_surface
+                    .then(|| PatchSurface::layout_preserving_sequence(patch_surface)),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -395,7 +399,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
             && realized.plain_text().trim().is_empty()
             && !semantic.plain_text().trim().is_empty()
         {
-            node.annotation.patch_surface = Some(semantic);
+            node.annotation.patch_surface = Some(PatchSurface::pre_container(semantic));
         }
         node.annotation.span = span;
         return node;
@@ -408,7 +412,7 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         return leaf_annotated(
             realized,
             Annotation {
-                patch_surface: Some(pre.clone()),
+                patch_surface: Some(PatchSurface::opaque_visual(pre.clone())),
                 span: pre.span(),
                 ..Annotation::default()
             },
@@ -538,7 +542,7 @@ fn annotate_footnote_paragraph_run(run: &[Content], realized: &Content) -> Annot
         annotation: Annotation {
             semantic_kind: Some(SemanticKind::Paragraph),
             slots,
-            patch_surface: Some(patch_surface),
+            patch_surface: Some(PatchSurface::grafted_block_body(patch_surface)),
             span: run
                 .iter()
                 .find(|content| !content.span().is_detached())
@@ -631,6 +635,7 @@ fn annotated_surface(node: &AnnotatedContent) -> Content {
     node.annotation
         .patch_surface
         .as_ref()
+        .map(PatchSurface::as_content)
         .unwrap_or(&node.realized)
         .clone()
 }
@@ -1010,7 +1015,7 @@ fn annotate_container(pre: &Content, realized: &Content, kind: ContainerKind) ->
     let semantic_kind = kind.semantic_kind();
     let mapping = container_ops::map_container(pre, realized, kind);
     let patch_surface = mapping.patch_surface;
-    let patch_surface = (patch_surface != *realized).then_some(patch_surface);
+    let patch_surface = (patch_surface.as_content() != realized).then_some(patch_surface);
     AnnotatedContent {
         realized: realized.clone(),
         annotation: Annotation {
@@ -1220,7 +1225,7 @@ mod tests {
         let node = AnnotatedContent {
             realized: text("realized"),
             annotation: Annotation {
-                patch_surface: Some(surface),
+                patch_surface: Some(PatchSurface::layout_preserving_sequence(surface)),
                 ..Annotation::default()
             },
             children: vec![AnnotatedContent {
@@ -1243,7 +1248,7 @@ mod tests {
         let node = AnnotatedContent {
             realized: text("realized"),
             annotation: Annotation {
-                patch_surface: Some(surface.clone()),
+                patch_surface: Some(PatchSurface::layout_preserving_sequence(surface.clone())),
                 ..Annotation::default()
             },
             children: vec![AnnotatedContent {
@@ -1325,8 +1330,13 @@ mod tests {
             .annotation
             .patch_surface
             .as_ref()
-            .expect("parbreak-preserving surface should differ from realized");
+            .expect("parbreak-preserving surface should differ from realized")
+            .as_content();
 
+        assert!(matches!(
+            node.annotation.patch_surface,
+            Some(PatchSurface::LayoutPreservingSequence(_))
+        ));
         assert_eq!(node.children.len(), 3);
         assert!(node.children[1].realized.is::<ParbreakElem>());
         assert!(node.children[2].realized.is::<ListElem>());

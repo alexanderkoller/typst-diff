@@ -29,6 +29,7 @@ pub mod diag;
 pub mod diff;
 pub mod eval;
 mod normalize;
+mod patch_surface;
 pub mod render;
 mod style_context;
 pub mod trace;

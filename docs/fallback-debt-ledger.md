@@ -117,15 +117,15 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-009 Anonymous Opaque Pre-Surface Grafting
 
 - Warning code: `FB-009-anonymous-opaque-pre-surface-grafting`
-- Status: `active`
-- Current source sites: opaque patch-surface selection in `src/diff.rs` and `src/container_ops.rs`.
-- Why this is a guess: an anonymous pre-realization surface is grafted onto a realized carrier without a named patch-surface invariant.
+- Status: `partially-replaced`
+- Current source sites: opaque patch-surface selection in `src/container_ops.rs`.
+- Why this is a guess: opaque visual and grafted block-body patch surfaces are now named, but the carrier association can still depend on a recovered opaque realized surface rather than a retained owner/carrier ID.
 - User-visible risk: whole-surface visual replacement can obscure finer structural edits or attach to the wrong carrier.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/anonymous-opaque-pre-surface-grafting`.
 - Tests: opaque graphic and figure body tests.
-- Replacement abstraction: `patch_surface::OpaqueVisual` with an explicit carrier invariant.
-- Removal criteria: every opaque graft records its patch-surface variant and provenance proof.
+- Replacement abstraction: `patch_surface::PatchSurface::OpaqueVisual` and `PatchSurface::GraftedBlockBody` with explicit carrier provenance from an attributed block stream.
+- Removal criteria: every opaque graft records its patch-surface variant and a retained owner/carrier proof, and remaining opaque-graft decisions are instrumented or removed.
 
 ## FB-010 Word-Diff-Or-Opaque Replacement Ladder
 

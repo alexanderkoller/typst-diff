@@ -2691,6 +2691,7 @@ fn raw_block_text(node: &AnnotatedContent) -> Option<String> {
         .annotation
         .patch_surface
         .as_ref()
+        .map(crate::patch_surface::PatchSurface::as_content)
         .unwrap_or(&node.realized);
     Some(surface.plain_text().to_string())
 }
@@ -6323,6 +6324,7 @@ fn visible_footnote_units(node: &AnnotatedContent) -> Option<Vec<VisibleFootnote
         .annotation
         .patch_surface
         .as_ref()
+        .map(crate::patch_surface::PatchSurface::as_content)
         .unwrap_or(&node.realized);
     let body_path = paragraph_body_path(surface)?;
     let body = content_tree::realized_content_at_path(surface, &body_path)?;
@@ -6411,6 +6413,7 @@ fn footnote_owner_content_without_footnotes(node: &AnnotatedContent) -> Content 
         .annotation
         .patch_surface
         .as_ref()
+        .map(crate::patch_surface::PatchSurface::as_content)
         .unwrap_or(&node.realized);
     remove_footnote_calls(surface)
 }

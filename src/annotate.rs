@@ -36,6 +36,7 @@ use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
     RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, Token, WordOp,
 };
+use crate::patch_surface::PatchSurface;
 use crate::style_context;
 use crate::trace::{DebugEventSink, PipelineTraceEvent, emit_pipeline_trace_event};
 
@@ -862,9 +863,9 @@ fn apply_realized_edit(
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = replace_annotated_path_content(node, path, rendered.clone()) {
                 node.annotation.patch_surface = Some(if modified_is_pure_insert(content) {
-                    patched
+                    PatchSurface::rendered_edit_surface(patched)
                 } else {
-                    strip_leading_parbreak(patched)
+                    PatchSurface::rendered_edit_surface(strip_leading_parbreak(patched))
                 });
             }
             if let Some(child) = node.get_path_mut(path) {
@@ -878,7 +879,7 @@ fn apply_realized_edit(
             }
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, true) {
-                node.annotation.patch_surface = Some(patched);
+                node.annotation.patch_surface = Some(PatchSurface::rendered_edit_surface(patched));
             }
         }
         RealizedEdit::InsertAfter { anchor, content } => {
@@ -887,7 +888,7 @@ fn apply_realized_edit(
             }
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, false) {
-                node.annotation.patch_surface = Some(patched);
+                node.annotation.patch_surface = Some(PatchSurface::rendered_edit_surface(patched));
             }
         }
         RealizedEdit::Append { content } => {
@@ -896,7 +897,10 @@ fn apply_realized_edit(
             }
             let rendered = render_edit_content(content, compact);
             let base = effective_render_content(node);
-            node.annotation.patch_surface = Some(Content::sequence([base, rendered]));
+            node.annotation.patch_surface =
+                Some(PatchSurface::rendered_edit_surface(Content::sequence([
+                    base, rendered,
+                ])));
         }
         RealizedEdit::WholeBlock(content) => {
             node.realized = render_edit_content(content, compact);
@@ -1159,6 +1163,7 @@ fn render_surface(node: &crate::annotated::AnnotatedContent) -> &Content {
     node.annotation
         .patch_surface
         .as_ref()
+        .map(PatchSurface::as_content)
         .unwrap_or(&node.realized)
 }
 

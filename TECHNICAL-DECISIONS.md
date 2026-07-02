@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Patch Surfaces Carry Their Invariant
+
+- Phase 5 introduces `PatchSurface` as the typed value stored by `Annotation::patch_surface` and returned by container slot mapping.
+- Non-realized edit surfaces now record why they are legal: authored pre-container surfaces, grafted block-body surfaces, layout-preserving sequences, opaque visual surfaces, or rendered edit surfaces produced by applying realized edits.
+- Annotation and rendering code must read patch content through `PatchSurface::as_content`, keeping the reason attached until the last possible point.
+- Container mapping no longer returns anonymous raw `Content` as a patch surface. Wrapper body grafts, explicit pre-container surfaces, opaque visual surfaces, and single-item layout-preserving repairs are named at their creation sites.
+- Applying a `RealizedEdit` to an annotated tree produces `RenderedEditSurface`, separating edit-output surfaces from provenance surfaces created during realization annotation.
+- The anonymous opaque pre-surface fallback is only partially replaced: the surface is now typed, but the remaining carrier association still needs retained owner/carrier provenance before the ledger entry can be removed.
+
+Tradeoff: this phase changes the internal representation without redesigning patch selection or removing the remaining recovery paths. That keeps behavior stable while making future patch-surface cleanup auditable by variant instead of by raw `Option<Content>`.
+
 ## Content Keys Name The Comparison Purpose
 
 - Phase 4 introduces `content_key` as the single home for comparison keys.
