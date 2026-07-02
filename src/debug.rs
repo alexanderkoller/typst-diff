@@ -12,6 +12,7 @@ use typst::model::{FigureCaption, LinkElem, LinkTarget, ParElem, RefElem};
 use typst::syntax::Span;
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind};
+use crate::decision::{DecisionEvent, FallbackWarningsDocument};
 use crate::diff::{
     BlockBaseProvenance, BlockOp, DiffBlock, DiffBlockDebug, DiffResult, EditContent,
     PageRegionKind, RealizedEdit, RegionPath, RenderedRegionAlignment, RenderedRegionSegmentEdit,
@@ -38,6 +39,7 @@ pub struct DebugBundle<'a> {
     pub block_debug: &'a DiffBlockDebug,
     pub diff_result: &'a DiffResult,
     pub annotated_output: &'a Content,
+    pub fallback_warnings: &'a FallbackWarningsDocument,
     pub trace_files: Vec<DebugTraceFile>,
 }
 
@@ -129,6 +131,10 @@ pub fn write_debug_bundle(bundle: &DebugBundle<'_>) -> Result<()> {
     write_yaml(
         bundle.debug_dir.join("diff/rendered-regions.yml"),
         &rendered_regions_document(bundle.diff_result),
+    )?;
+    write_yaml(
+        bundle.debug_dir.join("diff/fallback-warnings.yml"),
+        bundle.fallback_warnings,
     )?;
     write_yaml(
         bundle.debug_dir.join("diff/provenance-audit.yml"),
@@ -262,6 +268,19 @@ impl DebugEventSink for JsonlTraceWriter {
         )
     }
 
+    fn decision_event(&mut self, event: &DecisionEvent) -> Result<()> {
+        let seq = self.next_seq();
+        write_jsonl(
+            &mut self.pipeline_writer,
+            &DecisionTraceRecord {
+                schema_version: SCHEMA_VERSION,
+                record: "decision_event",
+                seq,
+                event,
+            },
+        )
+    }
+
     fn rendered_region_trace_start(&mut self, trace: &RenderedRegionTraceStart) -> Result<()> {
         self.ensure_frame_writer()?;
         let seq = self.next_seq();
@@ -332,6 +351,15 @@ struct PipelineTraceRecord<'a> {
     seq: u64,
     #[serde(flatten)]
     event: &'a PipelineTraceEvent,
+}
+
+#[derive(Serialize)]
+struct DecisionTraceRecord<'a> {
+    schema_version: u32,
+    record: &'static str,
+    seq: u64,
+    #[serde(flatten)]
+    event: &'a DecisionEvent,
 }
 
 #[derive(Serialize)]

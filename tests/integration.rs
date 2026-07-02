@@ -2063,6 +2063,7 @@ fn cli_writes_debug_bundle_when_requested() {
         "diff/block-matched.yml",
         "diff/final-edits.yml",
         "diff/rendered-regions.yml",
+        "diff/fallback-warnings.yml",
         "output/annotated-content.yml",
     ];
     for rel in yaml_files {
@@ -2101,6 +2102,50 @@ fn cli_writes_debug_bundle_when_requested() {
 }
 
 #[test]
+fn cli_emits_fallback_warning_by_default_and_quiet_suppresses_stderr_only() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("old.typ"), "The old text.").unwrap();
+    std::fs::write(dir.path().join("new.typ"), "The new text.").unwrap();
+
+    let warned_pdf = dir.path().join("warned.pdf");
+    let warned = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["old.typ", "new.typ", "-o"])
+        .arg(&warned_pdf)
+        .output()
+        .unwrap();
+    assert!(warned.status.success(), "{warned:?}");
+    let warned_stderr = String::from_utf8_lossy(&warned.stderr);
+    assert!(
+        warned_stderr.contains("FB-010-word-diff-or-opaque-replacement-ladder"),
+        "{warned_stderr}"
+    );
+
+    let quiet_pdf = dir.path().join("quiet.pdf");
+    let quiet_debug_dir = quiet_pdf.with_extension("debug");
+    let quiet = Command::new(env!("CARGO_BIN_EXE_typst-diff"))
+        .current_dir(dir.path())
+        .args(["old.typ", "new.typ", "-o"])
+        .arg(&quiet_pdf)
+        .args(["--quiet", "--debug"])
+        .output()
+        .unwrap();
+    assert!(quiet.status.success(), "{quiet:?}");
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains("FB-010-word-diff-or-opaque-replacement-ladder"),
+        "{quiet_stderr}"
+    );
+    let warnings =
+        std::fs::read_to_string(quiet_debug_dir.join("diff/fallback-warnings.yml")).unwrap();
+    assert!(
+        warnings.contains("FB-010-word-diff-or-opaque-replacement-ladder"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("total_count: 1"), "{warnings}");
+}
+
+#[test]
 fn cli_debug_trace_records_pipeline_events_without_frame_trace_for_normal_text() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join("old.typ"), "The old text.").unwrap();
@@ -2135,6 +2180,11 @@ fn cli_debug_trace_records_pipeline_events_without_frame_trace_for_normal_text()
     assert!(trace.contains(r#""stage":"diff/edit-zone""#), "{trace}");
     assert!(
         trace.contains(r#""event":"selected_replacement""#),
+        "{trace}"
+    );
+    assert!(trace.contains(r#""record":"decision_event""#), "{trace}");
+    assert!(
+        trace.contains(r#""warning_code":"FB-010-word-diff-or-opaque-replacement-ladder""#),
         "{trace}"
     );
     assert!(trace.contains(r#""stage":"render""#), "{trace}");

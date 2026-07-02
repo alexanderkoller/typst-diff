@@ -51,6 +51,7 @@ use crate::annotated::{
     effective_render_content, effective_text_content,
 };
 use crate::container_ops;
+use crate::decision::{DecisionEvent, DecisionSink, FallbackCode, bounded_preview};
 use crate::trace::{
     DebugEventSink, FrameTraceEvent, PipelineTraceEvent, RenderedRegionTraceEnd,
     RenderedRegionTraceStart, emit_pipeline_trace_event,
@@ -1039,6 +1040,20 @@ fn block_op_trace_event(
             .new_content(&new.content)
             .selected_edit_kind("replace"),
     }
+}
+
+fn emit_fallback_decision(
+    decision_events: &mut Option<&mut dyn DecisionSink>,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+    event: DecisionEvent,
+) -> anyhow::Result<()> {
+    if let Some(sink) = decision_events.as_deref_mut() {
+        sink.fallback_decision(event.clone())?;
+    }
+    if let Some(sink) = debug_events.as_deref_mut() {
+        sink.decision_event(&event)?;
+    }
+    Ok(())
 }
 
 /// Scan the raw ops for contiguous `Delete + Insert` zones and pair them by similarity.
@@ -2393,7 +2408,14 @@ pub fn diff_annotated_with_block_debug_events(
     debug_events: &mut dyn DebugEventSink,
 ) -> anyhow::Result<(DiffResult, DiffBlockDebug)> {
     let mut debug_events = Some(debug_events);
-    let (result, debug) = diff_annotated_inner_with_events(old, new, true, &mut debug_events)?;
+    let mut no_decision_events = None;
+    let (result, debug) = diff_annotated_inner_with_events(
+        old,
+        new,
+        true,
+        &mut debug_events,
+        &mut no_decision_events,
+    )?;
     Ok((result, debug.expect("debug capture requested")))
 }
 
@@ -2407,6 +2429,7 @@ fn replace_block_edit(
     old_equation_origins: &[Content],
     new_equation_origins: &[Content],
     debug_events: &mut Option<&mut dyn DebugEventSink>,
+    decision_events: &mut Option<&mut dyn DecisionSink>,
 ) -> anyhow::Result<DiffBlockEdit> {
     let page_styles = new_block.page_styles.clone();
     let unique_changed_pair = match (old_ann, new_ann) {
@@ -2487,6 +2510,16 @@ fn replace_block_edit(
     if let Some((old_ann, new_ann)) = unique_changed_pair {
         let edits = diff_slot_edits_with_events(old_ann, new_ann, debug_events)?;
         if !edits.is_empty() {
+            emit_fallback_decision(
+                decision_events,
+                debug_events,
+                DecisionEvent::fallback("diff/replace-block", FallbackCode::UniqueChangedSlotPair)
+                    .preview(format!(
+                        "{} -> {}",
+                        bounded_preview(old_block.content.plain_text().as_str()),
+                        bounded_preview(new_block.content.plain_text().as_str())
+                    )),
+            )?;
             emit_pipeline_trace_event(
                 debug_events,
                 PipelineTraceEvent::new("diff/replace-block", "selected")
@@ -2622,6 +2655,19 @@ fn replace_block_edit(
         new_equation_origins,
     );
     let selected_edit_kind = edits.first().map(realized_edit_kind).unwrap_or("noop");
+    emit_fallback_decision(
+        decision_events,
+        debug_events,
+        DecisionEvent::fallback(
+            "diff/replace-block",
+            FallbackCode::WordDiffOrOpaqueReplacementLadder,
+        )
+        .preview(format!(
+            "{} -> {}",
+            bounded_preview(old_block.content.plain_text().as_str()),
+            bounded_preview(new_block.content.plain_text().as_str())
+        )),
+    )?;
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("diff/replace-block", "selected")
@@ -3488,7 +3534,14 @@ fn diff_annotated_inner(
     capture_debug: bool,
 ) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
     let mut no_debug_events = None;
-    diff_annotated_inner_with_events(old, new, capture_debug, &mut no_debug_events)
+    let mut no_decision_events = None;
+    diff_annotated_inner_with_events(
+        old,
+        new,
+        capture_debug,
+        &mut no_debug_events,
+        &mut no_decision_events,
+    )
 }
 
 fn diff_annotated_inner_with_events(
@@ -3496,6 +3549,7 @@ fn diff_annotated_inner_with_events(
     new: &AnnotatedContent,
     capture_debug: bool,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
+    decision_events: &mut Option<&mut dyn DecisionSink>,
 ) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
     let prepared = prepare_diff_inputs(old, new, capture_debug, debug_events)?;
     let old_region_styles = document_page_styles_raw(&old.realized, &prepared.old_realized_blocks);
@@ -3804,6 +3858,7 @@ fn diff_annotated_inner_with_events(
                             &old_eq_origins,
                             &new_eq_origins,
                             debug_events,
+                            decision_events,
                         )?;
                         if old_claim
                             .owner
@@ -3963,6 +4018,7 @@ fn diff_annotated_inner_with_events(
                     &old_eq_origins,
                     &new_eq_origins,
                     debug_events,
+                    decision_events,
                 )?;
                 if old_ann.zip(new_ann).is_some_and(|(old_ann, new_ann)| {
                     can_recurse_via_slots(old_ann, new_ann) && !replaced.edits.is_empty()
@@ -3980,6 +4036,19 @@ fn diff_annotated_inner_with_events(
     let before_prune_edits = count_block_edits(&blocks);
     prune_duplicate_empty_container_edits(&mut blocks);
     let after_prune_edits = count_block_edits(&blocks);
+    if after_prune_edits < before_prune_edits {
+        emit_fallback_decision(
+            decision_events,
+            debug_events,
+            DecisionEvent::fallback(
+                "diff/prune-duplicates",
+                FallbackCode::DuplicateEditPruningByTextSignature,
+            )
+            .preview(format!(
+                "edits_before={before_prune_edits} edits_after={after_prune_edits}"
+            )),
+        )?;
+    }
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("diff/prune-duplicates", "complete").reason(format!(
@@ -4338,7 +4407,10 @@ pub fn diff_annotated_with_rendered_regions(
     old_world: &dyn World,
     new_world: &dyn World,
 ) -> anyhow::Result<DiffResult> {
-    Ok(diff_annotated_with_rendered_regions_inner(old, new, old_world, new_world, None, false)?.0)
+    Ok(diff_annotated_with_rendered_regions_inner(
+        old, new, old_world, new_world, None, None, false,
+    )?
+    .0)
 }
 
 pub fn diff_annotated_with_rendered_regions_and_debug(
@@ -4347,8 +4419,9 @@ pub fn diff_annotated_with_rendered_regions_and_debug(
     old_world: &dyn World,
     new_world: &dyn World,
 ) -> anyhow::Result<(DiffResult, DiffBlockDebug)> {
-    let (result, debug) =
-        diff_annotated_with_rendered_regions_inner(old, new, old_world, new_world, None, true)?;
+    let (result, debug) = diff_annotated_with_rendered_regions_inner(
+        old, new, old_world, new_world, None, None, true,
+    )?;
     Ok((result, debug.expect("debug capture requested")))
 }
 
@@ -4365,9 +4438,30 @@ pub fn diff_annotated_with_rendered_regions_and_debug_events(
         old_world,
         new_world,
         Some(debug_events),
+        None,
         true,
     )?;
     Ok((result, debug.expect("debug capture requested")))
+}
+
+pub fn diff_annotated_with_rendered_regions_and_decisions(
+    old: &AnnotatedContent,
+    new: &AnnotatedContent,
+    old_world: &dyn World,
+    new_world: &dyn World,
+    debug_events: Option<&mut dyn DebugEventSink>,
+    decision_events: Option<&mut dyn DecisionSink>,
+    capture_debug: bool,
+) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
+    diff_annotated_with_rendered_regions_inner(
+        old,
+        new,
+        old_world,
+        new_world,
+        debug_events,
+        decision_events,
+        capture_debug,
+    )
 }
 
 fn diff_annotated_with_rendered_regions_inner(
@@ -4376,10 +4470,16 @@ fn diff_annotated_with_rendered_regions_inner(
     old_world: &dyn World,
     new_world: &dyn World,
     mut debug_events: Option<&mut dyn DebugEventSink>,
+    mut decision_events: Option<&mut dyn DecisionSink>,
     capture_debug: bool,
 ) -> anyhow::Result<(DiffResult, Option<DiffBlockDebug>)> {
-    let (mut result, debug) =
-        diff_annotated_inner_with_events(old, new, capture_debug, &mut debug_events)?;
+    let (mut result, debug) = diff_annotated_inner_with_events(
+        old,
+        new,
+        capture_debug,
+        &mut debug_events,
+        &mut decision_events,
+    )?;
     let old_source = crate::eval::eval_to_content(old_world)?;
     let new_source = crate::eval::eval_to_content(new_world)?;
     let old_doc = crate::eval::layout_document(old_world, &old_source)?;

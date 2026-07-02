@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use serde::Serialize;
 use typst::foundations::Content;
 
+use crate::decision::DecisionEvent;
 use crate::diff::PageRegionKind;
 
 #[derive(Clone, Serialize)]
@@ -119,6 +120,10 @@ impl TraceContentSummary {
 
 pub trait DebugEventSink {
     fn pipeline_trace_event(&mut self, _event: &PipelineTraceEvent) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn decision_event(&mut self, _event: &DecisionEvent) -> anyhow::Result<()> {
         Ok(())
     }
 

@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Fallback Warnings Use Lightweight Decision Events
+
+- Fallback warnings are represented as compact `DecisionEvent` records keyed by stable `FallbackCode` labels.
+- The CLI records fallback decisions during diff construction, prints compact warnings on stderr by default, and suppresses only those warnings with `--quiet`.
+- Debug bundles write aggregate fallback counts and bounded examples to `diff/fallback-warnings.yml`.
+- Debug trace writes per-decision JSONL records as `decision_event` entries in `diff/pipeline-events.jsonl`.
+- The first instrumented fallback codes are unique changed slot pair, duplicate edit pruning by text signature, and the word-diff-or-opaque replacement ladder.
+- Decision metadata stores small labels, phases, indices/paths when available, and bounded previews; it does not retain cloned Typst content trees just for diagnostics.
+
+Tradeoff: Phase 2 instrumentation starts with fallback sites that already have clear decision boundaries. Other ledger entries remain active and uninstrumented until their call sites can emit warnings without muddying provenance or turning broad code paths into noisy false positives.
+
 ## Passing Corpus Gate And Fallback Ledger
 
 - Corpus regression protection now distinguishes the intended baseline from the full corpus state.

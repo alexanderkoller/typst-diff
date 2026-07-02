@@ -1,4 +1,4 @@
-use typst_diff::{annotate, build_info, debug, diff, eval, render_to_pdf, trace, world};
+use typst_diff::{annotate, build_info, debug, decision, diff, eval, render_to_pdf, trace, world};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -66,6 +66,7 @@ fn run_pipeline(
 ) -> Result<()> {
     let capture_snapshots = args.debug || args.debug_trace;
     let debug_dir = debug::default_debug_dir(&args.output);
+    let mut decision_recorder = decision::DecisionRecorder::default();
     let mut trace_writer = if args.debug_trace {
         Some(debug::JsonlTraceWriter::create(&debug_dir)?)
     } else {
@@ -126,34 +127,30 @@ fn run_pipeline(
         trace::PipelineTraceEvent::new("diff", "start"),
     )?;
     let (diff_result, block_debug) = if capture_snapshots {
-        if let Some(writer) = trace_writer.as_mut() {
-            let (result, debug) = diff::diff_annotated_with_rendered_regions_and_debug_events(
-                &old_content,
-                &new_content,
-                old_world,
-                new_world,
-                writer,
-            )?;
-            (result, Some(debug))
-        } else {
-            let (result, debug) = diff::diff_annotated_with_rendered_regions_and_debug(
-                &old_content,
-                &new_content,
-                old_world,
-                new_world,
-            )?;
-            (result, Some(debug))
-        }
+        let debug_events = trace_writer
+            .as_mut()
+            .map(|writer| writer as &mut dyn trace::DebugEventSink);
+        let (result, debug) = diff::diff_annotated_with_rendered_regions_and_decisions(
+            &old_content,
+            &new_content,
+            old_world,
+            new_world,
+            debug_events,
+            Some(&mut decision_recorder),
+            true,
+        )?;
+        (result, Some(debug.expect("snapshots requested")))
     } else {
-        (
-            diff::diff_annotated_with_rendered_regions(
-                &old_content,
-                &new_content,
-                old_world,
-                new_world,
-            )?,
+        let (result, _) = diff::diff_annotated_with_rendered_regions_and_decisions(
+            &old_content,
+            &new_content,
+            old_world,
+            new_world,
             None,
-        )
+            Some(&mut decision_recorder),
+            false,
+        )?;
+        (result, None)
     };
     emit_cli_trace(
         &mut trace_writer,
@@ -199,6 +196,7 @@ fn run_pipeline(
             block_debug.as_ref().expect("snapshots requested"),
             &diff_result,
             &annotated,
+            &decision_recorder.fallback_warnings_document(),
             Vec::new(),
         )?;
     }
@@ -220,9 +218,12 @@ fn run_pipeline(
             block_debug.as_ref().expect("snapshots requested"),
             &diff_result,
             &annotated,
+            &decision_recorder.fallback_warnings_document(),
             trace_files,
         )?;
     }
+
+    decision_recorder.emit_stderr_warnings(args.quiet, std::io::stderr())?;
 
     Ok(())
 }
@@ -236,6 +237,7 @@ fn write_debug_bundle(
     block_debug: &diff::DiffBlockDebug,
     diff_result: &diff::DiffResult,
     annotated: &typst::foundations::Content,
+    fallback_warnings: &decision::FallbackWarningsDocument,
     trace_files: Vec<debug::DebugTraceFile>,
 ) -> Result<()> {
     eprintln!("Writing debug bundle to {}...", debug_dir.display());
@@ -252,6 +254,7 @@ fn write_debug_bundle(
         block_debug,
         diff_result,
         annotated_output: annotated,
+        fallback_warnings,
         trace_files,
     })
 }

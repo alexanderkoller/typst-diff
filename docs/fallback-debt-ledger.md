@@ -52,13 +52,13 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-004 Unique Changed Slot Pair
 
 - Warning code: `FB-004-unique-changed-slot-pair`
-- Status: `active`
+- Status: `instrumented`
 - Current source sites: `src/diff.rs` `find_unique_changed_slot_pair`.
 - Why this is a guess: locality is inferred from uniqueness after comparing descendants, not from a retained structural relation.
 - User-visible risk: repeated or symmetric container changes can localize edits to the wrong slot or fall back inconsistently.
-- Runtime warning behavior: not yet instrumented.
-- Debug/debug-trace event names: planned `fallback/unique-changed-slot-pair`.
-- Tests: container replacement tests in `tests/integration.rs`; add repeated same-shape changed slots when instrumented.
+- Runtime warning behavior: emits by default when unique-slot localization produces edits; suppressed on stderr by `--quiet`.
+- Debug/debug-trace event names: `decision_event` with phase `diff/replace-block`.
+- Tests: container replacement tests in `tests/integration.rs`; CLI fallback warning/debug tests cover warning plumbing.
 - Replacement abstraction: `edit_script` over stable slot IDs and explicit patch surfaces.
 - Removal criteria: slot recursion uses retained slot correspondence or emits an unsupported structured-surface decision.
 
@@ -78,13 +78,13 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-006 Duplicate Edit Pruning By Text Signature
 
 - Warning code: `FB-006-duplicate-edit-pruning-by-text-signature`
-- Status: `active`
+- Status: `instrumented`
 - Current source sites: `src/diff.rs` duplicate modified-signature pruning.
 - Why this is a guess: suppression uses text/hash signatures instead of edit ownership IDs.
 - User-visible risk: legitimate repeated edits can be hidden.
-- Runtime warning behavior: not yet instrumented.
-- Debug/debug-trace event names: planned `fallback/duplicate-edit-pruning-by-text-signature`.
-- Tests: duplicate-pruning and repeated-container tests in `tests/integration.rs`; add two identical legitimate edits.
+- Runtime warning behavior: emits by default when pruning removes one or more edits; suppressed on stderr by `--quiet`.
+- Debug/debug-trace event names: `decision_event` with phase `diff/prune-duplicates`.
+- Tests: duplicate-pruning and repeated-container tests in `tests/integration.rs`; CLI fallback warning/debug tests cover warning plumbing.
 - Replacement abstraction: represented-surface tracking by owner/path IDs.
 - Removal criteria: duplicate suppression consumes only a structurally represented owner or patch surface.
 
@@ -130,13 +130,13 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-010 Word-Diff-Or-Opaque Replacement Ladder
 
 - Warning code: `FB-010-word-diff-or-opaque-replacement-ladder`
-- Status: `active`
+- Status: `instrumented`
 - Current source sites: replacement selection ladder in `src/diff.rs`.
 - Why this is a guess: the algorithm escalates through word diff and opaque replacement choices after prior structural routes fail.
 - User-visible risk: structured changes can become misleading word edits or overly broad opaque frames.
-- Runtime warning behavior: not yet instrumented.
-- Debug/debug-trace event names: planned `fallback/word-diff-or-opaque-replacement-ladder`.
-- Tests: low-similarity container, table/grid, raw block, and opaque visual tests.
+- Runtime warning behavior: emits by default when the final replacement ladder is selected; suppressed on stderr by `--quiet`.
+- Debug/debug-trace event names: `decision_event` with phase `diff/replace-block`.
+- Tests: low-similarity container, table/grid, raw block, and opaque visual tests; `cli_emits_fallback_warning_by_default_and_quiet_suppresses_stderr_only`; `cli_debug_trace_records_pipeline_events_without_frame_trace_for_normal_text`.
 - Replacement abstraction: `diff_surface` and `diff_area` with typed surface kinds.
 - Removal criteria: replacement kind is selected from an explicit diff surface, or unsupported structured content is diagnosed.
 
@@ -191,4 +191,3 @@ When a code is instrumented, default CLI execution should warn unless
 - Tests: add malformed/edge escaping tests when instrumented.
 - Replacement abstraction: direct `Content` construction for rendered-region edits.
 - Removal criteria: generated Typst snippets are removed or failures return typed diagnostics.
-
