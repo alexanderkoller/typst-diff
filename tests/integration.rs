@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use typst::foundations::Content;
+use typst::model::RefElem;
 
 fn fixtures(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -108,6 +109,61 @@ fn count_nodes<T: typst::foundations::NativeElement>(content: &Content) -> usize
         std::ops::ControlFlow::Continue(())
     });
     count
+}
+
+fn reference_targets(content: &Content) -> std::collections::BTreeMap<String, usize> {
+    let mut targets = std::collections::BTreeMap::new();
+    let _ = content.traverse::<_, ()>(&mut |c| {
+        if let Some(reference) = c.to_packed::<RefElem>() {
+            *targets
+                .entry(reference.target.resolve().to_string())
+                .or_insert(0) += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    targets
+}
+
+fn assert_live_introspection_matches_new(
+    new_world: &typst_diff::world::SystemWorld,
+    annotated: &Content,
+    label: &str,
+) {
+    let new_content = typst_diff::eval_to_realized_content(new_world).unwrap();
+    let annotated_tags = count_nodes::<typst::introspection::TagElem>(annotated);
+    let new_tags = count_nodes::<typst::introspection::TagElem>(&new_content.realized);
+    assert!(
+        annotated_tags <= new_tags,
+        "{label}: annotated document should not add old-side labels/tags; annotated={annotated_tags}, new={new_tags}"
+    );
+    assert_eq!(
+        count_nodes::<typst::introspection::StateUpdateElem>(annotated),
+        count_nodes::<typst::introspection::StateUpdateElem>(&new_content.realized),
+        "{label}: annotated document should keep exactly the new-side state updates"
+    );
+    assert_eq!(
+        reference_targets(annotated),
+        reference_targets(&new_content.realized),
+        "{label}: annotated document should keep exactly the new-side live reference targets"
+    );
+    let annotated_contexts = count_nodes::<typst::foundations::ContextElem>(annotated);
+    let new_contexts = count_nodes::<typst::foundations::ContextElem>(&new_content.realized);
+    assert!(
+        annotated_contexts <= new_contexts,
+        "{label}: annotated document should not add old-side context expressions; annotated={annotated_contexts}, new={new_contexts}"
+    );
+}
+
+fn rendered_document_text(content: &Content, world: &typst_diff::world::SystemWorld) -> String {
+    let document = typst_diff::eval::layout_document(world, content).unwrap();
+    normalize_whitespace(
+        &document
+            .pages
+            .iter()
+            .flat_map(|page| rendered_text_runs(&page.frame))
+            .map(|run| run.text)
+            .collect::<String>(),
+    )
 }
 
 fn assert_contains_in_order(text: &str, needles: &[&str]) {
@@ -282,7 +338,9 @@ fn collect_modified_word_texts(blocks: &[typst_diff::diff::DiffBlockEdit]) -> (S
             | RealizedEdit::InsertBefore { content, .. }
             | RealizedEdit::InsertAfter { content, .. }
             | RealizedEdit::Append { content }
-            | RealizedEdit::WholeBlock(content) => {
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => {
                 walk_content(content, deleted, inserted);
             }
         }
@@ -407,7 +465,9 @@ fn collect_region_modified_word_texts(
             | RealizedEdit::InsertBefore { content, .. }
             | RealizedEdit::InsertAfter { content, .. }
             | RealizedEdit::Append { content }
-            | RealizedEdit::WholeBlock(content) => walk_content(content, deleted, inserted),
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => walk_content(content, deleted, inserted),
         }
     }
 
@@ -444,7 +504,9 @@ fn collect_modified_bases(blocks: &[typst_diff::diff::DiffBlockEdit]) -> Vec<Str
             | RealizedEdit::InsertBefore { content, .. }
             | RealizedEdit::InsertAfter { content, .. }
             | RealizedEdit::Append { content }
-            | RealizedEdit::WholeBlock(content) => walk_content(content, bases),
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => walk_content(content, bases),
         }
     }
 
@@ -488,7 +550,9 @@ fn collect_replace_at_modified_paths_and_bases(
             RealizedEdit::InsertBefore { content, .. }
             | RealizedEdit::InsertAfter { content, .. }
             | RealizedEdit::Append { content }
-            | RealizedEdit::WholeBlock(content) => {
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => {
                 walk_content(prefix, content, out);
             }
         }
@@ -617,7 +681,9 @@ fn collect_edit_texts(
             | RealizedEdit::InsertBefore { content, .. }
             | RealizedEdit::InsertAfter { content, .. }
             | RealizedEdit::Append { content }
-            | RealizedEdit::WholeBlock(content) => {
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => {
                 walk_content(
                     content,
                     inserted,
@@ -757,7 +823,10 @@ fn assert_edit_paths_resolve_for_base(
                 );
                 walk_content(content);
             }
-            RealizedEdit::Append { content } | RealizedEdit::WholeBlock(content) => {
+            RealizedEdit::Append { content }
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => {
                 walk_content(content);
             }
         }
@@ -790,7 +859,9 @@ fn realized_edit_content_or_nested_matches(
         | RealizedEdit::InsertBefore { content, .. }
         | RealizedEdit::InsertAfter { content, .. }
         | RealizedEdit::Append { content }
-        | RealizedEdit::WholeBlock(content) => {
+        | RealizedEdit::WholeBlock(content)
+        | RealizedEdit::LogOnly(content)
+        | RealizedEdit::MarkBaseInserted(content) => {
             edit_content_or_nested_matches(content, matches_content)
         }
     }
@@ -808,7 +879,9 @@ fn realized_edit_contains_replace_at_modified(edit: &typst_diff::diff::RealizedE
         | RealizedEdit::InsertBefore { content, .. }
         | RealizedEdit::InsertAfter { content, .. }
         | RealizedEdit::Append { content }
-        | RealizedEdit::WholeBlock(content) => {
+        | RealizedEdit::WholeBlock(content)
+        | RealizedEdit::LogOnly(content)
+        | RealizedEdit::MarkBaseInserted(content) => {
             if let EditContent::Nested { edits, .. } = content {
                 edits.iter().any(realized_edit_contains_replace_at_modified)
             } else {
@@ -863,15 +936,43 @@ fn same_visible_text_visual_changes_are_reported_as_modifications() {
 fn inserted_display_equation_is_tokenized_and_logged() {
     let result = diff_annotated_corpus("101-equation-number-reference-changed");
     let log = result.modification_log();
-    let (_deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    let (deleted, inserted) = collect_modified_word_texts(&result.blocks);
+    let new_world = corpus_world("101-equation-number-reference-changed/new.typ");
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let text = rendered_document_text(&annotated, &new_world);
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let green = typst::visualize::Color::from_u8(0, 180, 0, 255).into();
+    let green_text = rendered_text_runs(&document.pages[0].frame)
+        .into_iter()
+        .filter(|run| run.fill == green)
+        .map(|run| run.text)
+        .collect::<String>();
 
     assert!(inserted.contains('x'), "inserted={inserted:?}\n{log}");
     assert!(inserted.contains('y'), "inserted={inserted:?}\n{log}");
+    assert!(deleted.contains('1'), "deleted={deleted:?}\n{log}");
+    assert!(inserted.contains('2'), "inserted={inserted:?}\n{log}");
     assert!(inserted.contains("revised"), "inserted={inserted:?}\n{log}");
     assert!(log.contains("inserted:"), "{log}");
     assert!(log.contains('x'), "{log}");
     assert!(log.contains('y'), "{log}");
     assert!(!log.contains("text: \n"), "{log}");
+    assert_live_introspection_matches_new(&new_world, &annotated, "numbered equation insertion");
+    assert!(
+        text_is_struck(&annotated, "1"),
+        "old reference number should be visibly marked as deleted/asserted:\n{}",
+        struck_texts(&annotated).join(" | ")
+    );
+    assert!(
+        (green_text.contains('x') || green_text.contains('𝑥'))
+            && (green_text.contains('y') || green_text.contains('𝑦'))
+            && green_text.contains('1'),
+        "inserted equation and number should render in insertion green; green_text={green_text:?}"
+    );
+    assert!(
+        text.contains("See Equation 1 2 for the revised equation."),
+        "new-side equation label/reference should remain live while the number change is marked:\n{text}"
+    );
 }
 
 #[test]
@@ -990,7 +1091,9 @@ fn count_opaque_replacements(blocks: &[typst_diff::diff::DiffBlockEdit]) -> usiz
             | RealizedEdit::InsertBefore { content, .. }
             | RealizedEdit::InsertAfter { content, .. }
             | RealizedEdit::Append { content }
-            | RealizedEdit::WholeBlock(content) => walk(content),
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => walk(content),
         }
     }
 
@@ -1001,8 +1104,74 @@ fn count_opaque_replacements(blocks: &[typst_diff::diff::DiffBlockEdit]) -> usiz
         .sum()
 }
 
+fn opaque_replacement_payloads<'a>(
+    blocks: &'a [typst_diff::diff::DiffBlockEdit],
+) -> Vec<(&'a typst_diff::diff::OldDisplaySurface, &'a Content)> {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    fn walk_content<'a>(
+        content: &'a EditContent,
+        out: &mut Vec<(&'a typst_diff::diff::OldDisplaySurface, &'a Content)>,
+    ) {
+        match content {
+            EditContent::OpaqueReplacement { old, new } => out.push((old, new)),
+            EditContent::Nested { edits, .. } => {
+                for edit in edits {
+                    walk_edit(edit, out);
+                }
+            }
+            EditContent::Inserted(_) | EditContent::Deleted(_) | EditContent::Modified { .. } => {}
+        }
+    }
+
+    fn walk_edit<'a>(
+        edit: &'a RealizedEdit,
+        out: &mut Vec<(&'a typst_diff::diff::OldDisplaySurface, &'a Content)>,
+    ) {
+        match edit {
+            RealizedEdit::ReplaceAt { content, .. }
+            | RealizedEdit::InsertBefore { content, .. }
+            | RealizedEdit::InsertAfter { content, .. }
+            | RealizedEdit::Append { content }
+            | RealizedEdit::WholeBlock(content)
+            | RealizedEdit::LogOnly(content)
+            | RealizedEdit::MarkBaseInserted(content) => walk_content(content, out),
+        }
+    }
+
+    let mut out = Vec::new();
+    for block in blocks {
+        for edit in &block.edits {
+            walk_edit(edit, &mut out);
+        }
+    }
+    out
+}
+
 fn plain_occurrences(content: &Content, needle: &str) -> usize {
     content.plain_text().matches(needle).count()
+}
+
+fn equation_node_count(content: &Content) -> usize {
+    let mut count = 0;
+    let _ = content.traverse::<_, ()>(&mut |c| {
+        if c.is::<typst::math::EquationElem>() {
+            count += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    count
+}
+
+fn math_cancel_count(content: &Content) -> usize {
+    let mut count = 0;
+    let _ = content.traverse::<_, ()>(&mut |c| {
+        if c.is::<typst::math::CancelElem>() {
+            count += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    count
 }
 
 #[test]
@@ -1148,24 +1317,34 @@ fn figure_caption_add_delete_pair_by_semantic_owner_not_text() {
 }
 
 #[test]
-fn deleted_figure_caption_uses_rendered_label_as_one_deleted_payload() {
+fn deleted_figure_caption_uses_inert_old_display_payload() {
     use typst_diff::diff::{EditContent, RealizedEdit};
 
     let case = "72-figure-caption-deleted";
-    let expected = "Figure 1: Distribution of measurements";
+    let expected = "Distribution of measurements";
     let result = diff_annotated_corpus_with_rendered_regions(case);
     let figure = only_changed_figure_block(&result, case);
-    assert!(matches!(
-        figure.edits.as_slice(),
-        [RealizedEdit::InsertAfter {
-            anchor,
-            content: EditContent::Deleted(content),
-        }] if anchor.as_slice() == [0] && content.plain_text().as_str() == expected
-    ));
+    let payload_text = match figure.edits.as_slice() {
+        [
+            RealizedEdit::InsertAfter {
+                anchor,
+                content: EditContent::Deleted(content),
+            },
+        ] if anchor.as_slice() == [0] => content.plain_text().to_string(),
+        edits => panic!("unexpected caption edit shape: {}", edits.len()),
+    };
+    assert!(
+        payload_text.contains(expected),
+        "deleted caption old display should contain caption text: {payload_text:?}"
+    );
 
     let (_inserted, deleted, _modified_inserted, modified_deleted) =
         collect_edit_texts(&result.blocks);
-    assert_eq!(deleted, vec![expected.to_string()]);
+    assert_eq!(deleted.len(), 1);
+    assert!(
+        deleted[0].contains(expected),
+        "deleted caption log should contain caption text: {deleted:?}"
+    );
     assert!(
         modified_deleted.is_empty(),
         "deleted caption label must not be represented as token-level modified deletes: {modified_deleted:?}"
@@ -1173,13 +1352,9 @@ fn deleted_figure_caption_uses_rendered_label_as_one_deleted_payload() {
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let struck = struck_texts(&annotated);
-    assert_eq!(
-        struck
-            .iter()
-            .filter(|text| text.as_str() == expected)
-            .count(),
-        1,
-        "expected exactly one full struck caption label, got {struck:?}"
+    assert!(
+        struck.iter().any(|text| text.contains(expected)),
+        "expected struck caption text, got {struck:?}"
     );
 
     let world = corpus_world(&format!("{case}/new.typ"));
@@ -1347,19 +1522,80 @@ fn opaque_figure_body_and_caption_change_share_one_owner_block() {
 }
 
 #[test]
-fn text_empty_structural_visual_changes_produce_opaque_replacement() {
-    for case in [
-        "90-opaque-graphic-replaced",
-        "91-raw-svg-graphic-replaced",
-        "73-figure-body-changed-caption-added",
-        "92-diagram-caption-and-opaque-body-changed",
-    ] {
+fn opaque_figure_body_replacement_keeps_old_and_new_visual_surfaces() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let result = diff_annotated_corpus("73-figure-body-changed-caption-added");
+    let figure = only_changed_figure_block(&result, "73-figure-body-changed-caption-added");
+    assert_figure_slots_are_patch_surface_paths(figure);
+    assert_eq!(figure.edits.len(), 2);
+
+    let RealizedEdit::ReplaceAt {
+        path,
+        content: EditContent::OpaqueReplacement { old, new },
+    } = &figure.edits[0]
+    else {
+        panic!("figure body edit should be an opaque replacement");
+    };
+    assert_eq!(path.as_slice(), [0]);
+    assert!(
+        !old.as_content().is_empty(),
+        "old opaque payload should keep the old visual surface"
+    );
+    assert!(
+        !new.is_empty(),
+        "new opaque payload should keep the new visual surface"
+    );
+}
+
+#[test]
+fn top_level_opaque_visual_replacements_claim_their_empty_carriers() {
+    for case in ["90-opaque-graphic-replaced", "91-raw-svg-graphic-replaced"] {
         let result = diff_annotated_corpus(case);
+        assert_eq!(
+            count_opaque_replacements(&result.blocks),
+            1,
+            "{case} should emit exactly one opaque visual replacement:\n{}",
+            result.modification_log()
+        );
+
+        let payloads = opaque_replacement_payloads(&result.blocks);
+        assert_eq!(payloads.len(), 1);
+        let (old, new) = payloads[0];
         assert!(
-            count_opaque_replacements(&result.blocks) >= 1,
-            "{case} should produce an opaque visual replacement"
+            !old.as_content().is_empty(),
+            "{case} old payload should keep the old visual surface"
+        );
+        assert!(
+            !new.is_empty(),
+            "{case} new payload should keep the new visual surface"
         );
     }
+}
+
+#[test]
+fn text_empty_scaffolding_changes_do_not_produce_opaque_replacement_frames() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#align(center)[
+  #v(2em)
+  #text(18pt)[Title]
+  #v(2em)
+]"#,
+        r#"#align(center)[
+  #v(4em)
+  #text(18pt)[Title]
+  #v(1em)
+]"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+
+    assert_eq!(count_opaque_replacements(&result.blocks), 0);
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
 }
 
 #[test]
@@ -2064,8 +2300,8 @@ fn traced_and_untraced_edit_zone_matching_are_identical() {
 
 #[test]
 fn pipeline_trace_records_opaque_replacement_decision() {
-    let old_world = corpus_world("90-opaque-graphic-replaced/old.typ");
-    let new_world = corpus_world("90-opaque-graphic-replaced/new.typ");
+    let old_world = corpus_world("92-diagram-caption-and-opaque-body-changed/old.typ");
+    let new_world = corpus_world("92-diagram-caption-and-opaque-body-changed/new.typ");
     let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
     let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
     let mut sink = RecordingSink::default();
@@ -2559,6 +2795,1009 @@ fn table_row_deleted_middle_keeps_deleted_cells_in_tree() {
 }
 
 #[test]
+fn deleted_old_table_keeps_table_structure_in_annotated_tree() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#table(
+  columns: 2,
+  [Old A], [Old B],
+  [1], [2],
+)
+"#,
+        "After\n",
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+
+    assert_eq!(count_nodes::<typst::model::TableElem>(&annotated), 1);
+    assert!(annotated.plain_text().contains("Old A"));
+
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_old_grid_keeps_grid_structure_in_annotated_tree() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#grid(
+  columns: 2,
+  [Old A], [Old B],
+  [1], [2],
+)
+"#,
+        "After\n",
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+
+    assert_eq!(count_nodes::<typst::layout::GridElem>(&annotated), 1);
+    assert!(annotated.plain_text().contains("Old A"));
+
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_old_boxed_table_keeps_opaque_box_surface_in_annotated_tree() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#box(width: 100%)[
+  #table(
+    columns: 2,
+    [Old A], [Old B],
+    [1], [2],
+  )
+]
+"#,
+        "After\n",
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+
+    assert!(
+        count_nodes::<typst::layout::BoxElem>(&annotated) >= 1,
+        "deleted boxed table should remain an opaque box surface"
+    );
+    assert!(annotated.plain_text().contains("Old A"));
+
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn shown_boxed_table_change_recurses_into_cells_without_opaque_duplicate() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#show table: it => box(width: 100%)[#it]
+
+#table(
+  columns: 2,
+  [Project], [Value],
+  [A01], [1],
+)
+"#,
+        r#"#show table: it => box(width: 100%)[#it]
+
+#table(
+  columns: 2,
+  [Project], [Value],
+  [A01], [2],
+)
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let (inserted, deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+
+    assert_eq!(count_opaque_replacements(&result.blocks), 0);
+    assert!(
+        modified_deleted.iter().any(|text| text == "1"),
+        "expected deleted table cell value, got deleted={deleted:?} modified_deleted={modified_deleted:?}"
+    );
+    assert!(
+        modified_inserted.iter().any(|text| text == "2"),
+        "expected inserted table cell value, got inserted={inserted:?} modified_inserted={modified_inserted:?}"
+    );
+
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+    assert!(
+        compact.plain_text().contains('2') && count_nodes::<typst::text::StrikeElem>(&compact) == 0,
+        "compact table diff should show inserted value without struck deleted substitution: {}",
+        compact.plain_text()
+    );
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn authored_boxed_table_change_recurses_into_cells_without_opaque_replacement() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#box(table(
+  columns: 2,
+  [Project], [Value],
+  [A01], [1],
+))
+"#,
+        r#"#box(table(
+  columns: 2,
+  [Project], [Value],
+  [A01], [2],
+))
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let (inserted, deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "authored boxed table should recurse into table cells"
+    );
+    assert!(
+        modified_deleted.iter().any(|text| text == "1"),
+        "expected deleted table cell value, got deleted={deleted:?} modified_deleted={modified_deleted:?}"
+    );
+    assert!(
+        modified_inserted.iter().any(|text| text == "2"),
+        "expected inserted table cell value, got inserted={inserted:?} modified_inserted={modified_inserted:?}"
+    );
+
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+    assert!(
+        compact.plain_text().contains('2') && count_nodes::<typst::text::StrikeElem>(&compact) == 0,
+        "compact table diff should show inserted value without struck deleted substitution: {}",
+        compact.plain_text()
+    );
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_boxed_table_change_recurses_into_cells_without_opaque_replacement() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#context [
+  #let value = "1"
+  #box(table(
+    columns: 2,
+    [Project], [Value],
+    [A01], [#value],
+  ))
+]
+"#,
+        r#"#context [
+  #let value = "2"
+  #box(table(
+    columns: 2,
+    [Project], [Value],
+    [A01], [#value],
+  ))
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let (_inserted, _deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+
+    assert_eq!(count_opaque_replacements(&result.blocks), 0);
+    assert!(modified_deleted.iter().any(|text| text == "1"));
+    assert!(modified_inserted.iter().any(|text| text == "2"));
+}
+
+#[test]
+fn context_boxed_table_after_generated_pagebreak_recurses_into_cells() {
+    let old = r#"#set page(width: 220pt, height: 90pt, margin: 5pt)
+#block(height: 70pt)[Intro]
+
+#context [
+  #box(table(
+    columns: 2,
+    [Item], [Value],
+    [A], [1],
+  ))
+]
+"#;
+    let new = r#"#set page(width: 220pt, height: 90pt, margin: 5pt)
+#block(height: 70pt)[Intro]
+
+#context [
+  #box(table(
+    columns: 2,
+    [Item], [Value],
+    [A], [2],
+  ))
+]
+"#;
+    let (_dir, result, _annotated) = diff_temp_sources(old, new);
+    let log = result.modification_log();
+
+    let opaque_replacements = count_opaque_replacements(&result.blocks);
+    assert!(
+        opaque_replacements == 0,
+        "context table after generated pagebreak should keep ownership of the visible table; opaque_replacements={opaque_replacements}:\n{log}"
+    );
+    let (_inserted, _deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    assert!(modified_deleted.iter().any(|text| text == "1"));
+    assert!(modified_inserted.iter().any(|text| text == "2"));
+}
+
+#[test]
+fn context_boxed_table_after_pagebreak_large_change_recurses_into_cells() {
+    let old = r#"#set page(width: 230pt, height: 95pt, margin: 5pt)
+#block(height: 72pt)[Intro]
+
+#context [
+  #box(table(
+    columns: 4,
+    [Project], [2027], [2028], [2029],
+    [A01], [10], [20], [30],
+    [B01], [40], [50], [60],
+    [C01], [70], [80], [90],
+    [D01], [100], [110], [120],
+    [Total], [220], [260], [300],
+  ))
+]
+"#;
+    let new = r#"#set page(width: 230pt, height: 95pt, margin: 5pt)
+#block(height: 72pt)[Intro]
+
+#context [
+  #box(table(
+    columns: 4,
+    [Project], [2027], [2028], [2029],
+    [C01], [7], [8], [9],
+    [Total], [7], [8], [9],
+  ))
+]
+"#;
+    let (_dir, result, _annotated) = diff_temp_sources(old, new);
+    let log = result.modification_log();
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "large context table replacement after pagebreak should recurse through table cells:\n{log}"
+    );
+    let (_inserted, _deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    assert!(modified_deleted.iter().any(|text| text == "70"));
+    assert!(modified_inserted.iter().any(|text| text == "7"));
+}
+
+#[test]
+fn boxed_table_with_local_style_and_deleted_row_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#box[
+  #set text(size: 9pt)
+  #table(
+    columns: 2,
+    [Project], [Value],
+    [A01], [1],
+    [B01], [2],
+  )
+]
+"#,
+        r#"#box[
+  #set text(size: 9pt)
+  #table(
+    columns: 2,
+    [Project], [Value],
+    [A01], [1],
+  )
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "deleted table row inside styled box should be represented through table cell slots"
+    );
+    assert!(compact.plain_text().contains("A01"));
+    assert!(
+        !compact.plain_text().contains("B01"),
+        "compact mode should hide deleted row cells"
+    );
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_boxed_table_with_local_style_and_deleted_row_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#context [
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: 2,
+      [Project], [Value],
+      [A01], [1],
+      [B01], [2],
+    )
+  ]
+]
+"#,
+        r#"#context [
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: 2,
+      [Project], [Value],
+      [A01], [1],
+    )
+  ]
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "context-generated styled boxed table should be represented through table cell slots"
+    );
+    assert!(compact.plain_text().contains("A01"));
+    assert!(
+        !compact.plain_text().contains("B01"),
+        "compact mode should hide deleted row cells"
+    );
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_state_generated_boxed_table_deleted_row_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#let rows = state("rows", ())
+#rows.update((("A01", "1"), ("B01", "2")))
+
+#context [
+  #let data = rows.final()
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: 2,
+      [Project], [Value],
+      ..data.map(((project, value)) => ([#project], [#value])).flatten(),
+    )
+  ]
+]
+"#,
+        r#"#let rows = state("rows", ())
+#rows.update((("A01", "1"),))
+
+#context [
+  #let data = rows.final()
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: 2,
+      [Project], [Value],
+      ..data.map(((project, value)) => ([#project], [#value])).flatten(),
+    )
+  ]
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "state-generated context table should be represented through table cell slots"
+    );
+    assert!(compact.plain_text().contains("A01"));
+    assert!(!compact.plain_text().contains("B01"));
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_boxed_table_with_header_spans_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#let years = ("2027/2", "2028")
+
+#context [
+  #let rows = (("A01", "1", "2"), ("B01", "3", "4"))
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: (35pt, auto, auto),
+      table.header(
+        table.cell(rowspan: 2)[Project],
+        table.cell(colspan: 2)[Years],
+        ..years,
+      ),
+      ..rows.map(((project, a, b)) => ([#project], [#a], [#b])).flatten(),
+      table.hline(),
+      table.cell[Total], [4], [6],
+    )
+  ]
+]
+"#,
+        r#"#let years = ("2027/2", "2028")
+
+#context [
+  #let rows = (("A01", "1", "2"),)
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: (35pt, auto, auto),
+      table.header(
+        table.cell(rowspan: 2)[Project],
+        table.cell(colspan: 2)[Years],
+        ..years,
+      ),
+      ..rows.map(((project, a, b)) => ([#project], [#a], [#b])).flatten(),
+      table.hline(),
+      table.cell[Total], [1], [2],
+    )
+  ]
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "context-generated boxed table with spanning header cells should recurse into table cells"
+    );
+    assert!(compact.plain_text().contains("A01"));
+    assert!(
+        !compact.plain_text().contains("B01"),
+        "compact mode should hide cells from the deleted row"
+    );
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_state_generated_boxed_table_with_header_spans_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#let rows = state("rows", ())
+#rows.update((("A01", "1", "2"), ("B01", "3", "4")))
+#let years = ("2027/2", "2028")
+
+#context [
+  #let data = rows.final()
+  #let totals = data.fold((0, 0), (acc, row) => (acc.at(0) + int(row.at(1)), acc.at(1) + int(row.at(2))))
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: (35pt, auto, auto),
+      fill: (x, y) => if y <= 1 { luma(230) },
+      stroke: (x, y) => (
+        left: if x < 1 { 1pt } else { 0.5pt },
+        right: 0.5pt,
+        top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+        bottom: 1pt,
+      ),
+      table.header(
+        table.cell(rowspan: 2)[Project],
+        table.cell(colspan: 2)[Years],
+        ..years,
+      ),
+      ..data.map(((project, a, b)) => ([#project], [#a], [#b])).flatten(),
+      table.hline(stroke: 1pt),
+      table.cell(fill: luma(230))[Total], [#str(totals.at(0))], [#str(totals.at(1))],
+    )
+  ]
+]
+"#,
+        r#"#let rows = state("rows", ())
+#rows.update((("A01", "1", "2"),))
+#let years = ("2027/2", "2028")
+
+#context [
+  #let data = rows.final()
+  #let totals = data.fold((0, 0), (acc, row) => (acc.at(0) + int(row.at(1)), acc.at(1) + int(row.at(2))))
+  #box[
+    #set text(size: 9pt)
+    #table(
+      columns: (35pt, auto, auto),
+      fill: (x, y) => if y <= 1 { luma(230) },
+      stroke: (x, y) => (
+        left: if x < 1 { 1pt } else { 0.5pt },
+        right: 0.5pt,
+        top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+        bottom: 1pt,
+      ),
+      table.header(
+        table.cell(rowspan: 2)[Project],
+        table.cell(colspan: 2)[Years],
+        ..years,
+      ),
+      ..data.map(((project, a, b)) => ([#project], [#a], [#b])).flatten(),
+      table.hline(stroke: 1pt),
+      table.cell(fill: luma(230))[Total], [#str(totals.at(0))], [#str(totals.at(1))],
+    )
+  ]
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "state-generated boxed table with spanning header cells should recurse into table cells"
+    );
+    assert!(compact.plain_text().contains("A01"));
+    assert!(!compact.plain_text().contains("B01"));
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_state_generated_positional_box_table_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#let rows = state("rows", ())
+#rows.update((("A01", "1", "2"), ("B01", "3", "4")))
+#let years = ("2027/2", "2028")
+
+#context [
+  #let data = rows.final()
+  #box(table(
+    columns: 3,
+    fill: (x, y) => if y <= 1 { luma(230) },
+    stroke: (x, y) => (
+      left: if x < 1 { 1pt } else { 0.5pt },
+      right: 0.5pt,
+      top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+      bottom: 1pt,
+    ),
+    table.header(
+      table.cell(rowspan: 2)[Project],
+      table.cell(colspan: 2)[Years],
+      ..years,
+    ),
+    ..data.map(((project, a, b)) => ([#project], [#a], [#b])).flatten(),
+    table.hline(stroke: 1pt),
+    table.cell(fill: luma(230))[Total], [4], [6],
+  ))
+]
+"#,
+        r#"#let rows = state("rows", ())
+#rows.update((("A01", "1", "2"),))
+#let years = ("2027/2", "2028")
+
+#context [
+  #let data = rows.final()
+  #box(table(
+    columns: 3,
+    fill: (x, y) => if y <= 1 { luma(230) },
+    stroke: (x, y) => (
+      left: if x < 1 { 1pt } else { 0.5pt },
+      right: 0.5pt,
+      top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+      bottom: 1pt,
+    ),
+    table.header(
+      table.cell(rowspan: 2)[Project],
+      table.cell(colspan: 2)[Years],
+      ..years,
+    ),
+    ..data.map(((project, a, b)) => ([#project], [#a], [#b])).flatten(),
+    table.hline(stroke: 1pt),
+    table.cell(fill: luma(230))[Total], [1], [2],
+  ))
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "state-generated positional box(table(...)) should recurse into table cells"
+    );
+    assert!(compact.plain_text().contains("A01"));
+    assert!(!compact.plain_text().contains("B01"));
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_generated_dynamic_box_table_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#let years = ("2027/2", "2028")
+
+#context [
+  #let category-funds = (
+    "Staff": (1000, 2000),
+    "Direct Costs": (3000, 4000),
+    "Instrumentation": (0, 0),
+    "Fellowships": (0, 0),
+    "Global Funds": (0, 0),
+  )
+  #let year-funds = years.enumerate().map(((i, y)) => (
+    y,
+    ..category-funds.values().map(x => str(x.at(i))),
+    str(category-funds.values().map(x => x.at(i)).sum()),
+  )).flatten()
+  #let category-sums = category-funds.values().map(x => str(x.sum()))
+  #let category-sums = category-sums + (str(category-funds.values().map(x => x.sum()).sum()),)
+  #let categories = category-funds.len()
+
+  #box(table(
+    columns: 2 + categories,
+    fill: (x, y) => if y <= 1 { luma(230) },
+    stroke: (x, y) => (
+      left: if x < 2 or x == 6 { 1pt } else { 0.5pt },
+      right: 0.5pt,
+      top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+      bottom: 1pt,
+    ),
+    row-gutter: (auto, 4pt, auto),
+    align: (x, y) => if x == 0 and y > 0 { left } else { center },
+    table.header(
+      table.cell(rowspan: 2, align(center + horizon)[Financial Year / Funding Period]),
+      table.cell(colspan: categories)[Funding for],
+      table.cell(rowspan: 2, align(center + horizon)[Total]),
+      ..category-funds.keys(),
+    ),
+    ..year-funds,
+    table.hline(stroke: 1pt),
+    table.cell(fill: luma(230))[Total], ..category-sums,
+  ))
+]
+"#,
+        r#"#let years = ("2027/2", "2028")
+
+#context [
+  #let category-funds = (
+    "Staff": (1000, 2000),
+    "Direct Costs": (30, 40),
+    "Instrumentation": (0, 0),
+    "Fellowships": (0, 0),
+    "Global Funds": (0, 0),
+  )
+  #let year-funds = years.enumerate().map(((i, y)) => (
+    y,
+    ..category-funds.values().map(x => str(x.at(i))),
+    str(category-funds.values().map(x => x.at(i)).sum()),
+  )).flatten()
+  #let category-sums = category-funds.values().map(x => str(x.sum()))
+  #let category-sums = category-sums + (str(category-funds.values().map(x => x.sum()).sum()),)
+  #let categories = category-funds.len()
+
+  #box(table(
+    columns: 2 + categories,
+    fill: (x, y) => if y <= 1 { luma(230) },
+    stroke: (x, y) => (
+      left: if x < 2 or x == 6 { 1pt } else { 0.5pt },
+      right: 0.5pt,
+      top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+      bottom: 1pt,
+    ),
+    row-gutter: (auto, 4pt, auto),
+    align: (x, y) => if x == 0 and y > 0 { left } else { center },
+    table.header(
+      table.cell(rowspan: 2, align(center + horizon)[Financial Year / Funding Period]),
+      table.cell(colspan: categories)[Funding for],
+      table.cell(rowspan: 2, align(center + horizon)[Total]),
+      ..category-funds.keys(),
+    ),
+    ..year-funds,
+    table.hline(stroke: 1pt),
+    table.cell(fill: luma(230))[Total], ..category-sums,
+  ))
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "dynamic context-generated funding table should recurse into cells"
+    );
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+    assert!(compact.plain_text().contains("Direct Costs"));
+    assert!(!compact.plain_text().contains("10000"));
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn reused_named_table_recurses_into_cells_without_opaque_replacement() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set table(fill: (x, y) => if y < 2 { luma(230) })
+#show table.cell.where(y: 0): strong
+
+#let overview = table(
+  columns: 3,
+  table.header([Funding for], [2027], [2028]),
+  [Staff], [1000], [2000],
+  [Direct costs], [3000], [4000],
+  [Total], [4000], [6000],
+)
+
+#overview
+"#,
+        r#"#set table(fill: (x, y) => if y < 2 { luma(230) })
+#show table.cell.where(y: 0): strong
+
+#let overview = table(
+  columns: 3,
+  table.header([Funding for], [2027], [2028]),
+  [Staff], [1000], [2000],
+  [Direct costs], [30], [40],
+  [Total], [1030], [2040],
+)
+
+#overview
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "a table stored in a variable and reused should still carry table-cell slots"
+    );
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+    assert!(compact.plain_text().contains("Direct costs"));
+    assert!(!compact.plain_text().contains("3000"));
+    assert!(!compact.plain_text().contains("4000"));
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn context_generated_wide_overview_box_table_recurses_into_cells() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#let years = ("2027/2", "2028", "2029", "2030", "2031/1")
+#let highlight = luma(85%)
+#let requested = state("requested", ())
+#requested.update((
+  "Staff": (81600, 163200, 163200, 163200, 81600),
+  "Direct Costs": (3000, 4000, 3000, 3000, 2000),
+  "Instrumentation": (0, 0, 0, 0, 0),
+  "Fellowships": (0, 0, 0, 0, 0),
+  "Global Funds": (0, 0, 0, 0, 0),
+))
+
+#context [
+  #let category-funds = requested.final()
+  #let year-funds = years.enumerate().map(((i, y)) => (
+    y,
+    ..category-funds.values().map(x => str(calc.round(x.at(i) / 1000, digits: 1))),
+    str(calc.round(category-funds.values().map(x => x.at(i)).sum() / 1000, digits: 1)),
+  )).flatten()
+  #let category-sums = category-funds.values().map(x => str(calc.round(x.sum() / 1000, digits: 1)))
+  #let category-sums = category-sums + (str(calc.round(category-funds.values().map(x => x.sum()).sum() / 1000, digits: 1)),)
+  #let categories = category-funds.len()
+
+  #box(table(
+    columns: 2 + categories,
+    fill: (x, y) => if y <= 1 { highlight },
+    stroke: (x, y) => (
+      left: if x < 2 or x == 6 { 1pt } else { 0.5pt },
+      right: 0.5pt,
+      top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+      bottom: 1pt,
+    ),
+    row-gutter: (auto, 4pt, auto),
+    align: (x, y) => if x == 0 and y > 0 { left } else { center },
+    table.header(
+      table.cell(rowspan: 2, align(center + horizon)[Financial Year / Funding Period]),
+      table.cell(colspan: categories)[Funding for],
+      table.cell(rowspan: 2, align(center + horizon)[Total]),
+      ..category-funds.keys(),
+    ),
+    ..year-funds,
+    table.hline(stroke: 1pt),
+    table.cell(fill: highlight)[Total], ..category-sums,
+  ))
+]
+"#,
+        r#"#let years = ("2027/2", "2028", "2029", "2030", "2031/1")
+#let highlight = luma(85%)
+#let requested = state("requested", ())
+#requested.update((
+  "Staff": (81600, 163200, 163200, 163200, 81600),
+  "Direct Costs": (30, 40, 30, 30, 20),
+  "Instrumentation": (0, 0, 0, 0, 0),
+  "Fellowships": (0, 0, 0, 0, 0),
+  "Global Funds": (0, 0, 0, 0, 0),
+))
+
+#context [
+  #let category-funds = requested.final()
+  #let year-funds = years.enumerate().map(((i, y)) => (
+    y,
+    ..category-funds.values().map(x => str(calc.round(x.at(i) / 1000, digits: 1))),
+    str(calc.round(category-funds.values().map(x => x.at(i)).sum() / 1000, digits: 1)),
+  )).flatten()
+  #let category-sums = category-funds.values().map(x => str(calc.round(x.sum() / 1000, digits: 1)))
+  #let category-sums = category-sums + (str(calc.round(category-funds.values().map(x => x.sum()).sum() / 1000, digits: 1)),)
+  #let categories = category-funds.len()
+
+  #box(table(
+    columns: 2 + categories,
+    fill: (x, y) => if y <= 1 { highlight },
+    stroke: (x, y) => (
+      left: if x < 2 or x == 6 { 1pt } else { 0.5pt },
+      right: 0.5pt,
+      top: if y == 0 or y == 2 { 1pt } else { 0.5pt },
+      bottom: 1pt,
+    ),
+    row-gutter: (auto, 4pt, auto),
+    align: (x, y) => if x == 0 and y > 0 { left } else { center },
+    table.header(
+      table.cell(rowspan: 2, align(center + horizon)[Financial Year / Funding Period]),
+      table.cell(colspan: categories)[Funding for],
+      table.cell(rowspan: 2, align(center + horizon)[Total]),
+      ..category-funds.keys(),
+    ),
+    ..year-funds,
+    table.hline(stroke: 1pt),
+    table.cell(fill: highlight)[Total], ..category-sums,
+  ))
+]
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "wide context-generated overview table should recurse into table cells"
+    );
+    let compact = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+    assert!(compact.plain_text().contains("Direct Costs"));
+    assert!(!compact.plain_text().contains("13"));
+    assert_eq!(count_nodes::<typst::text::StrikeElem>(&compact), 0);
+    let pdf = typst_diff::render_to_pdf(&compact, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn show_wrapper_context_generated_forward_state_table_recurses_into_cells() {
+    let old = r#"#let requested = state("requested", ())
+#let years = ("2027/2", "2028")
+
+#let wrapper(body) = [
+  #context [
+    #let category-funds = requested.final()
+    #let year-funds = years.enumerate().map(((i, y)) => (
+      y,
+      ..category-funds.values().map(x => str(x.at(i))),
+      str(category-funds.values().map(x => x.at(i)).sum()),
+    )).flatten()
+    #let category-sums = category-funds.values().map(x => str(x.sum()))
+    #let category-sums = category-sums + (str(category-funds.values().map(x => x.sum()).sum()),)
+    #let categories = category-funds.len()
+
+    #box(table(
+      columns: 2 + categories,
+      fill: (x, y) => if y <= 1 { luma(230) },
+      stroke: 0.5pt,
+      table.header(
+        table.cell(rowspan: 2)[Financial Year / Funding Period],
+        table.cell(colspan: categories)[Funding for],
+        table.cell(rowspan: 2)[Total],
+        ..category-funds.keys(),
+      ),
+      ..year-funds,
+      table.hline(stroke: 1pt),
+      table.cell(fill: luma(230))[Total], ..category-sums.map(str),
+    ))
+  ]
+
+  #body
+]
+
+#show: wrapper
+
+#requested.update((
+  "Staff": (1000, 2000),
+  "Direct Costs": (3000, 4000),
+))
+"#;
+    let new = r#"#let requested = state("requested", ())
+#let years = ("2027/2", "2028")
+
+#let wrapper(body) = [
+  #context [
+    #let category-funds = requested.final()
+    #let year-funds = years.enumerate().map(((i, y)) => (
+      y,
+      ..category-funds.values().map(x => str(x.at(i))),
+      str(category-funds.values().map(x => x.at(i)).sum()),
+    )).flatten()
+    #let category-sums = category-funds.values().map(x => str(x.sum()))
+    #let category-sums = category-sums + (str(category-funds.values().map(x => x.sum()).sum()),)
+    #let categories = category-funds.len()
+
+    #box(table(
+      columns: 2 + categories,
+      fill: (x, y) => if y <= 1 { luma(230) },
+      stroke: 0.5pt,
+      table.header(
+        table.cell(rowspan: 2)[Financial Year / Funding Period],
+        table.cell(colspan: categories)[Funding for],
+        table.cell(rowspan: 2)[Total],
+        ..category-funds.keys(),
+      ),
+      ..year-funds,
+      table.hline(stroke: 1pt),
+      table.cell(fill: luma(230))[Total], ..category-sums.map(str),
+    ))
+  ]
+
+  #body
+]
+
+#show: wrapper
+
+#requested.update((
+  "Staff": (1000, 2000),
+  "Direct Costs": (30, 40),
+))
+"#;
+    let (_dir, old_world, new_world) = temp_worlds(old, new);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+
+    assert_eq!(
+        count_opaque_replacements(&result.blocks),
+        0,
+        "show-wrapper context table fed by later state.final() should recurse into cells"
+    );
+    let (_inserted, _deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    assert!(modified_deleted.iter().any(|text| text == "3000"));
+    assert!(modified_inserted.iter().any(|text| text == "30"));
+}
+
+#[test]
 fn nested_list_item_inserted_uses_nested_changed_descendants() {
     let result = diff_annotated_corpus("69-nested-list-item-inserted");
     let list_block = result
@@ -2800,6 +4039,129 @@ fn opaque_wrapper_changes_are_reported_once() {
         assert!(log.contains("Old"), "{name} log missing old text:\n{log}");
         assert!(log.contains("New"), "{name} log missing new text:\n{log}");
     }
+}
+
+#[test]
+fn corpus_46_cetz_canvas_change_is_opaque_replacement() {
+    let result = diff_annotated_corpus("46-package-cetz");
+    let opaque_replacements = opaque_replacement_payloads(&result.blocks);
+    assert_eq!(
+        opaque_replacements.len(),
+        1,
+        "changed CeTZ canvas should be retained as one opaque replacement:\n{}",
+        result.modification_log()
+    );
+    let (old, new) = opaque_replacements[0];
+    assert!(
+        !old.as_content().is_empty(),
+        "old CeTZ opaque payload should retain the old visual carrier"
+    );
+    assert!(
+        !new.is_empty(),
+        "new CeTZ opaque payload should retain the new visual carrier"
+    );
+
+    let log = result.modification_log();
+    assert!(
+        log.contains("block: [opaque visual content]")
+            && log.contains("deleted: [old visual]")
+            && log.contains("inserted: [new visual]"),
+        "modification log should report the opaque CeTZ change:\n{log}"
+    );
+}
+
+#[test]
+fn semantic_owner_edits_are_anchored_to_realized_carriers() {
+    let pad_log = diff_annotated_corpus("55-pad-changed").modification_log();
+    assert!(
+        pad_log.contains("## 3: modify"),
+        "pad edit should stay after the heading and wrapper shell:\n{pad_log}"
+    );
+    assert_eq!(
+        pad_log
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .count(),
+        1,
+        "{pad_log}"
+    );
+
+    let box_log = diff_annotated_corpus("53-box-changed").modification_log();
+    assert!(
+        !box_log.contains("## 0: modify"),
+        "inline box owner should not be emitted as an early standalone edit:\n{box_log}"
+    );
+    assert_eq!(
+        box_log
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .count(),
+        1,
+        "{box_log}"
+    );
+
+    let math_log = diff_annotated_corpus("22-inline-math-changed").modification_log();
+    assert!(
+        !math_log.contains("## 2: modify\nblock: \n"),
+        "inline equation owner should not be emitted as an empty standalone edit:\n{math_log}"
+    );
+    assert!(
+        math_log.contains("attach(base: [E], b: [p])")
+            && math_log.contains("attach(base: [E], b: [k])"),
+        "inline equation origins should be retained in the paragraph edit:\n{math_log}"
+    );
+    let math_annotated = annotated_tree_corpus("22-inline-math-changed");
+    assert!(
+        math_cancel_count(&math_annotated) > 0,
+        "deleted inline equation should be rendered as cancelled math, not flattened struck text:\n{}",
+        math_annotated.plain_text()
+    );
+
+    let display_log = diff_annotated_corpus("23-display-math-changed").modification_log();
+    assert_eq!(
+        display_log
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .count(),
+        3,
+        "{display_log}"
+    );
+    assert!(
+        display_log.contains("## 2: modify\nblock: \n"),
+        "display equation edit should stay anchored to its realized carrier:\n{display_log}"
+    );
+
+    let display_annotated = annotated_tree_corpus("23-display-math-changed");
+    assert_eq!(
+        equation_node_count(&display_annotated),
+        3,
+        "display equation edit should render old and new display formulas once, plus the inline n occurrence:\n{}",
+        display_annotated.plain_text()
+    );
+}
+
+#[test]
+fn figure_slot_edits_are_anchored_to_figure_carrier() {
+    let caption_added = diff_annotated_corpus("71-figure-caption-added").modification_log();
+    assert_eq!(
+        caption_added
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .collect::<Vec<_>>(),
+        vec!["## 5: insert"],
+        "{caption_added}"
+    );
+
+    let diagram =
+        diff_annotated_corpus("92-diagram-caption-and-opaque-body-changed").modification_log();
+    let headings = diagram
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .collect::<Vec<_>>();
+    assert_eq!(headings, vec!["## 5: modify", "## 5: modify"], "{diagram}");
+    assert!(diagram.contains("[opaque visual content]"), "{diagram}");
+    assert!(diagram.contains("deleted: Old"), "{diagram}");
+    assert!(diagram.contains("inserted: New"), "{diagram}");
 }
 
 #[test]
@@ -3177,6 +4539,708 @@ See @api for the new contract.
 }
 
 #[test]
+fn deleted_label_does_not_duplicate_active_new_label() {
+    let old = r#"#set heading(numbering: "1.")
+
+= API <api>
+
+The old contract is stable.
+
+See @api.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= API <api>
+
+The new contract is stable.
+
+See @api.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let new_content = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let new_tags = count_nodes::<typst::introspection::TagElem>(&new_content.realized);
+    let annotated_tags = count_nodes::<typst::introspection::TagElem>(&annotated);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_eq!(
+        annotated_tags, new_tags,
+        "annotated document should keep only the new-side active labels/tags"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn inserted_label_and_reference_from_new_remain_live() {
+    let old = r#"The old document has no cross reference.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= New API <api>
+
+See @api for the new contract.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "inserted label/reference");
+    assert!(
+        text.contains("New API") && text.contains("See") && text.contains('1'),
+        "new reference should render in annotated output:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn changed_text_empty_context_label_from_new_remains_live() {
+    let old = r#"#show ref: it => {
+  let target = query(it.target).at(0, default: none)
+  if target == none { return [missing #str(it.target)] }
+  if target.func() == metadata { return [project #target.value.lbl] }
+  it
+}
+
+#context [#metadata((kind: "project", lbl: "old-project"))#label("old-project")]
+
+See @old-project.
+"#;
+    let new = r#"#show ref: it => {
+  let target = query(it.target).at(0, default: none)
+  if target == none { return [missing #str(it.target)] }
+  if target.func() == metadata { return [project #target.value.lbl] }
+  it
+}
+
+#context [#metadata((kind: "project", lbl: "new-project"))#label("new-project")]
+
+See @new-project.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "changed contextual label");
+    assert!(
+        text.contains("new-project") && !text.contains("missing"),
+        "new contextual label should resolve in annotated output:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_old_state_does_not_make_new_context_create_missing_label_link() {
+    let old = r#"#let projects = state("projects", (:))
+#let register(id) = [
+  #projects.update(data => {
+    data.insert(id, (id: id, title: [Old Project]))
+    data
+  })
+  #context [#metadata((kind: "project", lbl: id))#label(id)]
+]
+#let lpref(id) = context {
+  let data = projects.final().at(id, default: none)
+  if data == none { [unknown #id] } else { link(label(id), data.title) }
+}
+
+#register("old-project")
+
+Old body.
+"#;
+    let new = r#"#let projects = state("projects", (:))
+#let register(id) = [
+  #projects.update(data => {
+    data.insert(id, (id: id, title: [Old Project]))
+    data
+  })
+  #context [#metadata((kind: "project", lbl: id))#label(id)]
+]
+#let lpref(id) = context {
+  let data = projects.final().at(id, default: none)
+  if data == none { [unknown #id] } else { link(label(id), data.title) }
+}
+
+Reference: #lpref("old-project")
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        text.contains("unknown old-project"),
+        "new context must not see deleted old state updates:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_old_state_before_same_new_context_lookup_does_not_survive() {
+    let definitions = r#"#let projects = state("projects", (:))
+#let register(id) = [
+  #projects.update(data => {
+    data.insert(id, (id: id, title: [Old Project]))
+    data
+  })
+  #context [#metadata((kind: "project", lbl: id))#label(id)]
+]
+#let lpref(id) = context {
+  let data = projects.final().at(id, default: none)
+  if data == none { [unknown #id] } else { link(label(id), data.title) }
+}
+"#;
+    let old = format!(
+        r#"{definitions}
+#register("old-project")
+
+Reference: #lpref("old-project")
+"#
+    );
+    let new = format!(
+        r#"{definitions}
+Reference: #lpref("old-project")
+"#
+    );
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(&old, &new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        text.contains("unknown old-project"),
+        "deleted registration must not affect later new context lookup:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn inserted_state_update_from_new_executes() {
+    let old = r#"The old document has no state.
+"#;
+    let new = r#"#let status = state("status", "unset")
+
+#status.update("new")
+
+#context [Final status: #status.final()]
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "inserted state update");
+    assert!(
+        text.contains("Final status: new"),
+        "new state update should execute in annotated output:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn unchanged_new_state_update_inside_modified_container_stays_live() {
+    let old = r#"#let status = state("status", "unset")
+
+- #status.update("new") Old item
+
+#context [Final status: #status.final()]
+"#;
+    let new = r#"#let status = state("status", "unset")
+
+- #status.update("new") New item
+
+#context [Final status: #status.final()]
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        text.contains("Final status: new"),
+        "unchanged new state update should stay live in nested base:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn unchanged_new_text_empty_state_update_stays_live() {
+    let old = r#"#let ids = state("ids", ())
+
+#ids.update(values => values + ("target",))
+
+Old visible text.
+
+#context {
+  [Registered: ]
+  ids.final().join(", ")
+}
+"#;
+    let new = r#"#let ids = state("ids", ())
+
+#ids.update(values => values + ("target",))
+
+New visible text.
+
+#context {
+  [Registered: ]
+  ids.final().join(", ")
+}
+"#;
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_modified_words_include(&result, &["Old"], &["New"]);
+    assert!(
+        text.contains("Registered:") && text.contains("target"),
+        "new text-empty state registry should stay live:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn unchanged_new_text_empty_label_target_stays_live() {
+    let old = r#"#set heading(numbering: "1.")
+
+#heading(outlined: false)[] <target>
+
+Old visible text.
+
+See @target.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+#heading(outlined: false)[] <target>
+
+New visible text.
+
+See @target.
+"#;
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_modified_words_include(&result, &["Old"], &["New"]);
+    assert!(
+        text.contains("See") && text.contains('1'),
+        "new text-empty label target should stay live:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_reference_to_deleted_label_renders_inertly() {
+    let old = r#"#set heading(numbering: "1.")
+
+= Legacy API <legacy>
+
+See @legacy for the old contract.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= Current API <current>
+
+The current contract stands alone.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let new_content = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let new_tags = count_nodes::<typst::introspection::TagElem>(&new_content.realized);
+    let annotated_tags = count_nodes::<typst::introspection::TagElem>(&annotated);
+    let new_refs = count_nodes::<typst::model::RefElem>(&new_content.realized);
+    let annotated_refs = count_nodes::<typst::model::RefElem>(&annotated);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_eq!(
+        annotated_tags, new_tags,
+        "annotated document should not keep deleted labels active"
+    );
+    assert_eq!(
+        annotated_refs, new_refs,
+        "annotated document should render deleted references as inert content"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_link_to_deleted_label_renders_inertly() {
+    let old = r#"= Old Target <old-target>
+
+#link(<old-target>)[Project Old] will be removed.
+"#;
+    let new = r#"The replacement text has no old target.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        text.contains("Project Old") && text.contains("replacement text"),
+        "deleted link body should remain visible without keeping its old target live:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn new_missing_reference_show_rule_is_preserved_when_old_target_existed() {
+    let old = r#"#show ref: it => {
+  let target = query(it.target).at(0, default: none)
+  if target == none { return [invalid #str(it.target)] }
+  if target.func() == metadata { return [project] }
+  it
+}
+
+= Old Project
+#metadata((kind: "project")) <project>
+
+See @project.
+"#;
+    let new = r#"#show ref: it => {
+  let target = query(it.target).at(0, default: none)
+  if target == none { return [invalid #str(it.target)] }
+  if target.func() == metadata { return [project] }
+  it
+}
+
+See @project.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        text.contains("invalid project"),
+        "new missing-reference show rule should remain effective:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn new_missing_label_link_show_rule_is_preserved_when_old_target_existed() {
+    let old = r#"#show link: it => [link fallback: #it.body]
+
+= Old Project <project>
+
+See #link(<project>)[project].
+"#;
+    let new = r#"#show link: it => [link fallback: #it.body]
+
+See #link(<project>)[project].
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        text.contains("link fallback: project"),
+        "new missing-link show rule should remain effective:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_heading_figure_and_equation_labels_are_inert() {
+    let old = r#"#set heading(numbering: "1.")
+#set math.equation(numbering: "(1)")
+
+= Legacy Heading <legacy-heading>
+
+#figure(rect(width: 1cm, height: 5mm), caption: [Legacy figure]) <legacy-figure>
+
+$ x = y $ <legacy-equation>
+
+See @legacy-heading, @legacy-figure, and @legacy-equation.
+"#;
+    let new = r#"The new document has no legacy labels.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted mixed labels");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_reference_to_old_target_and_new_reference_to_new_target_keep_only_new_live() {
+    let old = r#"#set heading(numbering: "1.")
+
+= Legacy API <old-api>
+
+See @old-api for the legacy contract.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= Current API <new-api>
+
+See @new-api for the current contract.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "old and new references");
+    assert!(
+        text.contains("Current API") && text.contains('1'),
+        "new reference should remain live:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn equal_visible_reference_uses_new_side_reference() {
+    let old = r#"#set heading(numbering: "1.")
+
+= API <old-api>
+
+See @old-api.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= API <new-api>
+
+See @new-api.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "equal visible new reference");
+    assert!(
+        text.contains("See") && text.contains('1'),
+        "new-side equal reference should resolve:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn opaque_replacement_strips_old_labels_but_keeps_new_labels() {
+    let old = r#"#figure(rect(width: 1cm, height: 5mm), caption: [Legacy figure]) <legacy-figure>
+
+See @legacy-figure.
+"#;
+    let new = r#"#figure(circle(radius: 4mm), caption: [Current figure]) <current-figure>
+
+See @current-figure.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "opaque replacement labels");
+    assert!(
+        text.contains("Current figure"),
+        "new replacement label/reference should render:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn deleted_state_update_does_not_affect_active_new_state() {
+    let old = r#"#let status = state("status", "unset")
+
+#status.update("old")
+
+The old contract is stable.
+
+#context [Final status: #status.final()]
+"#;
+    let new = r#"#let status = state("status", "unset")
+
+#status.update("new")
+
+The new contract is stable.
+
+#context [Final status: #status.final()]
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let new_content = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let new_state_updates =
+        count_nodes::<typst::introspection::StateUpdateElem>(&new_content.realized);
+    let annotated_state_updates = count_nodes::<typst::introspection::StateUpdateElem>(&annotated);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_eq!(
+        annotated_state_updates, new_state_updates,
+        "annotated document should keep only the new-side active state updates"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_context_state_get_is_inert_when_deleted() {
+    let old = r#"#let progress = state("progress", "unset")
+
+#progress.update("old")
+
+#context [Old current progress: #progress.get()]
+"#;
+    let new = r#"The new document does not define progress.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted state.get context");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_context_state_final_is_inert_when_deleted() {
+    let old = r#"#let progress = state("progress", "unset")
+
+#progress.update("old")
+
+#context [Old final progress: #progress.final()]
+"#;
+    let new = r#"The new document does not define progress.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted state.final context");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_context_inside_deleted_block_is_inert() {
+    let old = r#"#let progress = state("progress", "unset")
+
+#progress.update("old")
+
+#block[
+  #context [Old final progress: #progress.final()]
+]
+"#;
+    let new = r#"The new document does not define progress.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted block context");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_hidden_state_update_is_inert_when_deleted() {
+    let old = r#"#let project = state("project", ())
+
+#hide[#project.update(values => values + ("old-project",))]
+
+#context [Old projects: #project.final().join(", ")]
+"#;
+    let new = r#"The new document has no hidden project state.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted hidden state update");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_empty_structural_deletions_are_dropped() {
+    let old = r#"#let project = state("project", ())
+
+#hide[#project.update(values => values + ("old-project",))]
+
+#context [#metadata((kind: "project"))#label("old-project")]
+
+Visible text.
+"#;
+    let new = r#"Visible text.
+"#;
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+    let (inserted, deleted, modified_inserted, modified_deleted) =
+        collect_edit_texts(&result.blocks);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert!(
+        inserted.is_empty()
+            && deleted.is_empty()
+            && modified_inserted.is_empty()
+            && modified_deleted.is_empty(),
+        "empty old structural content should not create visible edit payloads: inserted={inserted:?} deleted={deleted:?} modified_inserted={modified_inserted:?} modified_deleted={modified_deleted:?}"
+    );
+    assert_live_introspection_matches_new(&new_world, &annotated, "dropped empty old structure");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_page_counter_contexts_are_inert_when_deleted() {
+    let old = r#"Old page display: #context counter(page).display()
+
+Old final page: #context counter(page).final().first()
+"#;
+    let new = r#"The new document has no page counter contexts.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted page counter contexts");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn old_query_and_here_contexts_are_inert_when_deleted() {
+    let old = r#"= Legacy
+
+Old heading count: #context query(heading.where(level: 1)).len()
+
+Old page number: #context here().page()
+"#;
+    let new = r#"The new document has no query or here context.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "deleted query/here contexts");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn modified_labelled_base_does_not_duplicate_new_label() {
+    let old = r#"#set heading(numbering: "1.")
+
+= Old API <api>
+
+See @api.
+"#;
+    let new = r#"#set heading(numbering: "1.")
+
+= New API <api>
+
+See @api.
+"#;
+    let (_dir, new_world, result, annotated) = diff_temp_sources_with_world(old, new);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_modified_words_include(&result, &["Old"], &["New"]);
+    assert_live_introspection_matches_new(&new_world, &annotated, "modified labelled base");
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn nested_old_label_and_context_inside_figure_caption_are_inert() {
+    let old = r#"#figure(
+  rect(width: 1cm, height: 5mm),
+  caption: [Legacy caption #context counter(page).display() <legacy-caption>],
+) <legacy-figure>
+
+See @legacy-figure.
+"#;
+    let new = r#"#figure(
+  rect(width: 1cm, height: 5mm),
+  caption: [Current caption],
+) <current-figure>
+
+See @current-figure.
+"#;
+    let (_dir, new_world, _result, annotated) = diff_temp_sources_with_world(old, new);
+    let text = rendered_document_text(&annotated, &new_world);
+    let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+
+    assert_live_introspection_matches_new(&new_world, &annotated, "nested figure caption");
+    assert!(
+        text.contains("Current caption"),
+        "new caption should render:\n{text}"
+    );
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
 fn corpus_32_header_change_is_page_region_edit() {
     use typst_diff::diff::{PageRegionKind, RegionPath};
 
@@ -3205,6 +5269,44 @@ fn corpus_32_header_change_is_page_region_edit() {
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn corpus_82_deleted_header_does_not_restyle_body_text() {
+    let result = diff_annotated_corpus("82-header-deleted");
+    assert!(
+        result.blocks.iter().all(|block| {
+            !block.edits.iter().any(|edit| {
+                matches!(
+                    edit,
+                    typst_diff::diff::RealizedEdit::WholeBlock(
+                        typst_diff::diff::EditContent::Deleted(_)
+                    )
+                )
+            }) || block.page_styles.is_empty()
+        }),
+        "deleted old-only blocks must not carry live page styles"
+    );
+
+    let new_world = corpus_world("82-header-deleted/new.typ");
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    assert_eq!(
+        count_nodes::<typst::layout::PagebreakElem>(&annotated),
+        0,
+        "deleted old pagebreaks must not remain live in the annotated new-world document"
+    );
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let runs = rendered_text_runs(&document.pages[0].frame);
+
+    assert!(
+        runs.iter().any(|run| run.text.contains("Report")),
+        "body heading should remain on page 1: {runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .any(|run| run.text.contains("The body text is unchanged.")),
+        "body paragraph should remain on page 1: {runs:?}"
+    );
 }
 
 #[test]
@@ -3705,6 +5807,43 @@ Body unchanged.
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
+    assert_valid_pdf(&pdf);
+}
+
+#[test]
+fn inserted_context_page_set_renders_after_annotation() {
+    use typst_diff::diff::{EditContent, RealizedEdit};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("main.typ"), "").unwrap();
+    let world = typst_diff::world::SystemWorld::new(dir.path().join("main.typ")).unwrap();
+    let titlepage = typst_diff::eval::eval_snippet_to_content(
+        r#"#context [
+  #set page(margin: (x: 2cm, y: 3cm), footer: [])
+  #align(center)[New title]
+]
+"#,
+    )
+    .unwrap();
+    let result = typst_diff::diff::DiffResult {
+        blocks: vec![typst_diff::diff::DiffBlockEdit {
+            base: typst_diff::AnnotatedContent {
+                realized: typst::foundations::Content::sequence([]),
+                annotation: Default::default(),
+                children: vec![],
+            },
+            base_provenance: typst_diff::diff::BlockBaseProvenance::LiveNew,
+            edits: vec![RealizedEdit::WholeBlock(EditContent::Inserted(titlepage))],
+            page_styles: Default::default(),
+        }],
+        root_styles: Default::default(),
+        regions: vec![],
+        rendered_regions: vec![],
+    };
+
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, true);
+    let pdf = typst_diff::render_to_pdf(&annotated, &world).unwrap();
+
     assert_valid_pdf(&pdf);
 }
 

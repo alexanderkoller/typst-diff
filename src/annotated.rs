@@ -7,7 +7,8 @@
 
 use crate::container_ops::{self, ContainerKind};
 use std::collections::VecDeque;
-use typst::foundations::{Content, SequenceElem, StyleChain, StyledElem};
+use typst::foundations::{Content, ContextElem, SequenceElem, StyleChain, StyledElem};
+use typst::introspection::{Tag, TagElem};
 use typst::layout::{BlockBody, BlockElem};
 use typst::math::EquationElem;
 use typst::model::{FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem};
@@ -188,7 +189,9 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     if pre.to_packed::<SequenceElem>().is_some()
         && let Some(styled) = realized.to_packed::<StyledElem>()
     {
-        let inner = annotate_realized(pre, &styled.child);
+        let child =
+            container_ops::materialize_style_dependent_fields(&styled.child, &styled.styles);
+        let inner = annotate_realized(pre, &child);
         let patch_surface = inner
             .annotation
             .patch_surface
@@ -212,7 +215,9 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     if let Some(styled) = pre.to_packed::<StyledElem>()
         && realized.to_packed::<StyledElem>().is_none()
     {
-        let inner = annotate_realized(&styled.child, realized);
+        let child =
+            container_ops::materialize_style_dependent_fields(&styled.child, &styled.styles);
+        let inner = annotate_realized(&child, realized);
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
@@ -227,6 +232,29 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     // --- Structural elements: semantic_kind + slot map ---
     if pre.is::<FootnoteElem>() {
         return annotate_footnote_element(pre, realized);
+    }
+    if pre.is::<ContextElem>() {
+        if realized.is::<ContextElem>() {
+            return leaf_annotated(
+                realized,
+                Annotation {
+                    span: pre.span(),
+                    ..Annotation::default()
+                },
+            );
+        }
+        let semantic =
+            crate::context_recording::take(pre.span()).unwrap_or_else(|| realized.clone());
+        let mut node = annotate_realized(&semantic, realized);
+        if !node.annotation.slots.is_empty()
+            && node.annotation.patch_surface.is_none()
+            && realized.plain_text().trim().is_empty()
+            && !semantic.plain_text().trim().is_empty()
+        {
+            node.annotation.patch_surface = Some(semantic);
+        }
+        node.annotation.span = pre.span();
+        return node;
     }
     if let Some(kind) = ContainerKind::of(pre) {
         return annotate_container(pre, realized, kind);
@@ -264,7 +292,9 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         let children: Vec<AnnotatedContent> =
             if sequence_contains_footnote(pre_seq) && sequence_has_paragraph_blocks(real_seq) {
                 pair_sequence_with_footnote_paragraphs(&pre_seq.children, &real_seq.children)
-            } else if pre_seq.children.len() == real_seq.children.len() {
+            } else if pre_seq.children.len() == real_seq.children.len()
+                && !sequence_needs_context_pairing(&pre_seq.children, &real_seq.children)
+            {
                 pre_seq
                     .children
                     .iter()
@@ -287,6 +317,20 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
                 ..Annotation::default()
             },
             children,
+        };
+    }
+    if pre.to_packed::<SequenceElem>().is_some()
+        && let Some(real_p) = realized.to_packed::<ParElem>()
+    {
+        let child = annotate_realized(pre, &real_p.body);
+        return AnnotatedContent {
+            realized: realized.clone(),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Paragraph),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+            children: vec![child],
         };
     }
     if let Some(pre_seq) = pre.to_packed::<SequenceElem>() {
@@ -313,7 +357,11 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
         pre.to_packed::<StyledElem>(),
         realized.to_packed::<StyledElem>(),
     ) {
-        let child = annotate_realized(&pre_s.child, &real_s.child);
+        let pre_child =
+            container_ops::materialize_style_dependent_fields(&pre_s.child, &pre_s.styles);
+        let real_child =
+            container_ops::materialize_style_dependent_fields(&real_s.child, &real_s.styles);
+        let child = annotate_realized(&pre_child, &real_child);
         return AnnotatedContent {
             realized: realized.clone(),
             annotation: Annotation {
@@ -339,6 +387,33 @@ pub fn annotate_realized(pre: &Content, realized: &Content) -> AnnotatedContent 
     }
 
     // --- Leaf fallback ---
+    if let Some((semantic, span)) = recorded_context_descendant(realized) {
+        let mut node = annotate_realized(&semantic, realized);
+        if !node.annotation.slots.is_empty()
+            && node.annotation.patch_surface.is_none()
+            && realized.plain_text().trim().is_empty()
+            && !semantic.plain_text().trim().is_empty()
+        {
+            node.annotation.patch_surface = Some(semantic);
+        }
+        node.annotation.span = span;
+        return node;
+    }
+
+    if is_opaque_visual_element_name(pre.func().name())
+        && realized.plain_text().trim().is_empty()
+        && pre != realized
+    {
+        return leaf_annotated(
+            realized,
+            Annotation {
+                patch_surface: Some(pre.clone()),
+                span: pre.span(),
+                ..Annotation::default()
+            },
+        );
+    }
+
     leaf_annotated(
         realized,
         Annotation {
@@ -365,6 +440,22 @@ fn content_contains_footnote(content: &Content) -> bool {
     }
     if let Some(par) = content.to_packed::<ParElem>() {
         return content_contains_footnote(&par.body);
+    }
+    false
+}
+
+fn content_contains_context(content: &Content) -> bool {
+    if content.is::<ContextElem>() {
+        return true;
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq.children.iter().any(content_contains_context);
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return content_contains_context(&styled.child);
+    }
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return content_contains_context(&par.body);
     }
     false
 }
@@ -618,15 +709,86 @@ fn pair_sequence_by_span(
 ) -> Vec<AnnotatedContent> {
     let mut out: Vec<AnnotatedContent> = Vec::new();
     let mut cursor: usize = 0;
-    for pre_child in pre_children {
+    for (pre_index, pre_child) in pre_children.iter().enumerate() {
         if pre_child.is::<ParbreakElem>() {
             out.push(annotate_realized(pre_child, pre_child));
+            continue;
+        }
+
+        if pre_child.is::<ContextElem>() && cursor < real_children.len() {
+            let fallback_end =
+                next_pre_child_span_match(pre_children, pre_index + 1, real_children, cursor)
+                    .unwrap_or(real_children.len());
+            let match_idx = if find_context_descendant_span(&real_children[cursor]).is_some() {
+                None
+            } else {
+                let target = pre_child.span();
+                (!target.is_detached()).then(|| {
+                    real_children[cursor..fallback_end]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(offset, real_child)| {
+                            (context_realized_span_matches(real_child, target)
+                                && !is_invisible_realized_child(real_child))
+                            .then_some(cursor + offset)
+                        })
+                        .or_else(|| {
+                            real_children[fallback_end..].iter().enumerate().find_map(
+                                |(offset, real_child)| {
+                                    (effective_span(real_child) == target
+                                        && !is_invisible_realized_child(real_child))
+                                    .then_some(fallback_end + offset)
+                                },
+                            )
+                        })
+                        .or_else(|| {
+                            let semantic_text =
+                                crate::context_recording::peek(target)?.plain_text();
+                            (!semantic_text.is_empty()).then_some(())?;
+                            real_children[cursor..].iter().enumerate().find_map(
+                                |(offset, real_child)| {
+                                    (real_child.plain_text() == semantic_text
+                                        && !is_invisible_realized_child(real_child))
+                                    .then_some(cursor + offset)
+                                },
+                            )
+                        })
+                })
+            };
+            if let Some(idx) = match_idx.flatten() {
+                while cursor < idx {
+                    cursor = push_unmatched_realized_child(&mut out, real_children, cursor);
+                }
+                let end = context_owner_realized_run_end(
+                    pre_child,
+                    pre_children,
+                    pre_index,
+                    real_children,
+                    idx,
+                );
+                if end > idx + 1 {
+                    let realized_run = Content::sequence(real_children[idx..end].iter().cloned());
+                    out.push(annotate_realized(pre_child, &realized_run));
+                    cursor = end;
+                } else {
+                    out.push(annotate_realized(pre_child, &real_children[idx]));
+                    cursor = idx + 1;
+                }
+            } else {
+                let realized_run =
+                    Content::sequence(real_children[cursor..fallback_end].iter().cloned());
+                out.push(annotate_realized(pre_child, &realized_run));
+                cursor = fallback_end;
+            }
             continue;
         }
 
         let target = pre_child.span();
         let mut match_idx = None;
         for (idx, real_child) in real_children.iter().enumerate().skip(cursor) {
+            if is_invisible_pre_child(pre_child) && !is_invisible_realized_child(real_child) {
+                continue;
+            }
             if effective_span(real_child) == target {
                 match_idx = Some(idx);
                 break;
@@ -635,20 +797,44 @@ fn pair_sequence_by_span(
 
         if let Some(idx) = match_idx {
             while cursor < idx {
-                out.push(leaf_annotated(
-                    &real_children[cursor],
-                    Annotation::default(),
-                ));
-                cursor += 1;
+                cursor = push_unmatched_realized_child(&mut out, real_children, cursor);
             }
-            out.push(annotate_realized(pre_child, &real_children[idx]));
-            cursor = idx + 1;
+            let end = context_owner_realized_run_end(
+                pre_child,
+                pre_children,
+                pre_index,
+                real_children,
+                idx,
+            );
+            if end > idx + 1 {
+                let realized_run = Content::sequence(real_children[idx..end].iter().cloned());
+                out.push(annotate_realized(pre_child, &realized_run));
+                cursor = end;
+            } else {
+                out.push(annotate_realized(pre_child, &real_children[idx]));
+                cursor = idx + 1;
+            }
             continue;
         }
 
         // If no span match exists, fall back to positional pairing instead of
         // dropping the pre node. This preserves structural semantics when
         // realization rewrites spans on wrapper-heavy sequences.
+        if cursor < real_children.len() && is_invisible_pre_child(pre_child) {
+            out.push(annotate_realized(pre_child, pre_child));
+            continue;
+        }
+
+        if cursor < real_children.len()
+            && find_context_descendant_span(&real_children[cursor]).is_some()
+        {
+            cursor = push_unmatched_realized_child(&mut out, real_children, cursor);
+            if is_invisible_pre_child(pre_child) || cursor >= real_children.len() {
+                out.push(annotate_realized(pre_child, pre_child));
+                continue;
+            }
+        }
+
         if cursor < real_children.len() {
             out.push(annotate_realized(pre_child, &real_children[cursor]));
             cursor += 1;
@@ -656,13 +842,160 @@ fn pair_sequence_by_span(
     }
     // Any trailing unmatched realized children become anonymous leaves.
     while cursor < real_children.len() {
-        out.push(leaf_annotated(
-            &real_children[cursor],
-            Annotation::default(),
-        ));
-        cursor += 1;
+        cursor = push_unmatched_realized_child(&mut out, real_children, cursor);
     }
     out
+}
+
+fn sequence_needs_context_pairing(pre_children: &[Content], real_children: &[Content]) -> bool {
+    pre_children.iter().any(content_contains_context)
+        || real_children
+            .iter()
+            .any(|child| find_context_descendant_span(child).is_some())
+}
+
+fn context_realized_span_matches(realized: &Content, target: Span) -> bool {
+    effective_span(realized) == target || find_context_descendant_span(realized) == Some(target)
+}
+
+fn context_owner_realized_run_end(
+    pre_child: &Content,
+    pre_children: &[Content],
+    pre_index: usize,
+    real_children: &[Content],
+    match_idx: usize,
+) -> usize {
+    if !content_contains_context(pre_child) {
+        return match_idx + 1;
+    }
+
+    let limit =
+        next_pre_child_span_match(pre_children, pre_index + 1, real_children, match_idx + 1)
+            .unwrap_or(real_children.len());
+    let mut end = match_idx + 1;
+    let mut included_context_output = false;
+    while end < limit {
+        let child = &real_children[end];
+        let has_context_output = find_context_descendant_span(child).is_some();
+        if has_context_output {
+            included_context_output = true;
+            end += 1;
+            break;
+        }
+        if is_invisible_realized_child(child) {
+            end += 1;
+            continue;
+        }
+        break;
+    }
+
+    if included_context_output {
+        end
+    } else {
+        match_idx + 1
+    }
+}
+
+fn push_unmatched_realized_child(
+    out: &mut Vec<AnnotatedContent>,
+    real_children: &[Content],
+    cursor: usize,
+) -> usize {
+    if let Some((end, semantic, span)) = recorded_context_run_at(real_children, cursor) {
+        let realized_run = Content::sequence(real_children[cursor..end].iter().cloned());
+        let mut node = annotate_realized(&semantic, &realized_run);
+        node.annotation.span = span;
+        out.push(node);
+        return end;
+    }
+
+    out.push(leaf_annotated(
+        &real_children[cursor],
+        Annotation::default(),
+    ));
+    cursor + 1
+}
+
+fn recorded_context_run_at(
+    real_children: &[Content],
+    cursor: usize,
+) -> Option<(usize, Content, Span)> {
+    let start = real_children.get(cursor)?.to_packed::<TagElem>()?;
+    let Tag::Start(tagged, _) = &start.tag else {
+        return None;
+    };
+    if !tagged.is::<ContextElem>() {
+        return None;
+    }
+    let span = tagged.span();
+    let semantic = crate::context_recording::take(span)?;
+    let location = start.tag.location();
+    for (index, child) in real_children.iter().enumerate().skip(cursor + 1) {
+        if let Some(tag) = child.to_packed::<TagElem>()
+            && let Tag::End(end_location, _, _) = tag.tag
+            && end_location == location
+        {
+            return Some((index + 1, semantic, span));
+        }
+    }
+    Some((cursor + 1, semantic, span))
+}
+
+fn recorded_context_descendant(realized: &Content) -> Option<(Content, Span)> {
+    let span = find_context_descendant_span(realized)?;
+    crate::context_recording::take(span).map(|semantic| (semantic, span))
+}
+
+fn find_context_descendant_span(realized: &Content) -> Option<Span> {
+    if let Some(tag) = realized.to_packed::<TagElem>()
+        && let Tag::Start(tagged, _) = &tag.tag
+    {
+        if tagged.is::<ContextElem>() {
+            return Some(tagged.span());
+        }
+    }
+
+    container_ops::realized_child_contents(realized)
+        .iter()
+        .find_map(find_context_descendant_span)
+}
+
+fn is_invisible_pre_child(content: &Content) -> bool {
+    content.plain_text().trim().is_empty()
+}
+
+fn is_invisible_realized_child(content: &Content) -> bool {
+    content.plain_text().trim().is_empty()
+}
+
+fn is_opaque_visual_element_name(name: &str) -> bool {
+    matches!(
+        name,
+        "rect" | "circle" | "ellipse" | "line" | "polygon" | "path" | "image"
+    )
+}
+
+fn next_pre_child_span_match(
+    pre_children: &[Content],
+    start_pre: usize,
+    real_children: &[Content],
+    cursor: usize,
+) -> Option<usize> {
+    for pre_child in pre_children.iter().skip(start_pre) {
+        if pre_child.is::<ParbreakElem>() {
+            continue;
+        }
+        let target = pre_child.span();
+        if target.is_detached() {
+            continue;
+        }
+        for (idx, real_child) in real_children.iter().enumerate().skip(cursor) {
+            if effective_span(real_child) == target {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 fn semantic_kind_of(pre: &Content) -> Option<SemanticKind> {
@@ -763,6 +1096,11 @@ fn collect_source_equations(content: &Content) -> Vec<Content> {
 }
 
 fn assign_equation_origins(node: &mut AnnotatedContent, equations: &mut VecDeque<Content>) {
+    if node.annotation.semantic_kind == Some(SemanticKind::Equation) {
+        node.annotation.equation_origins = (0..1).filter_map(|_| equations.pop_front()).collect();
+        return;
+    }
+
     if node.children.is_empty() {
         let count = realized_equation_carrier_count(&node.realized).min(equations.len());
         node.annotation.equation_origins =
@@ -804,9 +1142,7 @@ fn realized_equation_carrier_count(content: &Content) -> usize {
 }
 
 fn is_realized_equation_carrier(content: &Content) -> bool {
-    content.is::<EquationElem>()
-        || matches!(content.func().name(), "inline" | "display")
-        || (content.is::<BlockElem>() && content.plain_text().is_empty())
+    content.is::<EquationElem>() || matches!(content.func().name(), "inline" | "display")
 }
 
 fn is_footnote_marker_text(content: &Content, number: usize) -> bool {
@@ -837,6 +1173,49 @@ mod tests {
 
     fn seq(items: impl IntoIterator<Item = Content>) -> Content {
         Content::sequence(items)
+    }
+
+    #[test]
+    fn empty_block_is_not_an_equation_origin_target() {
+        use typst::layout::{BlockBody, BlockElem};
+
+        let pre = Content::new(EquationElem::new(text("x")));
+        let mut node = AnnotatedContent {
+            realized: Content::new(
+                BlockElem::new().with_body(Some(BlockBody::Content(Content::sequence([])))),
+            ),
+            annotation: Annotation::default(),
+            children: vec![],
+        };
+
+        annotate_equation_origins(&pre, &mut node);
+
+        assert!(
+            node.annotation.equation_origins.is_empty(),
+            "empty structural blocks must not consume source equation provenance"
+        );
+    }
+
+    #[test]
+    fn semantic_equation_node_receives_equation_origin_even_when_realized_empty() {
+        use typst::layout::{BlockBody, BlockElem};
+
+        let pre = Content::new(EquationElem::new(text("x")));
+        let mut node = AnnotatedContent {
+            realized: Content::new(
+                BlockElem::new().with_body(Some(BlockBody::Content(Content::sequence([])))),
+            ),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Equation),
+                ..Annotation::default()
+            },
+            children: vec![],
+        };
+
+        annotate_equation_origins(&pre, &mut node);
+
+        assert_eq!(node.annotation.equation_origins.len(), 1);
+        assert!(node.annotation.equation_origins[0].is::<EquationElem>());
     }
 
     fn contains_kind(node: &AnnotatedContent, kind: &SemanticKind) -> bool {

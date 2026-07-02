@@ -17,7 +17,8 @@
 //!
 //! 4. **Realized-tree edits** — [`diff_annotated`] drives all of the above, then
 //!    recurses through semantic slots when a structured container can be matched.
-//!    Leaf replacements fall back to [`diff_words`].
+//!    Leaf replacements use [`diff_words`] or an opaque visual replacement for
+//!    realized visual leaves.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -25,24 +26,27 @@ use std::hash::{Hash, Hasher};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use typst::World;
 use typst::foundations::{
-    Content, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem, Styles,
+    Content, ContextElem, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem,
+    Styles,
 };
-use typst::introspection::Tag;
+use typst::introspection::{MetadataElem, StateUpdateElem, Tag, TagElem};
 use typst::layout::{
-    BlockBody, BlockElem, BoxElem, Frame, FrameItem, PageElem, PagedDocument, Point, Rel,
+    BlockBody, BlockElem, BoxElem, Frame, FrameItem, GridChild, GridElem, GridItem, PageElem,
+    PagebreakElem, PagedDocument, Point, Rel,
 };
 use typst::math::EquationElem;
 use typst::model::{
-    EmphElem, FigureCaption, FootnoteBody, FootnoteElem, HeadingElem, LinkElem, ParElem,
-    ParbreakElem, StrongElem,
+    EmphElem, EnumElem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem, HeadingElem,
+    LinkElem, ListElem, ParElem, ParbreakElem, RefElem, StrongElem, TableChild, TableElem,
+    TableItem,
 };
 use typst::text::{
-    HighlightElem, OverlineElem, RawElem, SpaceElem, StrikeElem, SubElem, SuperElem, TextElem,
-    UnderlineElem,
+    HighlightElem, LinebreakElem, OverlineElem, RawElem, RawLine, SpaceElem, StrikeElem, SubElem,
+    SuperElem, TextElem, UnderlineElem,
 };
 
 use crate::annotated::{
-    AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, annotate_realized,
+    AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind, annotate_realized,
     effective_render_content, effective_text_content,
 };
 use crate::container_ops;
@@ -429,6 +433,12 @@ fn write_presentation_key(content: &Content, out: &mut String) {
         out.push(']');
     } else if let Some(block) = content.to_packed::<BlockElem>() {
         out.push_str("block(");
+        if block_has_visual_decoration(block) {
+            out.push_str("visual:");
+            out.push_str(content.repr().as_str());
+            out.push(')');
+            return;
+        }
         out.push_str(match block.body.get_cloned(StyleChain::default()) {
             Some(BlockBody::Content(_)) => "content",
             Some(_) => "other",
@@ -488,6 +498,10 @@ fn write_presentation_key(content: &Content, out: &mut String) {
         out.push_str("text");
     } else if content.is::<SpaceElem>() {
         out.push_str("space");
+    } else if is_opaque_visual_element_name(content.func().name()) {
+        out.push_str(content.func().name());
+        out.push(':');
+        out.push_str(content.repr().as_str());
     } else if is_metadata_tag(content) {
     } else {
         let children = container_ops::semantic_diff_child_contents(content);
@@ -579,17 +593,17 @@ fn extract_words_for_annotated_with_equation_origins(
     equation_origins: &[Content],
 ) -> Vec<Token> {
     let tokens = extract_words_for_annotated(fallback, annotated);
-    if has_meaningful_tokens(&tokens) || equation_origins.is_empty() {
+    if equation_origins.is_empty() {
         return tokens;
     }
 
     let mut origin_iter = equation_origins.iter();
     let mut origin_tokens = Vec::new();
     collect_tokens_with_equation_origins(fallback, &mut origin_iter, &mut origin_tokens);
-    if origin_tokens.is_empty() {
-        tokens
-    } else {
+    if has_meaningful_tokens(&origin_tokens) {
         origin_tokens
+    } else {
+        tokens
     }
 }
 
@@ -599,8 +613,15 @@ fn has_equation_origins(node: &AnnotatedContent) -> bool {
 
 fn collect_annotated_tokens(node: &AnnotatedContent, out: &mut Vec<Token>) {
     if !node.annotation.equation_origins.is_empty() {
+        let before = out.len();
         let mut origins = node.annotation.equation_origins.iter();
         collect_tokens_with_equation_origins(&node.realized, &mut origins, out);
+        if !has_meaningful_tokens(&out[before..]) {
+            out.truncate(before);
+            for origin in &node.annotation.equation_origins {
+                collect_tokens(origin, out);
+            }
+        }
         return;
     }
 
@@ -729,9 +750,7 @@ fn collect_tokens_with_equation_origins<'a>(
 }
 
 fn is_realized_equation_carrier(content: &Content) -> bool {
-    content.is::<EquationElem>()
-        || matches!(content.func().name(), "inline" | "display")
-        || (content.is::<BlockElem>() && content.plain_text().is_empty())
+    content.is::<EquationElem>() || matches!(content.func().name(), "inline" | "display")
 }
 
 fn collect_semantic_child_tokens(content: &Content, out: &mut Vec<Token>) -> bool {
@@ -1355,10 +1374,10 @@ pub fn diff_words(old: &[Token], new: &[Token]) -> Vec<WordOp> {
 
     for op in raw_ops {
         match op {
-            DiffOp::Equal { old_index, len, .. } => {
+            DiffOp::Equal { new_index, len, .. } => {
                 coalesce(
                     &mut result,
-                    WordOp::Equal(old[old_index..old_index + len].to_vec()),
+                    WordOp::Equal(new[new_index..new_index + len].to_vec()),
                 );
             }
             DiffOp::Delete {
@@ -1488,6 +1507,26 @@ fn coalesce(ops: &mut Vec<WordOp>, next: WordOp) {
         (Some(WordOp::Insert(v)), WordOp::Insert(w)) => v.extend_from_slice(w),
         _ => ops.push(next),
     }
+}
+
+fn old_display_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    tokens
+        .into_iter()
+        .map(|token| Token {
+            text: token.text,
+            content: retain_old_display_content(&token.content),
+        })
+        .collect()
+}
+
+fn old_display_delete_ops(ops: Vec<WordOp>) -> Vec<WordOp> {
+    ops.into_iter()
+        .map(|op| match op {
+            WordOp::Delete(tokens) => WordOp::Delete(old_display_tokens(tokens)),
+            WordOp::Equal(tokens) => WordOp::Equal(tokens),
+            WordOp::Insert(tokens) => WordOp::Insert(tokens),
+        })
+        .collect()
 }
 
 fn push_log_entry(log: &mut String, index: usize, kind: &str, fields: &[(&str, String)]) {
@@ -1666,10 +1705,21 @@ pub struct DiffResult {
 pub struct DiffBlockEdit {
     /// New-side realized block for normal edits; old-side block for pure deletes.
     pub base: AnnotatedContent,
+    /// Provenance of `base.realized`; annotation must not treat old bases as live
+    /// Typst content.
+    pub base_provenance: BlockBaseProvenance,
     /// Edits to apply to `base.realized`.
     pub edits: Vec<RealizedEdit>,
     /// Page styles active at this block's position (for output grouping).
     pub page_styles: Styles,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockBaseProvenance {
+    LiveNew,
+    InertOld,
+    MixedInertOldLiveNew,
+    Layout,
 }
 
 pub struct DiffBlockDebug {
@@ -1728,6 +1778,25 @@ pub struct RenderedRegionSegmentEdit {
     pub word_ops: Vec<WordOp>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct OldDisplaySurface {
+    pub content: Content,
+}
+
+impl OldDisplaySurface {
+    pub fn new(content: Content) -> Self {
+        Self { content }
+    }
+
+    pub fn as_content(&self) -> &Content {
+        &self.content
+    }
+
+    pub fn plain_text(&self) -> typst::diag::EcoString {
+        self.content.plain_text()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegionPath {
     RootPage(PageRegionKind),
@@ -1758,13 +1827,15 @@ pub enum RealizedEdit {
         content: EditContent,
     },
     WholeBlock(EditContent),
+    LogOnly(EditContent),
+    MarkBaseInserted(EditContent),
 }
 
 pub enum EditContent {
     Inserted(Content),
-    Deleted(Content),
+    Deleted(OldDisplaySurface),
     OpaqueReplacement {
-        old: Content,
+        old: OldDisplaySurface,
         new: Content,
     },
     Modified {
@@ -1775,6 +1846,256 @@ pub enum EditContent {
         base: AnnotatedContent,
         edits: Vec<RealizedEdit>,
     },
+}
+
+fn old_display_surface(content: &Content) -> OldDisplaySurface {
+    OldDisplaySurface::new(retain_old_display_content(content))
+}
+
+fn old_display_surface_for_annotated(
+    fallback: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> OldDisplaySurface {
+    let content = annotated
+        .map(effective_render_content)
+        .unwrap_or_else(|| fallback.clone());
+    old_display_surface(&content)
+}
+
+fn retain_old_display_content(content: &Content) -> Content {
+    if content.is::<StateUpdateElem>()
+        || content.is::<MetadataElem>()
+        || content.is::<TagElem>()
+        || content.is::<PagebreakElem>()
+    {
+        return Content::sequence([]);
+    }
+
+    if content.is::<ContextElem>() || content.is::<RefElem>() {
+        let text = content.plain_text();
+        return if text.is_empty() {
+            Content::sequence([])
+        } else {
+            TextElem::packed(text.as_str())
+        };
+    }
+
+    if content.is::<TextElem>()
+        || content.is::<SpaceElem>()
+        || content.is::<LinebreakElem>()
+        || content.is::<ParbreakElem>()
+        || content.is::<RawLine>()
+        || content.is::<EquationElem>()
+    {
+        return strip_old_display_styles(content);
+    }
+
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return Content::sequence(seq.children.iter().map(retain_old_display_content));
+    }
+
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let child = retain_old_display_content(&styled.child);
+        let styles = old_display_styles(&styled.styles);
+        return if styles.is_empty() {
+            child
+        } else {
+            child.styled_with_map(styles)
+        };
+    }
+
+    if let Some(strong) = content.to_packed::<StrongElem>() {
+        return retain_old_display_content(&strong.body).strong();
+    }
+
+    if let Some(emph) = content.to_packed::<EmphElem>() {
+        return retain_old_display_content(&emph.body).emph();
+    }
+
+    if let Some(highlight) = content.to_packed::<HighlightElem>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<HighlightElem>()
+            .expect("checked highlight")
+            .body = retain_old_display_content(&highlight.body);
+        return kept;
+    }
+
+    if let Some(link) = content.to_packed::<LinkElem>() {
+        return retain_old_display_content(&link.body);
+    }
+
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return Content::new(ParElem::new(retain_old_display_content(&par.body)));
+    }
+
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<HeadingElem>()
+            .expect("checked heading")
+            .body = retain_old_display_content(&heading.body);
+        return kept;
+    }
+
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<FigureCaption>()
+            .expect("checked caption")
+            .body = retain_old_display_content(&caption.body);
+        return kept;
+    }
+
+    if let Some(list) = content.to_packed::<ListElem>() {
+        let mut kept = content.clone();
+        let kept_list = kept.to_packed_mut::<ListElem>().expect("checked list");
+        for (kept_item, original_item) in kept_list.children.iter_mut().zip(&list.children) {
+            kept_item.body = retain_old_display_content(&original_item.body);
+        }
+        return kept;
+    }
+
+    if let Some(enm) = content.to_packed::<EnumElem>() {
+        let mut kept = content.clone();
+        let kept_enum = kept.to_packed_mut::<EnumElem>().expect("checked enum");
+        for (kept_item, original_item) in kept_enum.children.iter_mut().zip(&enm.children) {
+            kept_item.body = retain_old_display_content(&original_item.body);
+        }
+        return kept;
+    }
+
+    if let Some(figure) = content.to_packed::<FigureElem>() {
+        let mut kept = content.clone();
+        let kept_figure = kept.to_packed_mut::<FigureElem>().expect("checked figure");
+        kept_figure.body = retain_old_display_content(&figure.body);
+        if let Some(original_caption) = figure.caption.get_cloned(StyleChain::default())
+            && let Some(Some(kept_caption)) = kept_figure.caption.as_option_mut().as_mut()
+        {
+            kept_caption.body = retain_old_display_content(&original_caption.body);
+        }
+        return kept;
+    }
+
+    if let Some(footnote) = content.to_packed::<FootnoteElem>() {
+        if let FootnoteBody::Content(body) = &footnote.body {
+            let mut kept = content.clone();
+            kept.to_packed_mut::<FootnoteElem>()
+                .expect("checked footnote")
+                .body = FootnoteBody::Content(retain_old_display_content(body));
+            return kept;
+        }
+    }
+
+    if content.is::<TableElem>() {
+        let mut kept = content.clone();
+        let table = kept.to_packed_mut::<TableElem>().expect("checked table");
+        for child in &mut table.children {
+            retain_old_display_table_child(child);
+        }
+        return kept;
+    }
+
+    if content.is::<GridElem>() {
+        let mut kept = content.clone();
+        let grid = kept.to_packed_mut::<GridElem>().expect("checked grid");
+        for child in &mut grid.children {
+            retain_old_display_grid_child(child);
+        }
+        return kept;
+    }
+
+    if let Some(box_elem) = content.to_packed::<BoxElem>() {
+        let mut kept = content.clone();
+        if let Some(body) = box_elem.body.get_cloned(StyleChain::default()) {
+            kept.to_packed_mut::<BoxElem>()
+                .expect("checked box")
+                .body
+                .set(Some(retain_old_display_content(&body)));
+        }
+        return kept;
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<BlockElem>()
+            .expect("checked block")
+            .body
+            .set(Some(BlockBody::Content(retain_old_display_content(&body))));
+        return kept;
+    }
+
+    let text = content.plain_text();
+    if text.is_empty() {
+        Content::sequence([])
+    } else {
+        TextElem::packed(text.as_str())
+    }
+}
+
+fn retain_old_display_table_child(child: &mut TableChild) {
+    match child {
+        TableChild::Header(header) => {
+            for item in &mut header.children {
+                retain_old_display_table_item(item);
+            }
+        }
+        TableChild::Footer(footer) => {
+            for item in &mut footer.children {
+                retain_old_display_table_item(item);
+            }
+        }
+        TableChild::Item(item) => retain_old_display_table_item(item),
+    }
+}
+
+fn retain_old_display_table_item(item: &mut TableItem) {
+    if let TableItem::Cell(cell) = item {
+        cell.body = retain_old_display_content(&cell.body);
+    }
+}
+
+fn retain_old_display_grid_child(child: &mut GridChild) {
+    match child {
+        GridChild::Header(header) => {
+            for item in &mut header.children {
+                retain_old_display_grid_item(item);
+            }
+        }
+        GridChild::Footer(footer) => {
+            for item in &mut footer.children {
+                retain_old_display_grid_item(item);
+            }
+        }
+        GridChild::Item(item) => retain_old_display_grid_item(item),
+    }
+}
+
+fn retain_old_display_grid_item(item: &mut GridItem) {
+    if let GridItem::Cell(cell) = item {
+        cell.body = retain_old_display_content(&cell.body);
+    }
+}
+
+fn strip_old_display_styles(content: &Content) -> Content {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let child = strip_old_display_styles(&styled.child);
+        let styles = old_display_styles(&styled.styles);
+        return if styles.is_empty() {
+            child
+        } else {
+            child.styled_with_map(styles)
+        };
+    }
+    content.clone()
+}
+
+fn old_display_styles(styles: &Styles) -> Styles {
+    styles
+        .iter()
+        .filter(|style| !is_page_style(style))
+        .cloned()
+        .map(Style::wrap)
+        .collect()
 }
 
 impl DiffResult {
@@ -1840,7 +2161,9 @@ fn log_realized_edit(log: &mut String, edit: &RealizedEdit, index: usize) {
         | RealizedEdit::InsertBefore { content, .. }
         | RealizedEdit::InsertAfter { content, .. }
         | RealizedEdit::Append { content }
-        | RealizedEdit::WholeBlock(content) => log_edit_content(log, content, index),
+        | RealizedEdit::WholeBlock(content)
+        | RealizedEdit::LogOnly(content)
+        | RealizedEdit::MarkBaseInserted(content) => log_edit_content(log, content, index),
     }
 }
 
@@ -1851,6 +2174,8 @@ fn realized_edit_kind(edit: &RealizedEdit) -> &'static str {
         RealizedEdit::InsertAfter { content, .. } => edit_content_kind(content),
         RealizedEdit::Append { content } => edit_content_kind(content),
         RealizedEdit::WholeBlock(content) => edit_content_kind(content),
+        RealizedEdit::LogOnly(content) => edit_content_kind(content),
+        RealizedEdit::MarkBaseInserted(content) => edit_content_kind(content),
     }
 }
 
@@ -1873,7 +2198,7 @@ fn log_edit_content(log: &mut String, content: &EditContent, index: usize) {
             }
         }
         EditContent::Deleted(content) => {
-            let text = content_log_text(content);
+            let text = content_log_text(content.as_content());
             if text.chars().any(|ch| !ch.is_whitespace()) {
                 push_log_entry(log, index, "delete", &[("text", text)]);
             }
@@ -2039,6 +2364,7 @@ fn replace_block_edit(
             )?;
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, None),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits: vec![],
                 page_styles,
             });
@@ -2056,6 +2382,7 @@ fn replace_block_edit(
             )?;
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits,
                 page_styles,
             });
@@ -2071,6 +2398,7 @@ fn replace_block_edit(
             )?;
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits: vec![edit],
                 page_styles,
             });
@@ -2085,6 +2413,7 @@ fn replace_block_edit(
         )?;
         return Ok(DiffBlockEdit {
             base: annotated_block_from(&new_block.content, None),
+            base_provenance: BlockBaseProvenance::LiveNew,
             edits: vec![],
             page_styles,
         });
@@ -2103,6 +2432,7 @@ fn replace_block_edit(
             )?;
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits,
                 page_styles,
             });
@@ -2123,6 +2453,7 @@ fn replace_block_edit(
         )?;
         return Ok(DiffBlockEdit {
             base: annotated_block_from(&new_block.content, new_ann),
+            base_provenance: BlockBaseProvenance::LiveNew,
             edits: vec![edit],
             page_styles,
         });
@@ -2148,6 +2479,7 @@ fn replace_block_edit(
             )?;
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, Some(new_ann)),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits,
                 page_styles,
             });
@@ -2177,6 +2509,7 @@ fn replace_block_edit(
             )?;
             return Ok(DiffBlockEdit {
                 base: annotated_block_from(&new_block.content, new_ann),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits: vec![RealizedEdit::WholeBlock(EditContent::Modified {
                     base: new_block.content.clone(),
                     word_ops,
@@ -2234,6 +2567,7 @@ fn replace_block_edit(
     )?;
     Ok(DiffBlockEdit {
         base: annotated_block_from(&new_block.content, None),
+        base_provenance: BlockBaseProvenance::LiveNew,
         edits,
         page_styles,
     })
@@ -2291,24 +2625,164 @@ fn modified_fragment_edit_content(
             word_ops = inline_word_ops;
         }
     }
+    word_ops = old_display_delete_ops(word_ops);
     if has_textual_word_change(&word_ops) {
-        return Some(EditContent::Modified {
-            base: new_content.clone(),
-            word_ops,
-        });
+        return Some(
+            if contains_non_token_display_container_for(old_content, old_ann)
+                || contains_non_token_display_container_for(new_content, new_ann)
+            {
+                EditContent::OpaqueReplacement {
+                    old: old_display_surface_for_annotated(old_content, old_ann),
+                    new: new_content.clone(),
+                }
+            } else {
+                EditContent::Modified {
+                    base: new_content.clone(),
+                    word_ops,
+                }
+            },
+        );
     }
 
-    if old_content != new_content
-        && old_content.plain_text().is_empty()
-        && new_content.plain_text().is_empty()
-    {
+    if opaque_visual_surface_changed(old_content, new_content, old_ann, new_ann) {
         return Some(EditContent::OpaqueReplacement {
-            old: old_content.clone(),
+            old: old_opaque_display_surface(old_content, old_ann),
             new: new_content.clone(),
         });
     }
 
     None
+}
+
+fn opaque_visual_surface_changed(
+    old_content: &Content,
+    new_content: &Content,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+) -> bool {
+    old_content.plain_text().is_empty()
+        && new_content.plain_text().is_empty()
+        && old_content != new_content
+        && (contains_opaque_visual_surface(old_content)
+            || contains_opaque_visual_surface(new_content)
+            || contains_text_empty_opaque_layouter_surface(old_content)
+            || contains_text_empty_opaque_layouter_surface(new_content)
+            || old_ann.is_some_and(is_opaque_visual_owner)
+            || new_ann.is_some_and(is_opaque_visual_owner))
+}
+
+fn old_opaque_display_surface(
+    fallback: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> OldDisplaySurface {
+    let annotated_surface = annotated.map(effective_render_content);
+    let content = annotated_surface
+        .as_ref()
+        .filter(|surface| contains_opaque_visual_surface(surface))
+        .unwrap_or(fallback);
+    OldDisplaySurface::new(content.clone())
+}
+
+fn is_opaque_visual_owner(node: &AnnotatedContent) -> bool {
+    matches!(
+        node.annotation.semantic_kind,
+        Some(SemanticKind::Wrapper(
+            WrapperKind::Rect | WrapperKind::Circle | WrapperKind::Ellipse
+        ))
+    ) || contains_opaque_visual_surface(&effective_render_content(node))
+}
+
+fn contains_opaque_visual_surface(content: &Content) -> bool {
+    if content.is::<ContextElem>()
+        || content.is::<MetadataElem>()
+        || content.is::<StateUpdateElem>()
+        || content.is::<TagElem>()
+        || content.is::<RefElem>()
+        || content.is::<PagebreakElem>()
+        || content.is::<ParbreakElem>()
+    {
+        return false;
+    }
+
+    if is_opaque_visual_element_name(content.func().name()) {
+        return true;
+    }
+
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq.children.iter().any(contains_opaque_visual_surface);
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return contains_opaque_visual_surface(&styled.child);
+    }
+    if let Some(block) = content.to_packed::<BlockElem>() {
+        if block_has_visual_decoration(block) {
+            return true;
+        }
+        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
+            return contains_opaque_visual_surface(&body);
+        }
+    }
+    container_ops::semantic_diff_child_contents(content)
+        .iter()
+        .any(contains_opaque_visual_surface)
+}
+
+fn contains_text_empty_opaque_layouter_surface(content: &Content) -> bool {
+    if content.is::<ContextElem>()
+        || content.is::<MetadataElem>()
+        || content.is::<StateUpdateElem>()
+        || content.is::<TagElem>()
+        || content.is::<RefElem>()
+        || content.is::<PagebreakElem>()
+        || content.is::<ParbreakElem>()
+    {
+        return false;
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && content.plain_text().is_empty()
+        && block_has_opaque_layouter_body(block)
+    {
+        return true;
+    }
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .any(contains_text_empty_opaque_layouter_surface);
+    }
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return contains_text_empty_opaque_layouter_surface(&styled.child);
+    }
+    container_ops::semantic_diff_child_contents(content)
+        .iter()
+        .any(contains_text_empty_opaque_layouter_surface)
+}
+
+fn block_has_visual_decoration(block: &typst::foundations::Packed<BlockElem>) -> bool {
+    let styles = StyleChain::default();
+    if block.fill.get_cloned(styles).is_some() {
+        return true;
+    }
+    let stroke = block.stroke.resolve(styles);
+    stroke.left.is_some()
+        || stroke.top.is_some()
+        || stroke.right.is_some()
+        || stroke.bottom.is_some()
+}
+
+fn block_has_opaque_layouter_body(block: &typst::foundations::Packed<BlockElem>) -> bool {
+    matches!(
+        block.body.get_cloned(StyleChain::default()),
+        Some(body) if !matches!(body, BlockBody::Content(_))
+    )
+}
+
+fn is_opaque_visual_element_name(name: &str) -> bool {
+    matches!(
+        name,
+        "rect" | "circle" | "ellipse" | "line" | "polygon" | "path" | "image"
+    )
 }
 
 fn raw_block_modified_content(
@@ -2400,12 +2874,12 @@ fn diff_raw_block_lines(old_text: &str, new_text: &str) -> Vec<WordOp> {
     for op in capture_diff_slices(Algorithm::Myers, &old_lines, &new_lines) {
         match op {
             DiffOp::Equal {
-                old_index,
-                new_index: _,
+                old_index: _,
+                new_index,
                 len,
             } => coalesce(
                 &mut ops,
-                WordOp::Equal(raw_line_tokens(&old_lines[old_index..old_index + len])),
+                WordOp::Equal(raw_line_tokens(&new_lines[new_index..new_index + len])),
             ),
             DiffOp::Delete {
                 old_index,
@@ -2525,9 +2999,14 @@ fn context_split_replacement_block_edit(
     new_equation_origins: &[Content],
     page_styles: Styles,
 ) -> DiffBlockEdit {
-    let base_content = Content::sequence([old_block.content.clone(), new_block.content.clone()]);
+    let old_base = old_display_surface_for_annotated(&old_block.content, old_ann).content;
+    let new_base = new_ann
+        .map(|node| node.realized.clone())
+        .unwrap_or_else(|| new_block.content.clone());
+    let base_content = Content::sequence([old_base, new_base]);
     DiffBlockEdit {
         base: annotated_block_from(&base_content, None),
+        base_provenance: BlockBaseProvenance::MixedInertOldLiveNew,
         edits: vec![
             RealizedEdit::ReplaceAt {
                 path: vec![0],
@@ -2555,18 +3034,21 @@ fn context_preserving_deleted_edit(
     annotated: Option<&AnnotatedContent>,
     equation_origins: &[Content],
 ) -> EditContent {
+    if contains_non_token_display_container_for(&content, annotated) {
+        return deleted_edit_for_annotated(&content, annotated);
+    }
+
     let tokens =
         extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
     if has_meaningful_tokens(&tokens) {
-        let base = annotated
-            .map(|node| node.realized.clone())
-            .unwrap_or_else(|| content.clone());
+        let tokens = old_display_tokens(tokens);
+        let base = old_display_surface_for_annotated(&content, annotated).content;
         EditContent::Modified {
             base,
             word_ops: vec![WordOp::Delete(tokens)],
         }
     } else {
-        deleted_edit(content)
+        deleted_edit_for_annotated(&content, annotated)
     }
 }
 
@@ -2575,6 +3057,10 @@ fn context_preserving_inserted_edit(
     annotated: Option<&AnnotatedContent>,
     equation_origins: &[Content],
 ) -> EditContent {
+    if contains_non_token_display_container_for(&content, annotated) {
+        return EditContent::Inserted(content);
+    }
+
     let tokens =
         extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
     if has_meaningful_tokens(&tokens) {
@@ -2588,6 +3074,104 @@ fn context_preserving_inserted_edit(
     } else {
         EditContent::Inserted(content)
     }
+}
+
+fn contains_non_token_display_container(content: &Content) -> bool {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return contains_non_token_display_container(&styled.child);
+    }
+
+    if content.is::<TableElem>() || content.is::<GridElem>() {
+        return true;
+    }
+
+    if let Some(box_elem) = content.to_packed::<BoxElem>() {
+        return box_elem
+            .body
+            .get_cloned(StyleChain::default())
+            .is_some_and(|body| contains_non_token_display_container(&body));
+    }
+
+    if let Some(par) = content.to_packed::<ParElem>() {
+        return contains_non_token_display_container(&par.body);
+    }
+
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return contains_non_token_display_container(&heading.body);
+    }
+
+    if let Some(caption) = content.to_packed::<FigureCaption>() {
+        return contains_non_token_display_container(&caption.body);
+    }
+
+    if let Some(footnote) = content.to_packed::<FootnoteElem>()
+        && let FootnoteBody::Content(body) = &footnote.body
+    {
+        return contains_non_token_display_container(body);
+    }
+
+    if let Some(figure) = content.to_packed::<FigureElem>() {
+        return contains_non_token_display_container(&figure.body)
+            || figure
+                .caption
+                .get_cloned(StyleChain::default())
+                .is_some_and(|caption| contains_non_token_display_container(&caption.body));
+    }
+
+    if let Some(link) = content.to_packed::<LinkElem>() {
+        return contains_non_token_display_container(&link.body);
+    }
+
+    if let Some(strong) = content.to_packed::<StrongElem>() {
+        return contains_non_token_display_container(&strong.body);
+    }
+
+    if let Some(emph) = content.to_packed::<EmphElem>() {
+        return contains_non_token_display_container(&emph.body);
+    }
+
+    if let Some(highlight) = content.to_packed::<HighlightElem>() {
+        return contains_non_token_display_container(&highlight.body);
+    }
+
+    if let Some(list) = content.to_packed::<ListElem>() {
+        return list
+            .children
+            .iter()
+            .any(|item| contains_non_token_display_container(&item.body));
+    }
+
+    if let Some(enm) = content.to_packed::<EnumElem>() {
+        return enm
+            .children
+            .iter()
+            .any(|item| contains_non_token_display_container(&item.body));
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        return contains_non_token_display_container(&body);
+    }
+
+    if let Some(seq) = content.to_packed::<SequenceElem>() {
+        return seq
+            .children
+            .iter()
+            .any(contains_non_token_display_container);
+    }
+
+    false
+}
+
+fn contains_non_token_display_container_for(
+    content: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> bool {
+    annotated
+        .map(effective_render_content)
+        .is_some_and(|content| contains_non_token_display_container(&content))
+        || contains_non_token_display_container(content)
 }
 
 fn block_context_changed(
@@ -2726,6 +3310,26 @@ fn block_context_key(content: &Content) -> Option<String> {
         ));
     }
 
+    if content.is::<TableElem>() {
+        return Some("table".to_string());
+    }
+
+    if content.is::<GridElem>() {
+        return Some("grid".to_string());
+    }
+
+    if content.is::<ListElem>() {
+        return Some("list".to_string());
+    }
+
+    if content.is::<EnumElem>() {
+        return Some("enum".to_string());
+    }
+
+    if content.is::<FigureElem>() {
+        return Some("figure".to_string());
+    }
+
     None
 }
 
@@ -2734,6 +3338,10 @@ fn is_block_context(content: &Content) -> bool {
         return is_block_context(&styled.child);
     }
     content.is::<BlockElem>()
+}
+
+fn is_empty_block_shell(content: &Content) -> bool {
+    content.plain_text().trim().is_empty() && is_block_context(content)
 }
 
 fn presentation_changed(
@@ -2755,9 +3363,12 @@ fn presentation_changed(
         new_equation_origins,
     );
     if !old_tokens.is_empty() || !new_tokens.is_empty() {
-        return diff_words(&old_tokens, &new_tokens)
+        if diff_words(&old_tokens, &new_tokens)
             .iter()
-            .any(|op| !matches!(op, WordOp::Equal(_)));
+            .any(|op| !matches!(op, WordOp::Equal(_)))
+        {
+            return true;
+        }
     }
 
     presentation_key(&old_block.content) != presentation_key(&new_block.content)
@@ -2768,6 +3379,10 @@ fn inserted_block_edit(
     annotated: Option<&AnnotatedContent>,
     equation_origins: &[Content],
 ) -> EditContent {
+    if contains_non_token_display_container_for(&content, annotated) {
+        return EditContent::Inserted(content);
+    }
+
     let tokens =
         extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
     if content.plain_text().is_empty() && has_meaningful_tokens(&tokens) {
@@ -2785,15 +3400,20 @@ fn deleted_block_edit(
     annotated: Option<&AnnotatedContent>,
     equation_origins: &[Content],
 ) -> EditContent {
+    if contains_non_token_display_container_for(&content, annotated) {
+        return deleted_edit_for_annotated(&content, annotated);
+    }
+
     let tokens =
         extract_words_for_annotated_with_equation_origins(&content, annotated, equation_origins);
     if content.plain_text().is_empty() && has_meaningful_tokens(&tokens) {
+        let tokens = old_display_tokens(tokens);
         EditContent::Modified {
-            base: content,
+            base: old_display_surface_for_annotated(&content, annotated).content,
             word_ops: vec![WordOp::Delete(tokens)],
         }
     } else {
-        deleted_edit(content)
+        deleted_edit_for_annotated(&content, annotated)
     }
 }
 
@@ -2830,6 +3450,12 @@ fn diff_annotated_inner_with_events(
     let mut new_equation_origins = EquationOriginBlockCursor::new(new);
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
+    let mut recursed_display_surfaces = Vec::new();
+    let mut deferred_old_owner: Option<BlockOwnerMatch<'_>> = None;
+    let mut deferred_new_owner: Option<BlockOwnerMatch<'_>> = None;
+    let mut deferred_old_equation_origins: Vec<Content> = Vec::new();
+    let mut deferred_new_equation_origins: Vec<Content> = Vec::new();
+    let mut pending_display_equation_carriers = 0usize;
     let matched_ops = prepared.matched_ops;
     let mut op_index = 0;
     while op_index < matched_ops.len() {
@@ -2838,17 +3464,15 @@ fn diff_annotated_inner_with_events(
         match op {
             BlockOp::Equal(old_block, new_block) => {
                 let page_styles = new_block.page_styles.clone();
-                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
-                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
                 let old_claim = old_owners.take_claim_for(&old_block.content);
                 let new_claim = new_owners.take_claim_for(&new_block.content);
                 let new_claim_key = new_claim.key.clone();
                 let old_ann = old_claim
                     .owner
-                    .or_else(|| find_nonempty_annotated_child(old, &old_block.content));
+                    .or_else(|| find_annotated_block_owner(old, &old_block.content));
                 let new_ann = new_claim
                     .owner
-                    .or_else(|| find_nonempty_annotated_child(new, &new_block.content));
+                    .or_else(|| find_annotated_block_owner(new, &new_block.content));
                 emit_pipeline_trace_event(
                     debug_events,
                     PipelineTraceEvent::new("diff/owner-claim", "equal_block")
@@ -2860,13 +3484,68 @@ fn diff_annotated_inner_with_events(
                         .old_content(&old_block.content)
                         .new_content(&new_block.content),
                 )?;
-                blocks.extend(layout.take_before(&new_block.content, new_ann));
+                blocks.extend(layout.take_before(&new_block.content));
+                if pending_display_equation_carriers > 0 && is_empty_block_shell(&new_block.content)
+                {
+                    pending_display_equation_carriers -= 1;
+                    continue;
+                }
+                if old_ann.zip(new_ann).is_some_and(|(old_ann, new_ann)| {
+                    should_defer_invisible_owner_edit(&old_block.content, old_ann)
+                        && should_defer_invisible_owner_edit(&new_block.content, new_ann)
+                }) {
+                    deferred_old_owner = Some(old_claim.clone());
+                    deferred_new_owner = Some(new_claim.clone());
+                    if let Some(old_ann) = old_ann
+                        && should_defer_invisible_equation_owner(&old_block.content, old_ann)
+                    {
+                        deferred_old_equation_origins
+                            .extend(old_ann.annotation.equation_origins.iter().cloned());
+                    }
+                    if let Some(new_ann) = new_ann
+                        && should_defer_invisible_equation_owner(&new_block.content, new_ann)
+                    {
+                        deferred_new_equation_origins
+                            .extend(new_ann.annotation.equation_origins.iter().cloned());
+                    }
+                    blocks.push(DiffBlockEdit {
+                        base: annotated_block_from(&new_block.content, None),
+                        base_provenance: BlockBaseProvenance::LiveNew,
+                        edits: vec![],
+                        page_styles,
+                    });
+                    continue;
+                }
+                if old_block.content.plain_text().trim().is_empty()
+                    && new_block.content.plain_text().trim().is_empty()
+                    && !old_ann.is_some_and(is_display_equation_owner)
+                    && !new_ann.is_some_and(is_display_equation_owner)
+                {
+                    blocks.push(DiffBlockEdit {
+                        base: annotated_block_from(&new_block.content, None),
+                        base_provenance: BlockBaseProvenance::LiveNew,
+                        edits: vec![],
+                        page_styles,
+                    });
+                    continue;
+                }
+                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
+                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
+                if new_ann.is_none()
+                    && consume_recursed_display_surface(
+                        &mut recursed_display_surfaces,
+                        &new_block.content,
+                    )
+                {
+                    continue;
+                }
                 if let (Some(old_ann), Some(new_ann)) = (old_ann, new_ann)
                     && can_recurse_via_slots(old_ann, new_ann)
                 {
                     if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim_key) {
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, None),
+                            base_provenance: BlockBaseProvenance::LiveNew,
                             edits: vec![],
                             page_styles,
                         });
@@ -2874,8 +3553,10 @@ fn diff_annotated_inner_with_events(
                     }
                     if annotated_subtree_equal(old_ann, new_ann) {
                         mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim_key);
+                        mark_recursed_display_surface(&mut recursed_display_surfaces, new_ann);
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, None),
+                            base_provenance: BlockBaseProvenance::LiveNew,
                             edits: vec![],
                             page_styles,
                         });
@@ -2885,8 +3566,10 @@ fn diff_annotated_inner_with_events(
                     edits.extend(diff_slot_edits_with_events(old_ann, new_ann, debug_events)?);
                     if !edits.is_empty() {
                         mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim_key);
+                        mark_recursed_display_surface(&mut recursed_display_surfaces, new_ann);
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            base_provenance: BlockBaseProvenance::LiveNew,
                             edits,
                             page_styles,
                         });
@@ -2896,8 +3579,10 @@ fn diff_annotated_inner_with_events(
                         && let Some(edit) = owned_surface_modified_edit(old_ann, new_ann)
                     {
                         mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim_key);
+                        mark_recursed_display_surface(&mut recursed_display_surfaces, new_ann);
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            base_provenance: BlockBaseProvenance::LiveNew,
                             edits: vec![edit],
                             page_styles,
                         });
@@ -2917,14 +3602,27 @@ fn diff_annotated_inner_with_events(
                         Some(new_ann),
                         &new_eq_origins,
                     );
-                    let word_ops = diff_words(&old_tokens, &new_tokens);
+                    let word_ops = old_display_delete_ops(diff_words(&old_tokens, &new_tokens));
                     if has_textual_word_change(&word_ops) {
+                        if is_display_equation_owner(new_ann) {
+                            pending_display_equation_carriers += 1;
+                        }
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            base_provenance: BlockBaseProvenance::LiveNew,
                             edits: vec![RealizedEdit::WholeBlock(EditContent::Modified {
                                 base: new_block.content.clone(),
                                 word_ops,
                             })],
+                            page_styles,
+                        });
+                        continue;
+                    }
+                    if is_empty_realized_equation_owner(&new_block.content, new_ann) {
+                        blocks.push(DiffBlockEdit {
+                            base: annotated_block_from(&new_block.content, Some(new_ann)),
+                            base_provenance: BlockBaseProvenance::LiveNew,
+                            edits: vec![],
                             page_styles,
                         });
                         continue;
@@ -2995,6 +3693,7 @@ fn diff_annotated_inner_with_events(
                         )?;
                         blocks.push(DiffBlockEdit {
                             base: annotated_block_from(&new_block.content, new_ann),
+                            base_provenance: BlockBaseProvenance::LiveNew,
                             edits,
                             page_styles,
                         });
@@ -3003,6 +3702,7 @@ fn diff_annotated_inner_with_events(
                 }
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, None),
+                    base_provenance: BlockBaseProvenance::LiveNew,
                     edits: vec![],
                     page_styles: new_block.page_styles,
                 });
@@ -3024,12 +3724,12 @@ fn diff_annotated_inner_with_events(
                         let new_claim = new_owners.take_claim_for(&new_block.content);
                         let new_eq_origins = new_equation_origins.take_for(&new_block.content);
                         if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
-                            blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
+                            blocks.extend(layout.take_before(&new_block.content));
                             op_index += 1;
                             continue;
                         }
-                        blocks.extend(layout.take_before(&new_block.content, new_claim.owner));
-                        blocks.push(replace_block_edit(
+                        blocks.extend(layout.take_before(&new_block.content));
+                        let replaced = replace_block_edit(
                             old,
                             new,
                             &old_block,
@@ -3039,7 +3739,47 @@ fn diff_annotated_inner_with_events(
                             &old_eq_origins,
                             &new_eq_origins,
                             debug_events,
-                        )?);
+                        )?;
+                        if old_claim
+                            .owner
+                            .zip(new_claim.owner)
+                            .is_some_and(|(old_ann, new_ann)| {
+                                can_recurse_via_slots(old_ann, new_ann)
+                                    && !replaced.edits.is_empty()
+                            })
+                        {
+                            mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim.key);
+                            if let Some(new_ann) = new_claim.owner {
+                                mark_recursed_display_surface(
+                                    &mut recursed_display_surfaces,
+                                    new_ann,
+                                );
+                            }
+                        }
+                        blocks.push(replaced);
+                        op_index += 1;
+                        continue;
+                    }
+                    if !old_claim
+                        .owner
+                        .zip(new_claim.owner)
+                        .is_some_and(|(old_ann, new_ann)| can_recurse_via_slots(old_ann, new_ann))
+                        && consume_recursed_display_surface(
+                            &mut recursed_display_surfaces,
+                            &new_block.content,
+                        )
+                    {
+                        emit_pipeline_trace_event(
+                            debug_events,
+                            PipelineTraceEvent::new("diff/display-surface", "suppressed")
+                                .reason("changed display surface already recursed through owner")
+                                .old_content(&old_block.content)
+                                .new_content(&new_block.content)
+                                .selected_edit_kind("noop"),
+                        )?;
+                        blocks.extend(layout.take_before(&new_block.content));
+                        new_owners.take_claim_for(&new_block.content);
+                        new_equation_origins.take_for(&new_block.content);
                         op_index += 1;
                         continue;
                     }
@@ -3047,14 +3787,17 @@ fn diff_annotated_inner_with_events(
                 let old_ann = old_claim
                     .owner
                     .or_else(|| find_annotated_block_owner(old, &old_block.content));
+                let old_base =
+                    old_display_surface_for_annotated(&old_block.content, old_ann).content;
                 blocks.push(DiffBlockEdit {
-                    base: annotated_block_from(&old_block.content, old_ann),
+                    base: annotated_block_from(&old_base, None),
+                    base_provenance: BlockBaseProvenance::InertOld,
                     edits: vec![RealizedEdit::WholeBlock(deleted_block_edit(
                         old_block.content.clone(),
                         old_ann,
                         &old_eq_origins,
                     ))],
-                    page_styles: old_block.page_styles,
+                    page_styles: current_annotated_page_styles(&blocks),
                 });
             }
             BlockOp::Insert(new_block) => {
@@ -3062,22 +3805,53 @@ fn diff_annotated_inner_with_events(
                 let new_ann = new_owners
                     .take_owner_for(&new_block.content)
                     .or_else(|| find_annotated_block_owner(new, &new_block.content));
-                blocks.extend(layout.take_before(&new_block.content, new_ann));
+                blocks.extend(layout.take_before(&new_block.content));
                 blocks.push(DiffBlockEdit {
                     base: annotated_block_from(&new_block.content, new_ann),
-                    edits: vec![RealizedEdit::WholeBlock(inserted_block_edit(
-                        new_block.content.clone(),
-                        new_ann,
-                        &new_eq_origins,
-                    ))],
+                    base_provenance: BlockBaseProvenance::LiveNew,
+                    edits: if let Some(new_ann) = new_ann
+                        && is_empty_realized_equation_owner(&new_block.content, new_ann)
+                    {
+                        let base = live_display_equation_block(new_ann)
+                            .unwrap_or_else(|| new_block.content.clone());
+                        let tokens = extract_words(&base);
+                        vec![RealizedEdit::MarkBaseInserted(EditContent::Modified {
+                            base,
+                            word_ops: vec![WordOp::Insert(tokens)],
+                        })]
+                    } else {
+                        vec![RealizedEdit::WholeBlock(inserted_block_edit(
+                            new_block.content.clone(),
+                            new_ann,
+                            &new_eq_origins,
+                        ))]
+                    },
                     page_styles: new_block.page_styles,
                 });
             }
             BlockOp::Replace(old_block, new_block) => {
-                let old_eq_origins = old_equation_origins.take_for(&old_block.content);
-                let new_eq_origins = new_equation_origins.take_for(&new_block.content);
-                let old_claim = old_owners.take_claim_for(&old_block.content);
-                let new_claim = new_owners.take_claim_for(&new_block.content);
+                let mut old_eq_origins = old_equation_origins.take_for(&old_block.content);
+                let mut new_eq_origins = new_equation_origins.take_for(&new_block.content);
+                if realized_equation_carrier_count_for_diff(&old_block.content) > 0 {
+                    old_eq_origins.append(&mut deferred_old_equation_origins);
+                }
+                if realized_equation_carrier_count_for_diff(&new_block.content) > 0 {
+                    new_eq_origins.append(&mut deferred_new_equation_origins);
+                }
+                let mut old_claim = old_owners.take_claim_for(&old_block.content);
+                let mut new_claim = new_owners.take_claim_for(&new_block.content);
+                if old_claim.owner.is_none()
+                    && old_block.content.plain_text().trim().is_empty()
+                    && let Some(deferred) = deferred_old_owner.take()
+                {
+                    old_claim = deferred;
+                }
+                if new_claim.owner.is_none()
+                    && new_block.content.plain_text().trim().is_empty()
+                    && let Some(deferred) = deferred_new_owner.take()
+                {
+                    new_claim = deferred;
+                }
                 let old_ann = old_claim
                     .owner
                     .or_else(|| find_annotated_block_owner(old, &old_block.content));
@@ -3085,11 +3859,36 @@ fn diff_annotated_inner_with_events(
                     .owner
                     .or_else(|| find_annotated_block_owner(new, &new_block.content));
                 if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
-                    blocks.extend(layout.take_before(&new_block.content, new_ann));
+                    blocks.extend(layout.take_before(&new_block.content));
                     continue;
                 }
-                blocks.extend(layout.take_before(&new_block.content, new_ann));
-                blocks.push(replace_block_edit(
+                if !old_ann
+                    .zip(new_ann)
+                    .is_some_and(|(old_ann, new_ann)| can_recurse_via_slots(old_ann, new_ann))
+                    && consume_recursed_display_surface(
+                        &mut recursed_display_surfaces,
+                        &new_block.content,
+                    )
+                {
+                    emit_pipeline_trace_event(
+                        debug_events,
+                        PipelineTraceEvent::new("diff/display-surface", "suppressed")
+                            .reason("changed display surface already recursed through owner")
+                            .old_content(&old_block.content)
+                            .new_content(&new_block.content)
+                            .selected_edit_kind("noop"),
+                    )?;
+                    blocks.extend(layout.take_before(&new_block.content));
+                    continue;
+                }
+                if pending_display_equation_carriers > 0 && is_empty_block_shell(&new_block.content)
+                {
+                    pending_display_equation_carriers -= 1;
+                    blocks.extend(layout.take_before(&new_block.content));
+                    continue;
+                }
+                blocks.extend(layout.take_before(&new_block.content));
+                let replaced = replace_block_edit(
                     old,
                     new,
                     &old_block,
@@ -3099,7 +3898,16 @@ fn diff_annotated_inner_with_events(
                     &old_eq_origins,
                     &new_eq_origins,
                     debug_events,
-                )?);
+                )?;
+                if old_ann.zip(new_ann).is_some_and(|(old_ann, new_ann)| {
+                    can_recurse_via_slots(old_ann, new_ann) && !replaced.edits.is_empty()
+                }) {
+                    mark_recursed_owner(&mut recursed_equal_semantic_nodes, &new_claim.key);
+                    if let Some(new_ann) = new_ann {
+                        mark_recursed_display_surface(&mut recursed_display_surfaces, new_ann);
+                    }
+                }
+                blocks.push(replaced);
             }
         }
     }
@@ -3115,6 +3923,7 @@ fn diff_annotated_inner_with_events(
     )?;
     let before_footnote_blocks = blocks.len();
     append_footnote_body_edits(old, new, &mut blocks);
+    prune_invisible_old_deletions(&mut blocks);
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("diff/footnote-body", "complete").reason(format!(
@@ -3212,6 +4021,66 @@ fn prune_duplicate_empty_container_edits(blocks: &mut [DiffBlockEdit]) {
     }
 }
 
+fn prune_invisible_old_deletions(blocks: &mut Vec<DiffBlockEdit>) {
+    for block in blocks.iter_mut() {
+        prune_invisible_old_delete_edits(&mut block.edits);
+    }
+    blocks.retain(|block| {
+        !(block.base_provenance == BlockBaseProvenance::InertOld
+            && block.edits.is_empty()
+            && effective_render_content(&block.base)
+                .plain_text()
+                .is_empty()
+            && !contains_opaque_visual_surface(&effective_render_content(&block.base)))
+    });
+}
+
+fn prune_invisible_old_delete_edits(edits: &mut Vec<RealizedEdit>) {
+    for edit in edits.iter_mut() {
+        prune_nested_invisible_old_deletions(edit);
+    }
+    edits.retain(|edit| !is_invisible_old_delete_edit(edit));
+}
+
+fn prune_nested_invisible_old_deletions(edit: &mut RealizedEdit) {
+    let content = match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content)
+        | RealizedEdit::LogOnly(content)
+        | RealizedEdit::MarkBaseInserted(content) => content,
+    };
+    if let EditContent::Nested { edits, .. } = content {
+        prune_invisible_old_delete_edits(edits);
+    }
+}
+
+fn is_invisible_old_delete_edit(edit: &RealizedEdit) -> bool {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content) => is_invisible_old_delete_content(content),
+        RealizedEdit::LogOnly(_) | RealizedEdit::MarkBaseInserted(_) => false,
+    }
+}
+
+fn is_invisible_old_delete_content(content: &EditContent) -> bool {
+    match content {
+        EditContent::Deleted(surface) => {
+            let content = surface.as_content();
+            content.plain_text().is_empty() && !contains_opaque_visual_surface(content)
+        }
+        EditContent::Nested { edits, .. } => edits.is_empty(),
+        EditContent::Inserted(_)
+        | EditContent::OpaqueReplacement { .. }
+        | EditContent::Modified { .. } => false,
+    }
+}
+
 fn is_owned_empty_edit_block(block: &DiffBlockEdit) -> bool {
     block.base.realized.plain_text().is_empty() && !block.base.annotation.slots.is_empty()
 }
@@ -3240,6 +4109,7 @@ fn edit_is_opaque_replacement(edit: &RealizedEdit) -> bool {
         | RealizedEdit::WholeBlock(content) => {
             matches!(content, EditContent::OpaqueReplacement { .. })
         }
+        RealizedEdit::LogOnly(_) | RealizedEdit::MarkBaseInserted(_) => false,
     }
 }
 
@@ -3278,7 +4148,8 @@ fn append_deleted_footnote_body_edits(old_bodies: Vec<Content>, blocks: &mut Vec
         if tokens.is_empty() {
             continue;
         }
-        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(old_body.clone())));
+        let inert_body = retain_old_display_content(&old_body);
+        let footnote = Content::new(FootnoteElem::new(FootnoteBody::Content(inert_body.clone())));
         let base = annotate_realized(&footnote, &footnote);
         let Some(path) = base
             .annotation
@@ -3291,11 +4162,12 @@ fn append_deleted_footnote_body_edits(old_bodies: Vec<Content>, blocks: &mut Vec
         };
         blocks.push(DiffBlockEdit {
             base,
+            base_provenance: BlockBaseProvenance::InertOld,
             edits: vec![RealizedEdit::ReplaceAt {
                 path,
                 content: EditContent::Modified {
-                    base: old_body,
-                    word_ops: vec![WordOp::Delete(tokens)],
+                    base: inert_body,
+                    word_ops: vec![WordOp::Delete(old_display_tokens(tokens))],
                 },
             }],
             page_styles: Styles::new(),
@@ -3355,13 +4227,17 @@ fn collect_modified_signatures(edit: &RealizedEdit, signatures: &mut HashSet<Str
         | RealizedEdit::InsertBefore { content, .. }
         | RealizedEdit::InsertAfter { content, .. }
         | RealizedEdit::Append { content }
-        | RealizedEdit::WholeBlock(content) => collect_edit_content_signature(content, signatures),
+        | RealizedEdit::WholeBlock(content)
+        | RealizedEdit::LogOnly(content)
+        | RealizedEdit::MarkBaseInserted(content) => {
+            collect_edit_content_signature(content, signatures)
+        }
     }
 }
 
 fn collect_edit_content_signature(content: &EditContent, signatures: &mut HashSet<String>) {
     match content {
-        EditContent::Modified { base, word_ops } if has_textual_word_change(word_ops) => {
+        EditContent::Modified { base, word_ops, .. } if has_textual_word_change(word_ops) => {
             signatures.insert(format!(
                 "{}\n{}\n{}",
                 single_line(&base.plain_text()),
@@ -3383,7 +4259,7 @@ fn collect_edit_content_signature(content: &EditContent, signatures: &mut HashSe
         EditContent::OpaqueReplacement { old, new } => {
             signatures.insert(format!(
                 "opaque\n{}\n{}",
-                content_signature(old),
+                content_signature(old.as_content()),
                 content_signature(new)
             ));
         }
@@ -3443,7 +4319,6 @@ fn diff_annotated_with_rendered_regions_inner(
     let new_source = crate::eval::eval_to_content(new_world)?;
     let old_doc = crate::eval::layout_document(old_world, &old_source)?;
     let new_doc = crate::eval::layout_document(new_world, &new_source)?;
-    enrich_deleted_figure_caption_labels(&mut result, &old_doc);
     let old_styles = document_page_styles_raw(&old.realized, &extract_block_units(&old.realized));
     let new_styles = document_page_styles_raw(&new.realized, &extract_block_units(&new.realized));
     let new_source_styles =
@@ -3459,119 +4334,6 @@ fn diff_annotated_with_rendered_regions_inner(
         debug_events,
     )?;
     Ok((result, debug))
-}
-
-fn enrich_deleted_figure_caption_labels(result: &mut DiffResult, old_doc: &PagedDocument) {
-    let lines = rendered_document_text_lines(old_doc);
-    if lines.is_empty() {
-        return;
-    }
-
-    for block in &mut result.blocks {
-        for edit in &mut block.edits {
-            enrich_deleted_figure_caption_label_edit(edit, &lines);
-        }
-    }
-}
-
-fn enrich_deleted_figure_caption_label_edit(edit: &mut RealizedEdit, lines: &[String]) {
-    match edit {
-        RealizedEdit::ReplaceAt { content, .. }
-        | RealizedEdit::InsertBefore { content, .. }
-        | RealizedEdit::InsertAfter { content, .. }
-        | RealizedEdit::Append { content } => {
-            enrich_deleted_figure_caption_label_content(content, lines);
-        }
-        RealizedEdit::WholeBlock(_) => {}
-    }
-}
-
-fn enrich_deleted_figure_caption_label_content(content: &mut EditContent, lines: &[String]) {
-    match content {
-        EditContent::Deleted(deleted) => {
-            if let Some(rendered) = deleted_figure_caption_rendered_line(deleted, lines) {
-                *deleted = TextElem::packed(rendered.as_str());
-            }
-        }
-        EditContent::Nested { edits, .. } => {
-            for edit in edits {
-                enrich_deleted_figure_caption_label_edit(edit, lines);
-            }
-        }
-        EditContent::Inserted(_)
-        | EditContent::OpaqueReplacement { .. }
-        | EditContent::Modified { .. } => {}
-    }
-}
-
-fn deleted_figure_caption_rendered_line(content: &Content, lines: &[String]) -> Option<String> {
-    let caption = content.to_packed::<FigureCaption>()?;
-    let body = caption.body.plain_text();
-    let body = body.trim();
-    if body.is_empty() {
-        return None;
-    }
-
-    let mut candidates = lines
-        .iter()
-        .map(|line| line.trim())
-        .filter(|line| *line != body && line.matches(body).count() == 1);
-    let rendered = candidates.next()?;
-    candidates
-        .next()
-        .is_none()
-        .then(|| rendered.replace('\u{a0}', " "))
-}
-
-fn rendered_document_text_lines(document: &PagedDocument) -> Vec<String> {
-    let mut lines = Vec::new();
-    for page in &document.pages {
-        let mut runs = Vec::new();
-        let mut tag_stack = Vec::new();
-        collect_positioned_text_runs(&page.frame, Point::zero(), &mut tag_stack, &mut runs);
-        let page_text = RenderedRegionText::from_runs(runs, page.frame.width().to_pt());
-        lines.extend(
-            page_text
-                .clusters
-                .into_iter()
-                .map(|cluster| cluster.text)
-                .filter(|text| !text.trim().is_empty()),
-        );
-    }
-    lines
-}
-
-fn collect_positioned_text_runs(
-    frame: &Frame,
-    origin: Point,
-    tag_stack: &mut Vec<FrameTag>,
-    out: &mut Vec<RenderedRegionRun>,
-) {
-    for (pos, item) in frame.items() {
-        let absolute = origin + *pos;
-        match item {
-            FrameItem::Text(text) => out.push(RenderedRegionRun {
-                x: absolute.x.to_pt(),
-                y: absolute.y.to_pt(),
-                width: text.width().to_pt(),
-                text: text.text.to_string(),
-                content: rendered_region_run_content(text.text.as_str(), tag_stack),
-            }),
-            FrameItem::Group(group) => {
-                collect_positioned_text_runs(&group.frame, absolute, tag_stack, out);
-            }
-            FrameItem::Tag(Tag::Start(content, _)) => {
-                tag_stack.push(FrameTag {
-                    is_artifact: content.elem().name() == "artifact",
-                    elem_name: content.elem().name().to_string(),
-                });
-            }
-            FrameItem::Tag(Tag::End(_, _, _)) => {
-                tag_stack.pop();
-            }
-            FrameItem::Shape(_, _) | FrameItem::Image(_, _, _) | FrameItem::Link(_, _) => {}
-        }
-    }
 }
 
 fn diff_root_page_regions(old_styles: &Styles, new_styles: &Styles) -> Vec<DiffRegionEdit> {
@@ -4508,20 +5270,15 @@ impl<'a> LayoutCursor<'a> {
         Self { blocks, index: 0 }
     }
 
-    fn take_before(
-        &mut self,
-        target: &Content,
-        owner: Option<&AnnotatedContent>,
-    ) -> Vec<DiffBlockEdit> {
+    fn take_before(&mut self, target: &Content) -> Vec<DiffBlockEdit> {
         let mut out = Vec::new();
         while let Some(block) = self.blocks.get(self.index) {
             self.index += 1;
+            if layout_content_matches(&block.content, target) {
+                break;
+            }
             if block.content.is::<ParbreakElem>() {
                 out.push(layout_block_edit(block));
-                continue;
-            }
-            if layout_content_matches(&block.content, target, owner) {
-                break;
             }
         }
         out
@@ -4569,43 +5326,48 @@ impl<'a> BlockOwnerCursor<'a> {
     }
 
     fn take_claim_for(&mut self, target: &Content) -> BlockOwnerMatch<'a> {
-        let Some(claim) = self.claims.get(self.index) else {
-            return BlockOwnerMatch {
-                owner: None,
-                key: None,
-            };
-        };
-        self.index += 1;
-        if owned_block_matches(&claim.content, target) {
-            BlockOwnerMatch {
-                owner: claim.owner,
-                key: claim.key.clone(),
+        while let Some(claim) = self.claims.get(self.index) {
+            if owned_block_matches(&claim.content, target) {
+                self.index += 1;
+                return BlockOwnerMatch {
+                    owner: claim.owner,
+                    key: claim.key.clone(),
+                };
             }
-        } else {
-            BlockOwnerMatch {
-                owner: None,
-                key: None,
+            if claim.owner.is_some_and(is_display_equation_owner) {
+                break;
             }
+            if !claim.content.plain_text().trim().is_empty() {
+                break;
+            }
+            self.index += 1;
+        }
+        BlockOwnerMatch {
+            owner: None,
+            key: None,
         }
     }
 
     fn peek_claim_for(&self, target: &Content) -> BlockOwnerMatch<'a> {
-        let Some(claim) = self.claims.get(self.index) else {
-            return BlockOwnerMatch {
-                owner: None,
-                key: None,
-            };
-        };
-        if owned_block_matches(&claim.content, target) {
-            BlockOwnerMatch {
-                owner: claim.owner,
-                key: claim.key.clone(),
+        let mut index = self.index;
+        while let Some(claim) = self.claims.get(index) {
+            if owned_block_matches(&claim.content, target) {
+                return BlockOwnerMatch {
+                    owner: claim.owner,
+                    key: claim.key.clone(),
+                };
             }
-        } else {
-            BlockOwnerMatch {
-                owner: None,
-                key: None,
+            if claim.owner.is_some_and(is_display_equation_owner) {
+                break;
             }
+            if !claim.content.plain_text().trim().is_empty() {
+                break;
+            }
+            index += 1;
+        }
+        BlockOwnerMatch {
+            owner: None,
+            key: None,
         }
     }
 }
@@ -4622,31 +5384,73 @@ struct EquationOriginBlockCursor {
 
 impl EquationOriginBlockCursor {
     fn new(root: &AnnotatedContent) -> Self {
-        let mut origins = std::collections::VecDeque::from(annotated_equation_origins(root));
-        let claims = extract_block_units(&root.realized)
-            .into_iter()
-            .map(|block| {
-                let count = realized_equation_carrier_count_for_diff(&block.content);
-                let origins = (0..count)
-                    .filter_map(|_| origins.pop_front())
-                    .collect::<Vec<_>>();
-                EquationOriginBlockClaim {
-                    content: block.content,
-                    origins,
-                }
-            })
-            .collect();
+        let mut claims = Vec::new();
+        collect_equation_origin_block_claims(root, &mut claims);
         Self { claims, index: 0 }
     }
 
     fn take_for(&mut self, target: &Content) -> Vec<Content> {
+        let mut deferred = Vec::new();
+        let target_has_equation_carrier = realized_equation_carrier_count_for_diff(target) > 0;
         while let Some(claim) = self.claims.get(self.index) {
-            self.index += 1;
             if claim.content == *target {
-                return claim.origins.clone();
+                self.index += 1;
+                deferred.extend(claim.origins.clone());
+                return deferred;
             }
+            if !claim.content.plain_text().trim().is_empty() {
+                break;
+            }
+            if !claim.origins.is_empty() && !target_has_equation_carrier {
+                break;
+            }
+            if target_has_equation_carrier {
+                deferred.extend(claim.origins.clone());
+            }
+            self.index += 1;
         }
-        vec![]
+        deferred
+    }
+}
+
+fn collect_equation_origin_block_claims(
+    node: &AnnotatedContent,
+    out: &mut Vec<EquationOriginBlockClaim>,
+) {
+    let subtree_origins = annotated_equation_origins(node);
+    if !subtree_origins.is_empty() {
+        let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
+        if blocks.len() == 1 {
+            out.push(EquationOriginBlockClaim {
+                content: blocks[0].content.clone(),
+                origins: subtree_origins,
+            });
+            return;
+        }
+
+        if node.children.is_empty() {
+            let mut origins = subtree_origins
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>();
+            for block in blocks {
+                let count =
+                    realized_equation_carrier_count_for_diff(&block.content).min(origins.len());
+                let block_origins = (0..count)
+                    .filter_map(|_| origins.pop_front())
+                    .collect::<Vec<_>>();
+                if !block_origins.is_empty() {
+                    out.push(EquationOriginBlockClaim {
+                        content: block.content,
+                        origins: block_origins,
+                    });
+                }
+            }
+            return;
+        }
+    }
+
+    for child in &node.children {
+        collect_equation_origin_block_claims(child, out);
     }
 }
 
@@ -4712,9 +5516,16 @@ fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
 }
 
 fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<BlockOwnerClaim<'a>>) {
-    let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
+    let blocks = owner_block_units(node);
     if blocks.len() == 1 {
-        let owner = (is_owned_diff_region(node) || has_equation_origins(node)).then_some(node);
+        let owner = if is_owned_diff_region(node)
+            || has_equation_origins(node)
+            || is_opaque_visual_owner(node)
+        {
+            Some(node)
+        } else {
+            unique_enclosed_diff_region_owner(node)
+        };
         if owner.is_some() || node.children.is_empty() {
             out.push(BlockOwnerClaim {
                 content: blocks[0].content.clone(),
@@ -4738,8 +5549,39 @@ fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<Bloc
     }
 }
 
+fn owner_block_units(node: &AnnotatedContent) -> Vec<DiffBlock> {
+    let realized_blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
+    if matches!(
+        node.annotation.semantic_kind,
+        Some(SemanticKind::Table | SemanticKind::Grid)
+    ) && realized_blocks
+        .iter()
+        .all(|block| block.content.plain_text().trim().is_empty())
+    {
+        let effective = effective_render_content(node);
+        let blocks = non_parbreak_blocks(&extract_block_units(&effective));
+        let nonempty_blocks = blocks
+            .iter()
+            .filter(|block| !block.content.plain_text().trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !nonempty_blocks.is_empty() {
+            return nonempty_blocks;
+        }
+        if !blocks.is_empty() {
+            return blocks;
+        }
+    }
+    realized_blocks
+}
+
 fn is_owned_diff_region(node: &AnnotatedContent) -> bool {
     !node.annotation.slots.is_empty()
+}
+
+fn unique_enclosed_diff_region_owner(node: &AnnotatedContent) -> Option<&AnnotatedContent> {
+    let mut owners = slot_bearing_descendants(node);
+    (owners.len() == 1).then(|| owners.remove(0).1)
 }
 
 fn owned_block_matches(owner_block: &Content, target: &Content) -> bool {
@@ -4764,33 +5606,81 @@ fn semantic_owner_claims_match(
 fn layout_block_edit(block: &DiffBlock) -> DiffBlockEdit {
     DiffBlockEdit {
         base: annotated_block_from(&block.content, None),
+        base_provenance: BlockBaseProvenance::Layout,
         edits: vec![],
         page_styles: block.page_styles.clone(),
     }
 }
 
-fn layout_content_matches(
-    layout: &Content,
-    target: &Content,
-    owner: Option<&AnnotatedContent>,
-) -> bool {
+fn current_annotated_page_styles(blocks: &[DiffBlockEdit]) -> Styles {
+    blocks
+        .last()
+        .map(|block| block.page_styles.clone())
+        .unwrap_or_else(Styles::new)
+}
+
+fn should_defer_invisible_owner_edit(block: &Content, owner: &AnnotatedContent) -> bool {
+    if !block.plain_text().trim().is_empty() {
+        return false;
+    }
+    if !owner.annotation.slots.is_empty()
+        && !effective_text_content(owner).plain_text().trim().is_empty()
+    {
+        return true;
+    }
+    if should_defer_invisible_equation_owner(block, owner) {
+        return true;
+    }
+    if is_opaque_visual_owner(owner) {
+        return true;
+    }
+    false
+}
+
+fn should_defer_invisible_equation_owner(block: &Content, owner: &AnnotatedContent) -> bool {
+    block.plain_text().trim().is_empty()
+        && owner.annotation.semantic_kind == Some(SemanticKind::Equation)
+        && !owner.annotation.equation_origins.is_empty()
+        && owner.annotation.equation_origins.iter().all(|origin| {
+            origin
+                .to_packed::<EquationElem>()
+                .is_some_and(|equation| !equation.block.get(StyleChain::default()))
+        })
+}
+
+fn is_display_equation_owner(owner: &AnnotatedContent) -> bool {
+    owner.annotation.semantic_kind == Some(SemanticKind::Equation)
+        && owner.annotation.equation_origins.iter().any(|origin| {
+            origin
+                .to_packed::<EquationElem>()
+                .is_some_and(|equation| equation.block.get(StyleChain::default()))
+        })
+}
+
+fn is_empty_realized_equation_owner(block: &Content, owner: &AnnotatedContent) -> bool {
+    block.plain_text().trim().is_empty()
+        && owner.annotation.semantic_kind == Some(SemanticKind::Equation)
+        && !owner.annotation.equation_origins.is_empty()
+}
+
+fn live_display_equation_block(owner: &AnnotatedContent) -> Option<Content> {
+    let origin = owner.annotation.equation_origins.first()?;
+    let mut content = origin.clone();
+    content
+        .to_packed_mut::<EquationElem>()
+        .expect("equation origin")
+        .block
+        .set(true);
+    Some(content)
+}
+
+fn layout_content_matches(layout: &Content, target: &Content) -> bool {
     if layout == target {
         return true;
     }
     let layout_text = layout.plain_text();
     let target_text = target.plain_text();
-    if !layout_text.is_empty() && layout_text == target_text {
-        return true;
-    }
-
-    let Some(owner) = owner else {
-        return false;
-    };
-    let owner_surface = effective_text_content(owner);
-    if layout == &owner_surface {
-        return true;
-    }
-    normalized_visible_text_matches(layout, &owner_surface)
+    !layout_text.is_empty() && layout_text == target_text
 }
 
 fn normalized_visible_text_matches(left: &Content, right: &Content) -> bool {
@@ -4830,13 +5720,6 @@ fn find_annotated_child<'a>(
         .max_by_key(|node| node.annotation.slots.len())
 }
 
-fn find_nonempty_annotated_child<'a>(
-    root: &'a AnnotatedContent,
-    target: &Content,
-) -> Option<&'a AnnotatedContent> {
-    (!target.plain_text().is_empty()).then(|| find_annotated_child(root, target))?
-}
-
 fn collect_annotated_matches<'a>(
     node: &'a AnnotatedContent,
     target: &Content,
@@ -4867,8 +5750,15 @@ fn collect_single_block_semantic_owners<'a>(
     out: &mut Vec<&'a AnnotatedContent>,
 ) {
     if !node.annotation.slots.is_empty() {
-        let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
-        if blocks.len() == 1 && blocks[0].content == *target {
+        if matches!(
+            node.annotation.semantic_kind,
+            Some(SemanticKind::Table | SemanticKind::Grid)
+        ) && normalized_visible_text_matches(&effective_render_content(node), target)
+        {
+            out.push(node);
+        }
+        let blocks = owner_block_units(node);
+        if blocks.len() == 1 && owned_block_matches(&blocks[0].content, target) {
             out.push(node);
         }
     }
@@ -5292,6 +6182,42 @@ fn mark_recursed_owner(recursed: &mut HashSet<SemanticOwnerKey>, key: &Option<Se
     }
 }
 
+fn mark_recursed_display_surface(recursed: &mut Vec<Content>, owner: &AnnotatedContent) {
+    let surface = effective_render_content(owner);
+    if is_display_equation_owner(owner) {
+        recursed.push(surface.clone());
+    }
+    if matches!(
+        owner.annotation.semantic_kind,
+        Some(SemanticKind::Table | SemanticKind::Grid)
+    ) && !surface.plain_text().trim().is_empty()
+    {
+        recursed.push(surface.clone());
+    }
+    if contains_non_token_display_container(&surface) {
+        recursed.extend(
+            non_parbreak_blocks(&extract_block_units(&surface))
+                .into_iter()
+                .map(|block| block.content),
+        );
+    }
+}
+
+fn consume_recursed_display_surface(recursed: &mut Vec<Content>, content: &Content) -> bool {
+    if !contains_non_token_display_container(content) && normalized_visible_text(content).is_empty()
+    {
+        return false;
+    }
+    let Some(index) = recursed
+        .iter()
+        .position(|surface| normalized_visible_text_matches(surface, content))
+    else {
+        return false;
+    };
+    recursed.remove(index);
+    true
+}
+
 fn resolved_slots(node: &AnnotatedContent) -> Vec<(&SemanticSlot, &AnnotatedContent)> {
     node.annotation
         .slots
@@ -5331,7 +6257,7 @@ fn diff_slot_edits_same_shape(
                 content,
             });
         } else {
-            push_modified_slot_edit(&mut edits, old_child, new_child, &new_slot.path);
+            push_modified_slot_edit(&mut edits, old_child, new_child, new_slot);
         }
     }
 
@@ -5342,14 +6268,40 @@ fn push_modified_slot_edit(
     edits: &mut Vec<RealizedEdit>,
     old_child: &AnnotatedContent,
     new_child: &AnnotatedContent,
-    path: &[usize],
+    slot: &SemanticSlot,
 ) {
-    if let Some(content) = modified_edit_content(old_child, new_child) {
+    if let Some(content) = modified_slot_edit_content(old_child, new_child, &slot.label) {
         edits.push(RealizedEdit::ReplaceAt {
-            path: path.to_vec(),
+            path: slot.path.clone(),
             content,
         });
     }
+}
+
+fn modified_slot_edit_content(
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+    slot: &SlotStep,
+) -> Option<EditContent> {
+    modified_edit_content(old_child, new_child)
+        .or_else(|| opaque_visual_slot_edit_content(old_child, new_child, slot))
+}
+
+fn opaque_visual_slot_edit_content(
+    old_child: &AnnotatedContent,
+    new_child: &AnnotatedContent,
+    slot: &SlotStep,
+) -> Option<EditContent> {
+    if !matches!(slot, SlotStep::FigureBody) {
+        return None;
+    }
+    let old_surface = effective_render_content(old_child);
+    let new_surface = effective_render_content(new_child);
+    opaque_visual_surface_changed(&old_surface, &new_surface, Some(old_child), Some(new_child))
+        .then(|| EditContent::OpaqueReplacement {
+            old: OldDisplaySurface::new(old_surface),
+            new: new_surface,
+        })
 }
 
 fn modified_edit_content(
@@ -5600,7 +6552,7 @@ fn deleted_visible_text_before_first_footnote(
 
     vec![RealizedEdit::InsertBefore {
         anchor,
-        content: EditContent::Deleted(content),
+        content: deleted_edit(content),
     }]
 }
 
@@ -5753,7 +6705,7 @@ fn deleted_footnote_call_edit(
         .iter()
         .map(|(_slot, child)| {
             Content::new(FootnoteElem::new(FootnoteBody::Content(
-                effective_text_content(child),
+                retain_old_display_content(&effective_text_content(child)),
             )))
         })
         .collect::<Vec<_>>();
@@ -5763,13 +6715,13 @@ fn deleted_footnote_call_edit(
 
     let content = if calls.len() == 1 {
         let call = calls.into_iter().next().expect("single deleted footnote");
-        let tokens = extract_words(&call);
+        let tokens = old_display_tokens(extract_words(&call));
         EditContent::Modified {
             base: call,
             word_ops: vec![WordOp::Delete(tokens)],
         }
     } else {
-        EditContent::Deleted(Content::sequence(calls))
+        EditContent::Deleted(OldDisplaySurface::new(Content::sequence(calls)))
     };
     if let Some(anchor) = new_slots
         .iter()
@@ -5875,7 +6827,7 @@ fn diff_slot_edits_lcs(
                             &mut edits,
                             old_child,
                             new_child,
-                            &new_slots[new_index + i].0.path,
+                            new_slots[new_index + i].0,
                         );
                     }
                 }
@@ -5925,7 +6877,7 @@ fn diff_slot_edits_lcs(
                             &mut edits,
                             old_child,
                             new_child,
-                            &new_slots[new_index + i].0.path,
+                            new_slots[new_index + i].0,
                         );
                     }
                 }
@@ -5985,7 +6937,14 @@ fn push_deleted_slot_edit(
 }
 
 fn deleted_edit(content: Content) -> EditContent {
-    EditContent::Deleted(content)
+    EditContent::Deleted(old_display_surface(&content))
+}
+
+fn deleted_edit_for_annotated(
+    content: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> EditContent {
+    EditContent::Deleted(old_display_surface_for_annotated(content, annotated))
 }
 
 #[cfg(test)]
@@ -6000,6 +6959,22 @@ mod tests {
 
     fn annotated(content: &Content) -> AnnotatedContent {
         crate::annotated::annotate_realized(content, content)
+    }
+
+    fn contains_style_for<T: NativeElement>(content: &Content) -> bool {
+        let mut found = false;
+        let _ = content.traverse::<_, ()>(&mut |node| {
+            if let Some(styled) = node.to_packed::<StyledElem>()
+                && styled
+                    .styles
+                    .iter()
+                    .any(|style| style.element().is_some_and(|element| element == T::ELEM))
+            {
+                found = true;
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        found
     }
 
     fn whole_block_modified_ops(result: &DiffResult) -> Option<&[WordOp]> {
@@ -6869,6 +7844,44 @@ mod tests {
     }
 
     #[test]
+    fn old_display_surfaces_keep_non_page_styles_but_drop_page_styles() {
+        use typst::visualize::Color;
+
+        let old = TextElem::packed("Deleted heading")
+            .styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()))
+            .styled(ParElem::justify.set(false))
+            .styled(PageElem::flipped.set(true));
+        let surface = old_display_surface(&old);
+
+        assert_eq!(surface.plain_text().as_str(), "Deleted heading");
+        assert!(contains_style_for::<TextElem>(&surface.content));
+        assert!(contains_style_for::<ParElem>(&surface.content));
+        assert!(!contains_style_for::<PageElem>(&surface.content));
+    }
+
+    #[test]
+    fn standalone_old_delete_inherits_current_new_page_styles() {
+        use typst::model::ParbreakElem;
+
+        let old = seq([
+            TextElem::packed("Keep").styled(PageElem::flipped.set(true)),
+            Content::new(ParbreakElem::new()),
+            TextElem::packed("Delete"),
+        ]);
+        let new = TextElem::packed("Keep").styled(PageElem::flipped.set(true));
+
+        let result = diff_annotated(&annotated(&old), &annotated(&new));
+        let deleted = result
+            .blocks
+            .iter()
+            .find(|block| block.base_provenance == BlockBaseProvenance::InertOld)
+            .expect("expected standalone old deletion");
+
+        assert!(!deleted.page_styles.is_empty());
+        assert!(deleted.page_styles.has(PageElem::flipped));
+    }
+
+    #[test]
     fn boundary_pagebreak_replaces_sticky_page_styles() {
         use typst::layout::PagebreakElem;
         use typst::model::ParbreakElem;
@@ -6973,6 +7986,32 @@ mod tests {
         assert!(texts.contains(&"alpha"), "tokens: {texts:?}");
         assert!(texts.contains(&"beta"), "tokens: {texts:?}");
         assert!(texts.contains(&"gamma"), "tokens: {texts:?}");
+    }
+
+    #[test]
+    fn empty_block_does_not_consume_equation_origin_tokens() {
+        use typst::layout::{BlockBody, BlockElem};
+
+        let empty_block = Content::new(
+            BlockElem::new().with_body(Some(BlockBody::Content(Content::sequence([])))),
+        );
+        let origin = Content::new(EquationElem::new(TextElem::packed("x")));
+
+        let tokens = extract_words_for_annotated_with_equation_origins(
+            &empty_block,
+            None,
+            &[origin.clone()],
+        );
+        assert!(
+            !has_meaningful_tokens(&tokens),
+            "empty structural block must not surface unrelated equation origins as word tokens"
+        );
+
+        let edit = context_preserving_inserted_edit(empty_block.clone(), None, &[origin]);
+        assert!(
+            matches!(edit, EditContent::Inserted(content) if content == empty_block),
+            "empty structural inserted content should remain live structural content, not a formula diff"
+        );
     }
 
     // --- diff_blocks_raw tests ---

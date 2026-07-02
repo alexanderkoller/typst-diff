@@ -17,20 +17,22 @@
 //! started whenever the page styles change. This preserves `#set page(…)` boundaries
 //! (margins, headers, footers) across section breaks in the diff output.
 
-use typst::foundations::{Content, Smart, Style, Styles};
+use typst::foundations::{Content, NativeElement, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::introspection::TagElem;
-use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
+use typst::layout::{Abs, BlockBody, BlockElem, HideElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{
-    EmphElem, EnumElem, EnumItem, FigureCaption, FootnoteBody, FootnoteElem, HeadingElem, ListElem,
-    ListItem, ParElem, ParbreakElem, TermItem, TermsElem,
+    EmphElem, EnumElem, EnumItem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem,
+    HeadingElem, LinkElem, ListElem, ListItem, ParElem, ParbreakElem, StrongElem, TermItem,
+    TermsElem,
 };
-use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
+use typst::text::{HighlightElem, LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
-use crate::annotated::{SemanticKind, effective_render_content};
+use crate::annotated::effective_render_content;
 use crate::container_ops;
+#[cfg(test)]
+use crate::diff::BlockBaseProvenance;
 use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
     RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, Token, WordOp,
@@ -79,17 +81,20 @@ fn flush_group(
     }
 
     let group = Content::sequence(blocks.drain(..));
-    groups.push(match page_styles {
-        Some(styles) => group.styled_with_map(styles),
-        None => group,
-    });
+    if let Some(styles) = page_styles
+        && !styles.is_empty()
+    {
+        groups.push(group.styled_with_map(styles));
+        return;
+    }
+    groups.push(group);
 }
 
 /// Turn a [`WordOp`] sequence into a flat inline `Content` sequence with colour annotations.
 ///
 /// Deleted tokens become red `StrikeElem` (equations use `CancelElem`). Inserted tokens
 /// become green. In compact mode, inserted tokens that are adjacent to a delete are
-/// coloured blue and their delete sibling is dropped entirely. A separator is inserted
+/// coloured blue and deleted modified-word runs are dropped entirely. A separator is inserted
 /// before an inserted run when the surrounding tokens would otherwise be glued into
 /// one word-like token.
 fn annotated_inline_content(word_ops: &[WordOp], compact_substitutions: bool) -> Content {
@@ -164,14 +169,10 @@ fn word_render_runs(word_ops: &[WordOp], compact: bool) -> Vec<WordRenderRun<'_>
                                 .is_some_and(|next| needs_separator(tokens, next)),
                     }
                 }
-                WordOp::Delete(tokens) => {
-                    let adjacent_insert = prev.is_some_and(|op| matches!(op, WordOp::Insert(_)))
-                        || next.is_some_and(|op| matches!(op, WordOp::Insert(_)));
-                    WordRenderRun::Delete {
-                        tokens,
-                        visible: !(compact && adjacent_insert),
-                    }
-                }
+                WordOp::Delete(tokens) => WordRenderRun::Delete {
+                    tokens,
+                    visible: !compact,
+                },
             }
         })
         .collect()
@@ -228,17 +229,8 @@ fn needs_separator(left: &[crate::diff::Token], right: &[crate::diff::Token]) ->
 
 fn deleted_token_content(token: &crate::diff::Token) -> Content {
     let content = token_render_content(token);
-    if let Some(equation) = content.to_packed::<EquationElem>() {
-        let body = equation
-            .body
-            .clone()
-            .styled(TextElem::fill.set(red().into()));
-        let cancelled = Content::new(
-            CancelElem::new(body).with_stroke(Stroke::from_pair(red(), Abs::pt(0.6).into())),
-        );
-        return Content::new(
-            EquationElem::new(cancelled).with_block(equation.block.get(StyleChain::default())),
-        );
+    if let Some(equation) = deleted_equation_token_content(&content) {
+        return equation;
     }
 
     let content = if content.plain_text().is_empty() {
@@ -248,6 +240,25 @@ fn deleted_token_content(token: &crate::diff::Token) -> Content {
     };
     let colored = content.styled(TextElem::fill.set(red().into()));
     Content::new(StrikeElem::new(colored))
+}
+
+fn deleted_equation_token_content(content: &Content) -> Option<Content> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        let child = deleted_equation_token_content(&styled.child)?;
+        return Some(child.styled_with_map(styled.styles.clone()));
+    }
+
+    let equation = content.to_packed::<EquationElem>()?;
+    let body = equation
+        .body
+        .clone()
+        .styled(TextElem::fill.set(red().into()));
+    let cancelled = Content::new(
+        CancelElem::new(body).with_stroke(Stroke::from_pair(red(), Abs::pt(0.6).into())),
+    );
+    Some(Content::new(
+        EquationElem::new(cancelled).with_block(equation.block.get(StyleChain::default())),
+    ))
 }
 
 fn token_render_content(token: &crate::diff::Token) -> Content {
@@ -386,6 +397,39 @@ fn strip_inherited_styles(content: &Content, inherited: &Styles) -> Content {
     content
 }
 
+fn strip_page_styles(content: &Content) -> Content {
+    let mut content = content.clone();
+
+    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
+        let child = strip_page_styles(&styled.child);
+        styled.styles = styles_without_page_styles(&styled.styles);
+        styled.child = child;
+        if styled.styles.is_empty() {
+            return styled.child.clone();
+        }
+        return content;
+    }
+
+    if let Some(mapped) = map_transparent_children(&content, strip_page_styles) {
+        return mapped;
+    }
+
+    content
+}
+
+fn styles_without_page_styles(styles: &Styles) -> Styles {
+    styles
+        .iter()
+        .filter(|style| {
+            style
+                .element()
+                .is_none_or(|element| element != PageElem::ELEM)
+        })
+        .cloned()
+        .map(Style::wrap)
+        .collect()
+}
+
 fn styles_without_inherited_sequence(styles: &Styles, inherited: &Styles) -> Option<Styles> {
     let styles = styles.as_slice();
     let inherited = inherited.as_slice();
@@ -447,6 +491,46 @@ fn map_transparent_children(
 
     if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
         heading.body = map_child(&heading.body);
+        return Some(content);
+    }
+
+    if let Some(link) = content.to_packed_mut::<LinkElem>() {
+        link.body = map_child(&link.body);
+        return Some(content);
+    }
+
+    if let Some(strong) = content.to_packed_mut::<StrongElem>() {
+        strong.body = map_child(&strong.body);
+        return Some(content);
+    }
+
+    if let Some(emph) = content.to_packed_mut::<EmphElem>() {
+        emph.body = map_child(&emph.body);
+        return Some(content);
+    }
+
+    if let Some(highlight) = content.to_packed_mut::<HighlightElem>() {
+        highlight.body = map_child(&highlight.body);
+        return Some(content);
+    }
+
+    if let Some(hidden) = content.to_packed_mut::<HideElem>() {
+        hidden.body = map_child(&hidden.body);
+        return Some(content);
+    }
+
+    if let Some(figure) = content.to_packed_mut::<FigureElem>() {
+        figure.body = map_child(&figure.body);
+        if let Some(caption) = figure.caption.as_option_mut().as_mut()
+            && let Some(caption) = caption.as_mut()
+        {
+            caption.body = map_child(&caption.body);
+        }
+        return Some(content);
+    }
+
+    if let Some(caption) = content.to_packed_mut::<FigureCaption>() {
+        caption.body = map_child(&caption.body);
         return Some(content);
     }
 
@@ -590,16 +674,6 @@ fn build_annotated_content_from_tree_inner(
     )?;
 
     for (index, block) in result.blocks.iter().enumerate() {
-        if should_skip_realization_scaffold(&result.blocks, index) {
-            emit_pipeline_trace_event(
-                debug_events,
-                PipelineTraceEvent::new("annotate/block", "skipped")
-                    .new_block_index(index)
-                    .reason("realization scaffold for patched semantic owner"),
-            )?;
-            continue;
-        }
-
         let mut annotated_block = annotate_block_edit(block, compact_substitutions);
         apply_page_region_updates(
             &mut annotated_block.page_styles,
@@ -633,80 +707,13 @@ fn build_annotated_content_from_tree_inner(
         PipelineTraceEvent::new("annotate/groups", "complete")
             .reason(format!("group_count={}", groups.len())),
     )?;
-    Ok(crate::normalize::normalize_list_item_runs(
-        Content::sequence(groups).styled_with_map(root_styles),
-    ))
-}
-
-fn should_skip_realization_scaffold(blocks: &[DiffBlockEdit], index: usize) -> bool {
-    let Some(block) = blocks.get(index) else {
-        return false;
+    let content = Content::sequence(groups);
+    let content = if root_styles.is_empty() {
+        content
+    } else {
+        content.styled_with_map(root_styles)
     };
-    block.edits.is_empty()
-        && is_tag_only_scaffold(&block.base.realized)
-        && has_adjacent_patched_locatable_owner(blocks, index)
-}
-
-fn has_adjacent_patched_locatable_owner(blocks: &[DiffBlockEdit], index: usize) -> bool {
-    let mut left = index;
-    while let Some(next) = left.checked_sub(1) {
-        let block = &blocks[next];
-        if is_patched_locatable_owner(block) {
-            return true;
-        }
-        if !block.edits.is_empty() || !is_tag_only_scaffold(&block.base.realized) {
-            break;
-        }
-        left = next;
-    }
-
-    let mut right = index + 1;
-    while let Some(block) = blocks.get(right) {
-        if is_patched_locatable_owner(block) {
-            return true;
-        }
-        if !block.edits.is_empty() || !is_tag_only_scaffold(&block.base.realized) {
-            break;
-        }
-        right += 1;
-    }
-
-    false
-}
-
-fn is_patched_locatable_owner(block: &DiffBlockEdit) -> bool {
-    is_body_only_figure_patch(block)
-}
-
-fn is_body_only_figure_patch(block: &DiffBlockEdit) -> bool {
-    !block.edits.is_empty()
-        && block.base.annotation.patch_surface.is_some()
-        && matches!(
-            block.base.annotation.semantic_kind,
-            Some(SemanticKind::Figure)
-        )
-        && block.edits.iter().all(|edit| {
-            matches!(
-                edit,
-                RealizedEdit::ReplaceAt { path, .. } if path.as_slice() == [0]
-            )
-        })
-}
-
-fn is_tag_only_scaffold(content: &Content) -> bool {
-    if !content.plain_text().is_empty() {
-        return false;
-    }
-    if content.is::<TagElem>() {
-        return true;
-    }
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return is_tag_only_scaffold(&styled.child);
-    }
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return !seq.children.is_empty() && seq.children.iter().all(is_tag_only_scaffold);
-    }
-    false
+    Ok(crate::normalize::normalize_list_item_runs(content))
 }
 
 fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
@@ -973,6 +980,7 @@ fn insertion_anchor(edit: &RealizedEdit) -> Option<(bool, &[usize])> {
     match edit {
         RealizedEdit::InsertBefore { anchor, .. } => Some((true, anchor)),
         RealizedEdit::InsertAfter { anchor, .. } => Some((false, anchor)),
+        RealizedEdit::LogOnly(_) | RealizedEdit::MarkBaseInserted(_) => None,
         _ => None,
     }
 }
@@ -1003,18 +1011,27 @@ fn apply_realized_edit(
             }
         }
         RealizedEdit::InsertBefore { anchor, content } => {
+            if compact && is_deleted_edit_content(content) {
+                return;
+            }
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, true) {
                 node.annotation.patch_surface = Some(patched);
             }
         }
         RealizedEdit::InsertAfter { anchor, content } => {
+            if compact && is_deleted_edit_content(content) {
+                return;
+            }
             let rendered = render_edit_content(content, compact);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, false) {
                 node.annotation.patch_surface = Some(patched);
             }
         }
         RealizedEdit::Append { content } => {
+            if compact && is_deleted_edit_content(content) {
+                return;
+            }
             let rendered = render_edit_content(content, compact);
             let base = effective_render_content(node);
             node.annotation.patch_surface = Some(Content::sequence([base, rendered]));
@@ -1024,7 +1041,16 @@ fn apply_realized_edit(
             node.annotation.patch_surface = None;
             node.children.clear();
         }
+        RealizedEdit::LogOnly(_) => {}
+        RealizedEdit::MarkBaseInserted(_) => {
+            node.realized = apply_fill_inside(&node.realized, green());
+            node.annotation.patch_surface = None;
+        }
     }
+}
+
+fn is_deleted_edit_content(content: &EditContent) -> bool {
+    matches!(content, EditContent::Deleted(_))
 }
 
 fn modified_is_pure_insert(content: &EditContent) -> bool {
@@ -1059,24 +1085,30 @@ fn render_edit_content(content: &EditContent, compact: bool) -> Content {
     match content {
         EditContent::Inserted(content) => {
             if content.plain_text().is_empty() {
-                content.clone()
+                strip_page_styles(content)
             } else {
-                apply_fill_inside(content, green())
+                strip_page_styles(&apply_fill_inside(content, green()))
             }
         }
-        EditContent::Deleted(content) => apply_delete_inside(content),
+        EditContent::Deleted(content) => {
+            strip_page_styles(&apply_delete_inside(content.as_content()))
+        }
         EditContent::OpaqueReplacement { old, new } => Content::sequence([
-            framed_opaque_visual(old, red()),
-            framed_opaque_visual(new, green()),
+            framed_opaque_visual(&strip_page_styles(old.as_content()), red()),
+            framed_opaque_visual(&strip_page_styles(new), green()),
         ]),
         EditContent::Modified { base, word_ops } => {
             if let Some(raw) = render_raw_block_modified(base, word_ops, compact) {
-                return raw;
+                strip_page_styles(&raw)
+            } else {
+                let inline = annotated_inline_content(word_ops, compact);
+                let rendered = replace_text_container(base, &inline).unwrap_or(inline);
+                strip_page_styles(&rendered)
             }
-            let inline = annotated_inline_content(word_ops, compact);
-            replace_text_container(base, &inline).unwrap_or(inline)
         }
-        EditContent::Nested { base, edits } => apply_edits_to_base(base, edits, compact),
+        EditContent::Nested { base, edits } => {
+            strip_page_styles(&apply_edits_to_base(base, edits, compact))
+        }
     }
 }
 
@@ -1287,7 +1319,9 @@ fn patchable_surface_for_index(
 mod tests {
     use super::*;
     use crate::annotated::{AnnotatedContent, Annotation, annotate_realized};
-    use crate::diff::{DiffBlockEdit, DiffResult, EditContent, RealizedEdit, Token, WordOp};
+    use crate::diff::{
+        DiffBlockEdit, DiffResult, EditContent, OldDisplaySurface, RealizedEdit, Token, WordOp,
+    };
     use typst::foundations::{NativeElement, Packed};
     use typst::layout::BlockElem;
     use typst::model::{HeadingElem, ListElem, ListItem};
@@ -1308,10 +1342,15 @@ mod tests {
         }
     }
 
-    fn render(base: Content, edits: Vec<RealizedEdit>, compact: bool) -> Content {
+    fn render(base: Content, edits: Vec<RealizedEdit>) -> Content {
+        render_with_compact(base, edits, false)
+    }
+
+    fn render_with_compact(base: Content, edits: Vec<RealizedEdit>, compact: bool) -> Content {
         let result = DiffResult {
             blocks: vec![DiffBlockEdit {
                 base: annotated(base),
+                base_provenance: BlockBaseProvenance::LiveNew,
                 edits,
                 page_styles: Default::default(),
             }],
@@ -1326,6 +1365,10 @@ mod tests {
         EditContent::Modified { base, word_ops }
     }
 
+    fn deleted(content: Content) -> EditContent {
+        EditContent::Deleted(OldDisplaySurface::new(content))
+    }
+
     fn whole(content: EditContent) -> Vec<RealizedEdit> {
         vec![RealizedEdit::WholeBlock(content)]
     }
@@ -1338,6 +1381,23 @@ mod tests {
         let mut count = 0;
         let _ = content.traverse::<_, ()>(&mut |c| {
             if c.is::<T>() {
+                count += 1;
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        count
+    }
+
+    fn count_page_style_wrappers(content: &Content) -> usize {
+        let mut count = 0;
+        let _ = content.traverse::<_, ()>(&mut |c| {
+            if let Some(styled) = c.to_packed::<StyledElem>()
+                && styled.styles.iter().any(|style| {
+                    style
+                        .element()
+                        .is_some_and(|element| element == PageElem::ELEM)
+                })
+            {
                 count += 1;
             }
             std::ops::ControlFlow::Continue(())
@@ -1484,7 +1544,6 @@ mod tests {
         let content = render(
             TextElem::packed("New paragraph"),
             whole(EditContent::Inserted(TextElem::packed("New paragraph"))),
-            false,
         );
         assert!(!content.is_empty());
     }
@@ -1502,7 +1561,6 @@ mod tests {
                     WordOp::Equal(vec![word_token(" text.")]),
                 ],
             )),
-            false,
         );
         assert!(!content.is_empty());
         assert_eq!(count_elem::<StrikeElem>(&content), 1);
@@ -1511,7 +1569,7 @@ mod tests {
     #[test]
     fn deleted_heading_keeps_heading_formatting() {
         let heading = Content::new(HeadingElem::new(TextElem::packed("Old heading")));
-        let content = render(heading.clone(), whole(EditContent::Deleted(heading)), false);
+        let content = render(heading.clone(), whole(deleted(heading)));
 
         assert_eq!(count_elem::<HeadingElem>(&content), 1);
         assert_eq!(count_elem::<StrikeElem>(&content), 1);
@@ -1523,11 +1581,7 @@ mod tests {
         let heading_block = Content::new(typst::layout::BlockElem::new().with_body(Some(
             typst::layout::BlockBody::Content(TextElem::packed("Old heading")),
         )));
-        let content = render(
-            heading_block.clone(),
-            whole(EditContent::Deleted(heading_block)),
-            false,
-        );
+        let content = render(heading_block.clone(), whole(deleted(heading_block)));
 
         assert_eq!(count_elem::<BlockElem>(&content), 1);
         assert_eq!(count_elem::<StrikeElem>(&content), 1);
@@ -1536,7 +1590,7 @@ mod tests {
 
     #[test]
     fn compact_substitutions_drop_deleted_text_and_color_inserted_text() {
-        let compact = render(
+        let compact = render_with_compact(
             TextElem::packed("The new text."),
             whole(modified(
                 TextElem::packed("The new text."),
@@ -1568,7 +1622,6 @@ mod tests {
                     WordOp::Equal(vec![word_token(" heading")]),
                 ],
             )),
-            false,
         );
 
         assert_eq!(count_elem::<HeadingElem>(&annotated), 1);
@@ -1595,7 +1648,6 @@ mod tests {
                     ],
                 ),
             ),
-            false,
         );
         let plain = annotated.plain_text();
 
@@ -1632,7 +1684,6 @@ mod tests {
                     ],
                 ),
             ),
-            false,
         );
 
         assert_eq!(count_elem::<TableElem>(&annotated), 1);
@@ -1664,7 +1715,6 @@ mod tests {
                     ],
                 ),
             ),
-            false,
         );
         let plain = annotated.plain_text();
 
@@ -1709,7 +1759,6 @@ mod tests {
                     ),
                 },
             ),
-            false,
         );
         let plain = annotated.plain_text();
 
@@ -1752,7 +1801,6 @@ mod tests {
                     ),
                 },
             ),
-            false,
         );
         let plain = annotated.plain_text();
 
@@ -1941,6 +1989,22 @@ mod tests {
     }
 
     #[test]
+    fn edit_payloads_do_not_carry_page_styles_into_containers() {
+        let page_styled = TextElem::packed("New").styled(PageElem::flipped.set(true));
+        let list = Content::new(ListElem::new(vec![Packed::new(ListItem::new(
+            page_styled.clone(),
+        ))]));
+
+        let content = render(
+            list,
+            replace_at(vec![0], EditContent::Inserted(page_styled)),
+        );
+
+        assert_eq!(count_elem::<ListElem>(&content), 1);
+        assert_eq!(count_page_style_wrappers(&content), 0);
+    }
+
+    #[test]
     fn inserted_parbreak_is_not_wrapped_in_styled_elem() {
         use typst::model::ParbreakElem;
 
@@ -1950,11 +2014,7 @@ mod tests {
             "sanity: ParbreakElem has no text"
         );
 
-        let content = render(
-            parbreak.clone(),
-            whole(EditContent::Inserted(parbreak)),
-            false,
-        );
+        let content = render(parbreak.clone(), whole(EditContent::Inserted(parbreak)));
         assert!(
             content.is::<ParbreakElem>(),
             "inserted ParbreakElem must remain bare, got: {:?}",
@@ -1967,7 +2027,6 @@ mod tests {
         let content = render(
             TextElem::packed("new text"),
             whole(EditContent::Inserted(TextElem::packed("new text"))),
-            false,
         );
         assert!(!content.is_empty());
     }
@@ -1977,7 +2036,7 @@ mod tests {
         let text = TextElem::packed("Visible text");
         assert!(!text.plain_text().is_empty(), "sanity: TextElem has text");
 
-        let content = render(text.clone(), whole(EditContent::Inserted(text)), false);
+        let content = render(text.clone(), whole(EditContent::Inserted(text)));
         assert!(
             !content.is::<typst::text::TextElem>(),
             "inserted visible block should be styled/colored, not a bare TextElem"

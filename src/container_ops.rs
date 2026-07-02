@@ -10,7 +10,7 @@ use crate::annotated::{
     annotate_realized,
 };
 use crate::normalize::normalize_list_item_runs;
-use typst::foundations::{Content, Packed, SequenceElem, StyleChain, StyledElem};
+use typst::foundations::{Content, Packed, SequenceElem, StyleChain, StyledElem, Styles};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, GridCell, GridChild, GridElem, GridItem,
     PadElem, PlaceElem, StackChild, StackElem,
@@ -611,10 +611,13 @@ impl ContainerOps for WrapperOps {
             return None;
         }
 
-        let path = direct_wrapper_body_path(realized)?;
-        let mut tree = anonymous_realized_tree(realized);
-        let realized_body = tree.get_path(&path)?.realized.clone();
+        let wrapper_kind = wrapper_kind_of(_pre_container)?;
         let pre_content = normalize_list_item_runs(part.pre_content);
+        let surface = wrapper_slot_patch_surface(realized, &wrapper_kind, &pre_content)?;
+        let path = direct_wrapper_body_path(&surface)
+            .or_else(|| realized_wrapper_body_path(&surface, &wrapper_kind, &pre_content))?;
+        let mut tree = anonymous_realized_tree(&surface);
+        let realized_body = tree.get_path(&path)?.realized.clone();
         let replacement = annotate_realized(&pre_content, &realized_body);
         replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
             patch_surface: tree.realized,
@@ -651,6 +654,62 @@ fn direct_wrapper_body_path(content: &Content) -> Option<Vec<usize>> {
     wrapper_kind_of(content).map(|_| vec![0])
 }
 
+fn realized_wrapper_body_path(
+    content: &Content,
+    kind: &WrapperKind,
+    expected_body: &Content,
+) -> Option<Vec<usize>> {
+    let expected_text = expected_body.plain_text();
+    if expected_text.trim().is_empty() {
+        return None;
+    }
+    let mut wrapper_path = find_realized_path(content, &mut |child| {
+        wrapper_kind_of(child).as_ref() == Some(kind)
+            && wrapper_body_of(child).is_some_and(|body| body.plain_text() == expected_text)
+    })?;
+    wrapper_path.push(0);
+    Some(wrapper_path)
+}
+
+fn wrapper_slot_patch_surface(
+    realized: &Content,
+    kind: &WrapperKind,
+    pre_body: &Content,
+) -> Option<Content> {
+    if direct_wrapper_body_path(realized).is_some()
+        || realized_wrapper_body_path(realized, kind, pre_body).is_some()
+    {
+        return Some(realized.clone());
+    }
+
+    let wrapper_path = unique_realized_wrapper_path(realized, kind)?;
+    let wrapper = content_at_realized_path(realized, &wrapper_path)?;
+    let patched_wrapper = replace_wrapper_body(wrapper, pre_body.clone())?;
+    replace_content_at_path(realized, &wrapper_path, patched_wrapper)
+}
+
+fn unique_realized_wrapper_path(content: &Content, kind: &WrapperKind) -> Option<Vec<usize>> {
+    let mut paths = Vec::new();
+    collect_realized_wrapper_paths(content, kind, &mut Vec::new(), &mut paths);
+    (paths.len() == 1).then(|| paths.remove(0))
+}
+
+fn collect_realized_wrapper_paths(
+    content: &Content,
+    kind: &WrapperKind,
+    prefix: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if wrapper_kind_of(content).as_ref() == Some(kind) {
+        out.push(prefix.clone());
+    }
+    for (index, child) in realized_child_contents(content).into_iter().enumerate() {
+        prefix.push(index);
+        collect_realized_wrapper_paths(&child, kind, prefix, out);
+        prefix.pop();
+    }
+}
+
 pub(crate) fn map_container(
     pre: &Content,
     realized: &Content,
@@ -672,17 +731,25 @@ pub(crate) fn map_container(
 }
 
 pub(crate) fn realized_child_contents(content: &Content) -> Vec<Content> {
+    realized_child_contents_with_styles(content, &Styles::new())
+}
+
+fn realized_child_contents_with_styles(content: &Content, styles: &Styles) -> Vec<Content> {
     if let Some(seq) = content.to_packed::<SequenceElem>() {
         return seq.children.clone();
     }
     if let Some(styled) = content.to_packed::<StyledElem>() {
-        return vec![styled.child.clone()];
+        let styles = StyleChain::new(styles).chain(&styled.styles).to_map();
+        return vec![materialize_style_dependent_fields_with_styles(
+            &styled.child,
+            &styles,
+        )];
     }
     if let Some(par) = content.to_packed::<ParElem>() {
         return vec![par.body.clone()];
     }
     if let Some(block) = content.to_packed::<BlockElem>()
-        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::new(styles))
     {
         return vec![body];
     }
@@ -691,10 +758,75 @@ pub(crate) fn realized_child_contents(content: &Content) -> Vec<Content> {
     {
         return vec![body.clone()];
     }
+    if let Some(body) = wrapper_body_of_with_styles(content, styles) {
+        return vec![body];
+    }
     if let Some(children) = ops_for(content).and_then(|ops| ops.child_contents(content)) {
         return children;
     }
     vec![]
+}
+
+pub(crate) fn materialize_style_dependent_fields(content: &Content, styles: &Styles) -> Content {
+    materialize_style_dependent_fields_with_styles(content, styles)
+}
+
+fn materialize_style_dependent_fields_with_styles(content: &Content, styles: &Styles) -> Content {
+    let chain = StyleChain::new(styles);
+    let mut result = content.clone();
+    result.materialize(chain);
+
+    if let Some(seq) = result.to_packed_mut::<SequenceElem>() {
+        for child in &mut seq.children {
+            *child = materialize_style_dependent_fields_with_styles(child, styles);
+        }
+        return result;
+    }
+    if let Some(par) = result.to_packed_mut::<ParElem>() {
+        par.body = materialize_style_dependent_fields_with_styles(&par.body, styles);
+        return result;
+    }
+    if let Some(styled) = result.to_packed_mut::<StyledElem>() {
+        let styles = StyleChain::new(styles).chain(&styled.styles).to_map();
+        styled.child = materialize_style_dependent_fields_with_styles(&styled.child, &styles);
+        return result;
+    }
+    if let Some(elem) = result.to_packed_mut::<BoxElem>()
+        && elem.body.get_cloned(StyleChain::default()).is_none()
+        && let Some(body) = elem.body.get_cloned(chain)
+    {
+        elem.body.set(Some(body));
+        return result;
+    }
+    if let Some(elem) = result.to_packed_mut::<BlockElem>()
+        && elem.body.get_cloned(StyleChain::default()).is_none()
+        && let Some(body) = elem.body.get_cloned(chain)
+    {
+        elem.body.set(Some(body));
+        return result;
+    }
+    if let Some(elem) = result.to_packed_mut::<RectElem>()
+        && elem.body.get_cloned(StyleChain::default()).is_none()
+        && let Some(body) = elem.body.get_cloned(chain)
+    {
+        elem.body.set(Some(body));
+        return result;
+    }
+    if let Some(elem) = result.to_packed_mut::<CircleElem>()
+        && elem.body.get_cloned(StyleChain::default()).is_none()
+        && let Some(body) = elem.body.get_cloned(chain)
+    {
+        elem.body.set(Some(body));
+        return result;
+    }
+    if let Some(elem) = result.to_packed_mut::<EllipseElem>()
+        && elem.body.get_cloned(StyleChain::default()).is_none()
+        && let Some(body) = elem.body.get_cloned(chain)
+    {
+        elem.body.set(Some(body));
+    }
+
+    result
 }
 
 pub(crate) fn semantic_diff_child_contents(content: &Content) -> Vec<Content> {
@@ -1026,6 +1158,19 @@ fn content_at_realized_path(content: &Content, path: &[usize]) -> Option<Content
     Some(current)
 }
 
+fn replace_content_at_path(
+    content: &Content,
+    path: &[usize],
+    replacement: Content,
+) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return Some(replacement);
+    };
+    let child = realized_child_contents(content).get(*index)?.clone();
+    let patched_child = replace_content_at_path(&child, rest, replacement)?;
+    replace_realized_child(content, *index, patched_child)
+}
+
 fn map_explicit_patch_surface(
     patch_surface: Content,
     parts: Vec<SlotPart>,
@@ -1311,6 +1456,11 @@ fn wrapper_kind_of(content: &Content) -> Option<WrapperKind> {
 }
 
 fn wrapper_body_of(content: &Content) -> Option<Content> {
+    wrapper_body_of_with_styles(content, &Styles::new())
+}
+
+fn wrapper_body_of_with_styles(content: &Content, styles: &Styles) -> Option<Content> {
+    let chain = StyleChain::new(styles);
     if let Some(e) = content.to_packed::<AlignElem>() {
         return Some(e.body.clone());
     }
@@ -1324,22 +1474,22 @@ fn wrapper_body_of(content: &Content) -> Option<Content> {
         return Some(e.body.clone());
     }
     if let Some(e) = content.to_packed::<BoxElem>() {
-        return e.body.get_cloned(StyleChain::default());
+        return e.body.get_cloned(chain);
     }
     if let Some(e) = content.to_packed::<BlockElem>() {
-        return match e.body.get_cloned(StyleChain::default()) {
+        return match e.body.get_cloned(chain) {
             Some(BlockBody::Content(b)) => Some(b),
             _ => None,
         };
     }
     if let Some(e) = content.to_packed::<RectElem>() {
-        return e.body.get_cloned(StyleChain::default());
+        return e.body.get_cloned(chain);
     }
     if let Some(e) = content.to_packed::<CircleElem>() {
-        return e.body.get_cloned(StyleChain::default());
+        return e.body.get_cloned(chain);
     }
     if let Some(e) = content.to_packed::<EllipseElem>() {
-        return e.body.get_cloned(StyleChain::default());
+        return e.body.get_cloned(chain);
     }
     None
 }

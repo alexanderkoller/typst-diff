@@ -186,6 +186,20 @@ fn run_pipeline(
         }),
     )?;
 
+    if capture_snapshots && trace_writer.is_none() {
+        write_debug_bundle(
+            args,
+            inputs,
+            &debug_dir,
+            old_eval.as_ref().expect("snapshots requested"),
+            new_eval.as_ref().expect("snapshots requested"),
+            block_debug.as_ref().expect("snapshots requested"),
+            &diff_result,
+            &annotated,
+            Vec::new(),
+        )?;
+    }
+
     write_log_and_pdf(args, new_world, &diff_result, &annotated, &mut trace_writer)?;
 
     let trace_files = match trace_writer {
@@ -193,26 +207,50 @@ fn run_pipeline(
         None => Vec::new(),
     };
 
-    if capture_snapshots {
-        eprintln!("Writing debug bundle to {}...", debug_dir.display());
-        let build_line = build_info::build_report_line();
-        debug::write_debug_bundle(&debug::DebugBundle {
-            build_line: &build_line,
-            args: debug_args(args),
-            old_input: &inputs.old,
-            new_input: &inputs.new,
-            output: &args.output,
-            debug_dir: &debug_dir,
-            old_eval: old_eval.as_ref().expect("snapshots requested"),
-            new_eval: new_eval.as_ref().expect("snapshots requested"),
-            block_debug: block_debug.as_ref().expect("snapshots requested"),
-            diff_result: &diff_result,
-            annotated_output: &annotated,
+    if capture_snapshots && args.debug_trace {
+        write_debug_bundle(
+            args,
+            inputs,
+            &debug_dir,
+            old_eval.as_ref().expect("snapshots requested"),
+            new_eval.as_ref().expect("snapshots requested"),
+            block_debug.as_ref().expect("snapshots requested"),
+            &diff_result,
+            &annotated,
             trace_files,
-        })?;
+        )?;
     }
 
     Ok(())
+}
+
+fn write_debug_bundle(
+    args: &Args,
+    inputs: &ResolvedInputs,
+    debug_dir: &std::path::Path,
+    old_eval: &eval::EvalDebug,
+    new_eval: &eval::EvalDebug,
+    block_debug: &diff::DiffBlockDebug,
+    diff_result: &diff::DiffResult,
+    annotated: &typst::foundations::Content,
+    trace_files: Vec<debug::DebugTraceFile>,
+) -> Result<()> {
+    eprintln!("Writing debug bundle to {}...", debug_dir.display());
+    let build_line = build_info::build_report_line();
+    debug::write_debug_bundle(&debug::DebugBundle {
+        build_line: &build_line,
+        args: debug_args(args),
+        old_input: &inputs.old,
+        new_input: &inputs.new,
+        output: &args.output,
+        debug_dir,
+        old_eval,
+        new_eval,
+        block_debug,
+        diff_result,
+        annotated_output: annotated,
+        trace_files,
+    })
 }
 
 fn write_log_and_pdf(

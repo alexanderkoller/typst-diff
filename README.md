@@ -14,6 +14,16 @@ by word.
 - **Fine-grained diffs.** Lists, enumerations, tables, figures, footnotes, and
   other structured containers are diffed item-by-item, not as opaque blocks.
 
+![typst-diff example output](examples/readme-screenshot/screenshot-1.png)
+
+The screenshot above is generated from
+[`examples/readme-screenshot`](examples/readme-screenshot). To regenerate it:
+
+```sh
+examples/readme-screenshot/run_diff.sh
+pdftoppm -png -r 160 -f 1 -l 1 examples/readme-screenshot/diff.pdf examples/readme-screenshot/screenshot
+```
+
 ## Install
 
 ### Prebuilt binaries
@@ -140,67 +150,226 @@ blue. This reduces visual noise when many individual words change at once.
 
 ## Limitations
 
-- **Math equations** are atomic. Changes inside an equation appear as a
-  whole-expression delete + insert. Deleted equations are rendered with Typst's
-  `math.cancel` mark.
-- **Code blocks** are line-diffed, not word-diffed. Changed lines appear as
-  deleted old lines plus inserted new lines; typst-diff does not currently
-  highlight individual token changes inside a code line.
-- **Opaque visuals** such as raw graphics, SVGs, and text-empty shapes are not
-  diffed word-by-word. Structural visual changes are shown as an old visual
-  replacement framed in red plus a new visual replacement framed in green.
-- **Document styles can override edit colours.** typst-diff represents
-  insertions and deletions by adding Typst styles to the annotated content, then
-  renders the result as a normal Typst document. Page styles and show rules in
-  the document can still win in the final cascade, so an edit may be detected
-  but not appear with the expected red/green fill. Page background content,
-  styled headings, styled strong text, and styled figure captions can recolor or
-  otherwise restyle the annotation output. Check `diff/final-edits.yml` or
-  `output/annotated-content.yml` with `--debug` to distinguish a missed edit from
-  an edit whose visual colour was overridden.
-- **Context-opaque package or function output** can hide changed text from the
-  semantic diff. typst-diff works on Typst's evaluated and realized `Content`
-  tree; if a package macro or user-defined function returns `context`-dependent
-  content whose visible body is not exposed as ordinary realized `Content`, the
-  diff may see only empty `context`, `tag`, or layout artifacts and produce no
-  edit. This is known to affect packages such as `@preview/showybox`, where box
-  body text changes can be hidden behind `context` expansion; see the
-  [technical example](docs/technical.md#context-opaque-body-content) for the
-  general shape. This does not mean
-  all `context` usage is unsupported: direct body `context` for state, counters,
-  or references can still diff correctly when the realized text appears in the
-  content tree. To diagnose this class of issue, run with `--debug` or
-  `--debug-trace` and inspect `normalized.yml`, `realized-tree.yml`, and
-  `final-edits.yml` for empty `plain_text`, missing slots, or
-  `changed_block_count: 0`.
-- **Some show-rule-generated body text is not yet diffed as authored text.**
-  typst-diff expands show rules through Typst's evaluated and realized content
-  pipeline, and many show-rule changes are visible there. However, some text
-  created only during final layout can be absent from the realized `Content`
-  tree used for semantic diffing. For example, a custom
-  `#show figure.caption` rule that changes a visible caption prefix from
-  `Figure:` to `Exhibit:` may typeset the new prefix, while the semantic diff
-  can still see only the underlying caption body and Typst's caption object
-  metadata. In those cases typst-diff does not currently have a general,
-  provenance-tracked way to attribute the rendered layout text back to the
-  owning semantic slot, so it may omit the show-rule-generated prefix edit or
-  fall back to less precise caption-object text. Use `--debug` or
-  `--debug-trace` and compare `realized-tree.yml` with the rendered output when
-  diagnosing this class of issue.
-- **Ambiguous footnote identity** is not guessed. If one version has a different
-  number of authored footnotes in the same paragraph, typst-diff treats the
-  bodies as separate inserted and deleted footnotes instead of matching them by
-  textual similarity. For example, if
-  `Existing note mentions baseline settings.` is the only old footnote body and
-  the new paragraph contains both `New note explains calibration.` and
-  `Existing note mentions revised settings.`, the footer shows the two new
-  bodies as insertions and the old body as a deleted synthetic footnote. Inline
-  text converted to a footnote is likewise shown as deleted inline text plus an
-  inserted footnote body; the reverse is shown as inserted inline text plus a
-  deleted footnote body.
-- **Moved paragraphs** show as a deletion at the old location plus an insertion
-  at the new location.
-- **PDF only.** No other output formats are supported.
+### Math equations are atomic
+
+Changes inside an equation appear as a whole-expression delete + insert.
+Deleted equations are rendered with Typst's `math.cancel` mark.
+
+```typst
+// Old
+$ a^2 + b^2 = c^2 $
+
+// New
+$ a^2 + b^2 = d^2 $
+```
+
+The change from `c` to `d` is not highlighted as an individual math token. The
+whole equation is treated as the changed unit.
+
+### Code blocks are line-diffed
+
+Changed code lines appear as deleted old lines plus inserted new lines.
+typst-diff does not currently highlight individual token changes inside a code
+line.
+
+````typst
+// Old
+```rust
+let total = subtotal + tax;
+```
+
+// New
+```rust
+let total = subtotal - discount;
+```
+````
+
+The changed Rust line is shown as a line replacement, not as a token-level
+change from `+ tax` to `- discount`.
+
+### Opaque visuals are replaced as whole visuals
+
+Raw graphics, SVGs, and text-empty shapes are not diffed word-by-word.
+Structural visual changes are shown as an old visual replacement framed in red
+plus a new visual replacement framed in green.
+
+```typst
+// Old
+#rect(width: 4cm, height: 1cm, fill: red)
+
+// New
+#rect(width: 4cm, height: 1cm, fill: blue)
+```
+
+The changed rectangle is visual content, not editable text, so typst-diff shows
+the old and new visuals rather than trying to describe the fill change.
+
+### Document styles can override edit colours
+
+typst-diff represents insertions and deletions by adding Typst styles to the
+annotated content, then renders the result as a normal Typst document. Page
+styles and show rules in the document can still win in the final cascade, so an
+edit may be detected but not appear with the expected red/green fill.
+
+```typst
+#show strong: set text(fill: black)
+
+// Old
+This is *important*.
+
+// New
+This is *very important*.
+```
+
+The inserted word may be present in the edit script while a document show rule
+forces the rendered text back to black. Page background content, styled
+headings, styled strong text, and styled figure captions can recolor or
+otherwise restyle the annotation output. Check `diff/final-edits.yml` or
+`output/annotated-content.yml` with `--debug` to distinguish a missed edit from
+an edit whose visual colour was overridden.
+
+### Context-opaque output can hide changed text
+
+typst-diff works on Typst's evaluated and realized `Content` tree. If a package
+macro or user-defined function returns `context`-dependent content whose visible
+body is not exposed as ordinary realized `Content`, the diff may see only empty
+`context`, `tag`, or layout artifacts and produce no edit.
+
+```typst
+#let contextual-box(body) = context {
+  box(inset: 6pt, body)
+}
+
+// Old
+#contextual-box[baseline settings]
+
+// New
+#contextual-box[revised settings]
+```
+
+This is known to affect packages such as `@preview/showybox`, where box body
+text changes can be hidden behind `context` expansion; see the
+[technical example](docs/technical.md#context-opaque-body-content) for the
+general shape. This does not mean all `context` usage is unsupported: direct
+body `context` for state, counters, or references can still diff correctly when
+the realized text appears in the content tree. To diagnose this class of issue,
+run with `--debug` or `--debug-trace` and inspect `normalized.yml`,
+`realized-tree.yml`, and `final-edits.yml` for empty `plain_text`, missing
+slots, or `changed_block_count: 0`.
+
+### Some context-generated tables can become opaque visual replacements
+
+Ordinary tables, boxed tables, and many `context`-generated tables are still
+diffed cell-by-cell when Typst exposes a table or grid owner in the realized
+content tree. However, a table produced through `context`, state, or show-rule
+machinery can be lowered to a body-less visual carrier before typst-diff can
+attach that carrier to the table cells.
+
+```typst
+#let totals = state("totals", (:))
+
+#show heading.where(level: 2): it => {
+  context {
+    let old = totals.final()
+    table(
+      columns: 2,
+      [Year], [Amount],
+      [2028], [#old.at("2028", default: "0 EUR")],
+    )
+  }
+  it
+}
+
+= Section
+#totals.update(t => t + ("2028": "12 EUR"))
+```
+
+If only the state update changes, Typst may expose the displayed result as a
+visual box rather than as a table with cells. typst-diff then cannot yet
+localize the change to the `Amount` cell, so the PDF or modification log may
+show one deleted old visual plus one inserted new visual instead of a single
+table with edited cells. To confirm this case, run with `--debug` or
+`--debug-trace` and inspect `realized-tree.yml`, `final-edits.yml`, or
+`pipeline-events.jsonl` for a visible table-like block with no table/grid owner
+or slot recursion.
+
+### Some show-rule-generated body text is not diffed as authored text
+
+typst-diff expands show rules through Typst's evaluated and realized content
+pipeline, and many show-rule changes are visible there. However, some text
+created only during final layout can be absent from the realized `Content` tree
+used for semantic diffing.
+
+```typst
+#show figure.caption: it => [Exhibit: #it.body]
+
+// Old
+#figure(rect(width: 2cm, height: 1cm), caption: [Baseline])
+
+// New
+#figure(rect(width: 2cm, height: 1cm), caption: [Revised])
+```
+
+A custom `#show figure.caption` rule that changes a visible caption prefix from
+`Figure:` to `Exhibit:` may typeset the new prefix, while the semantic diff can
+still see only the underlying caption body and Typst's caption object metadata.
+In those cases typst-diff does not currently have a general, provenance-tracked
+way to attribute the rendered layout text back to the owning semantic slot, so
+it may omit the show-rule-generated prefix edit or fall back to less precise
+caption-object text. Use `--debug` or `--debug-trace` and compare
+`realized-tree.yml` with the rendered output when diagnosing this class of
+issue.
+
+### Ambiguous footnote identity is not guessed
+
+If one version has a different number of authored footnotes in the same
+paragraph, typst-diff treats the bodies as separate inserted and deleted
+footnotes instead of matching them by textual similarity.
+
+```typst
+// Old
+The setup is stable.#footnote[Existing note mentions baseline settings.]
+
+// New
+The setup is stable.#footnote[New note explains calibration.]\
+#footnote[Existing note mentions revised settings.]
+```
+
+The footer shows the two new bodies as insertions and the old body as a deleted
+synthetic footnote. Inline text converted to a footnote is likewise shown as
+deleted inline text plus an inserted footnote body; the reverse is shown as
+inserted inline text plus a deleted footnote body.
+
+### Moved paragraphs are not recognized as moves
+
+Moved paragraphs show as a deletion at the old location plus an insertion at the
+new location.
+
+```typst
+// Old
+First paragraph.
+
+Second paragraph.
+
+// New
+Second paragraph.
+
+First paragraph.
+```
+
+typst-diff does not currently emit a move operation, so both paragraphs are
+reported at their old and new positions.
+
+### Only PDF output is supported
+
+typst-diff writes an annotated PDF. No other output formats are supported.
+
+```sh
+typst-diff old.typ new.typ -o changes.pdf
+```
+
+Outputs such as HTML, Markdown, or a machine-readable edit script are not
+currently produced as primary artifacts.
 
 ## Further reading
 

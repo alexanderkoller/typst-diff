@@ -14,6 +14,7 @@
 //! with identical text but different show rules would look identical in the diff.
 
 use anyhow::Result;
+use std::sync::LazyLock;
 use typst::ROUTINES;
 use typst::World;
 use typst::comemo::Track;
@@ -25,7 +26,7 @@ use typst::foundations::{
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PageElem, PagebreakElem, PagedDocument};
 use typst::model::{DocumentInfo, FootnoteElem};
-use typst::routines::{Arenas, RealizationKind};
+use typst::routines::{Arenas, RealizationKind, Routines};
 use typst::syntax::{FileId, Source, VirtualPath};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -34,6 +35,22 @@ use typst_kit::fonts::{FontSearcher, FontSlot};
 
 use crate::diag::format_diagnostics;
 use crate::normalize::normalize_list_item_runs;
+
+static DIFF_ROUTINES: LazyLock<Routines> = LazyLock::new(|| {
+    let mut rules = typst::foundations::NativeRuleMap::new();
+    typst_layout::register(&mut rules);
+    crate::context_recording::install_recording_context_rule(&mut rules);
+
+    Routines {
+        rules,
+        eval_string: ROUTINES.eval_string,
+        eval_closure: ROUTINES.eval_closure,
+        realize: ROUTINES.realize,
+        layout_frame: ROUTINES.layout_frame,
+        html_module: ROUTINES.html_module,
+        html_span_filled: ROUTINES.html_span_filled,
+    }
+});
 
 /// Evaluate the entry file and return the raw, unrealized [`Content`] tree.
 ///
@@ -115,8 +132,8 @@ impl World for SnippetWorld {
         self.font_slots[index].get()
     }
 
-    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
-        None
+    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+        crate::world::current_date(offset)
     }
 }
 
@@ -211,7 +228,7 @@ pub fn layout_document(world: &dyn World, content: &Content) -> Result<PagedDocu
         let constraint = typst::comemo::Constraint::new();
         let mut sink = Sink::new();
         let mut engine = Engine {
-            routines: &ROUTINES,
+            routines: &DIFF_ROUTINES,
             world: world.track(),
             introspector: introspector.track_with(&constraint),
             traced: traced.track(),
@@ -312,6 +329,7 @@ fn realize_to_content(
     content: &Content,
     introspector: Introspector,
 ) -> Result<Content> {
+    crate::context_recording::clear();
     let library = world.library();
     let target = TargetElem::target.set(Target::Paged).wrap();
     let base = StyleChain::new(&library.styles);
@@ -323,7 +341,7 @@ fn realize_to_content(
     let traced = Traced::default();
     let mut sink = Sink::new();
     let mut engine = Engine {
-        routines: &ROUTINES,
+        routines: &DIFF_ROUTINES,
         world: world.track(),
         introspector: introspector.track(),
         traced: traced.track(),
@@ -334,7 +352,7 @@ fn realize_to_content(
     let arenas = Arenas::default();
     let mut info = DocumentInfo::default();
     let mut locator = Locator::root().split();
-    let realized = (ROUTINES.realize)(
+    let realized = (DIFF_ROUTINES.realize)(
         RealizationKind::LayoutDocument { info: &mut info },
         &mut engine,
         &mut locator,
@@ -461,6 +479,15 @@ mod tests {
         });
         assert!(texts.contains(&"Hello".to_string()));
         assert!(texts.contains(&"world".to_string()));
+    }
+
+    #[test]
+    fn eval_supports_datetime_today() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("main.typ"), "#datetime.today().display()").unwrap();
+        let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
+
+        eval_to_content(&world).unwrap();
     }
 
     #[test]

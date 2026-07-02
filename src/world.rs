@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use typst::diag::{FileError, FileResult};
@@ -18,6 +18,29 @@ use typst::{Library, LibraryExt, World};
 use typst_kit::download::{Downloader, ProgressSink};
 use typst_kit::fonts::{FontSearcher, FontSlot};
 use typst_kit::package::PackageStorage;
+
+/// Return Typst's current-date value for this process.
+///
+/// Typst expects `None` to mean that the date is unavailable and reports that as
+/// an evaluation error. Cache the UTC instant so the old and new documents see
+/// the same "today" value even if a diff run crosses midnight.
+pub(crate) fn current_date(offset: Option<i64>) -> Option<Datetime> {
+    static NOW_UTC: OnceLock<time::OffsetDateTime> = OnceLock::new();
+
+    let now = *NOW_UTC.get_or_init(time::OffsetDateTime::now_utc);
+    let date = match offset {
+        Some(hours) => {
+            let offset = time::UtcOffset::from_hms(hours.try_into().ok()?, 0, 0).ok()?;
+            now.to_offset(offset).date()
+        }
+        None => {
+            let offset = time::UtcOffset::current_local_offset().ok()?;
+            now.to_offset(offset).date()
+        }
+    };
+
+    Datetime::from_ymd(date.year(), date.month() as u8, date.day())
+}
 
 /// A Typst [`World`] that reads source and binary files from the local filesystem.
 ///
@@ -141,8 +164,8 @@ impl World for SystemWorld {
         self.font_slots[index].get()
     }
 
-    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
-        None
+    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+        current_date(offset)
     }
 }
 
@@ -224,11 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn today_returns_none_for_reproducible_output() {
+    fn today_returns_current_date() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("main.typ"), "").unwrap();
         let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
 
-        assert!(world.today(None).is_none());
+        assert!(world.today(None).is_some());
     }
 }

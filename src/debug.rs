@@ -5,15 +5,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use typst::foundations::{Content, SequenceElem, StyledElem};
+use typst::foundations::{Content, ContextElem, SequenceElem, StyledElem};
+use typst::introspection::{MetadataElem, StateUpdateElem, TagElem};
 use typst::layout::{BlockBody, BlockElem};
-use typst::model::{FigureCaption, ParElem};
+use typst::model::{FigureCaption, LinkElem, LinkTarget, ParElem, RefElem};
 use typst::syntax::Span;
 
 use crate::annotated::{AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind};
 use crate::diff::{
-    BlockOp, DiffBlock, DiffBlockDebug, DiffResult, EditContent, PageRegionKind, RealizedEdit,
-    RegionPath, RenderedRegionAlignment, RenderedRegionSegmentEdit, RenderedRegionWrapper, WordOp,
+    BlockBaseProvenance, BlockOp, DiffBlock, DiffBlockDebug, DiffResult, EditContent,
+    PageRegionKind, RealizedEdit, RegionPath, RenderedRegionAlignment, RenderedRegionSegmentEdit,
+    RenderedRegionWrapper, WordOp,
 };
 use crate::trace::{
     DebugEventSink, FrameTraceEvent, PipelineTraceEvent, RenderedRegionTraceEnd,
@@ -128,6 +130,10 @@ pub fn write_debug_bundle(bundle: &DebugBundle<'_>) -> Result<()> {
         &rendered_regions_document(bundle.diff_result),
     )?;
     write_yaml(
+        bundle.debug_dir.join("diff/provenance-audit.yml"),
+        &provenance_audit_document(bundle.diff_result, bundle.annotated_output),
+    )?;
+    write_yaml(
         bundle.debug_dir.join("output/annotated-content.yml"),
         &content_document("annotated output content", bundle.annotated_output),
     )?;
@@ -235,6 +241,9 @@ fn write_jsonl(writer: &mut BufWriter<fs::File>, value: &impl Serialize) -> Resu
     writer
         .write_all(b"\n")
         .context("failed to write debug JSONL trace newline")?;
+    writer
+        .flush()
+        .context("failed to flush debug JSONL trace record")?;
     Ok(())
 }
 
@@ -544,6 +553,7 @@ fn diff_result_document(result: &DiffResult) -> DiffResultDocument {
             .enumerate()
             .map(|(index, block)| DiffBlockEditSummary {
                 index,
+                base_provenance: block_base_origin(block.base_provenance).to_string(),
                 page_style_count: block.page_styles.iter().count(),
                 base: summarize_annotated_shallow(&block.base),
                 edits: block.edits.iter().map(summarize_realized_edit).collect(),
@@ -582,6 +592,231 @@ fn rendered_regions_document(result: &DiffResult) -> RenderedRegionsDocument {
             .iter()
             .map(summarize_rendered_region)
             .collect(),
+    }
+}
+
+#[derive(Serialize)]
+struct ProvenanceAuditDocument {
+    schema_version: u32,
+    live_output: Vec<ProvenanceAuditEntry>,
+    edit_payloads: Vec<ProvenanceAuditEntry>,
+}
+
+#[derive(Serialize)]
+struct ProvenanceAuditEntry {
+    origin: String,
+    path: String,
+    node_kind: String,
+    target: Option<String>,
+    plain_text_preview: String,
+    content_hash: u64,
+}
+
+fn provenance_audit_document(
+    result: &DiffResult,
+    annotated_output: &Content,
+) -> ProvenanceAuditDocument {
+    let mut edit_payloads = Vec::new();
+    for (block_index, block) in result.blocks.iter().enumerate() {
+        collect_audit_entries(
+            &block.base.realized,
+            block_base_origin(block.base_provenance),
+            format!("blocks[{block_index}].base"),
+            &mut edit_payloads,
+        );
+        for (edit_index, edit) in block.edits.iter().enumerate() {
+            collect_edit_audit_entries(
+                edit,
+                format!("blocks[{block_index}].edits[{edit_index}]"),
+                &mut edit_payloads,
+            );
+        }
+    }
+    for (region_index, region) in result.regions.iter().enumerate() {
+        collect_audit_entries(
+            &region.base.realized,
+            "region_base",
+            format!("regions[{region_index}].base"),
+            &mut edit_payloads,
+        );
+        for (edit_index, edit) in region.edits.iter().enumerate() {
+            collect_edit_audit_entries(
+                edit,
+                format!("regions[{region_index}].edits[{edit_index}]"),
+                &mut edit_payloads,
+            );
+        }
+    }
+
+    let mut live_output = Vec::new();
+    collect_audit_entries(
+        annotated_output,
+        "annotated_output",
+        "output".to_string(),
+        &mut live_output,
+    );
+
+    ProvenanceAuditDocument {
+        schema_version: SCHEMA_VERSION,
+        live_output,
+        edit_payloads,
+    }
+}
+
+fn block_base_origin(provenance: BlockBaseProvenance) -> &'static str {
+    match provenance {
+        BlockBaseProvenance::LiveNew => "live_new_base",
+        BlockBaseProvenance::InertOld => "inert_old_base",
+        BlockBaseProvenance::MixedInertOldLiveNew => "mixed_inert_old_live_new_base",
+        BlockBaseProvenance::Layout => "layout_base",
+    }
+}
+
+fn collect_edit_audit_entries(
+    edit: &RealizedEdit,
+    path: String,
+    entries: &mut Vec<ProvenanceAuditEntry>,
+) {
+    match edit {
+        RealizedEdit::ReplaceAt { content, .. }
+        | RealizedEdit::InsertBefore { content, .. }
+        | RealizedEdit::InsertAfter { content, .. }
+        | RealizedEdit::Append { content }
+        | RealizedEdit::WholeBlock(content)
+        | RealizedEdit::LogOnly(content)
+        | RealizedEdit::MarkBaseInserted(content) => {
+            collect_edit_content_audit_entries(content, path, entries);
+        }
+    }
+}
+
+fn collect_edit_content_audit_entries(
+    content: &EditContent,
+    path: String,
+    entries: &mut Vec<ProvenanceAuditEntry>,
+) {
+    match content {
+        EditContent::Inserted(content) => {
+            collect_audit_entries(content, "live_new_insert", path, entries);
+        }
+        EditContent::Deleted(content) => {
+            collect_audit_entries(content.as_content(), "inert_old_delete", path, entries);
+        }
+        EditContent::OpaqueReplacement { old, new } => {
+            collect_audit_entries(
+                old.as_content(),
+                "inert_old_opaque",
+                format!("{path}.old"),
+                entries,
+            );
+            collect_audit_entries(new, "live_new_opaque", format!("{path}.new"), entries);
+        }
+        EditContent::Modified { base, word_ops } => {
+            collect_audit_entries(
+                base,
+                "live_new_modified_base",
+                format!("{path}.base"),
+                entries,
+            );
+            for (op_index, op) in word_ops.iter().enumerate() {
+                match op {
+                    WordOp::Equal(tokens) => collect_token_audit_entries(
+                        tokens,
+                        "live_new_equal_token",
+                        format!("{path}.word_ops[{op_index}]"),
+                        entries,
+                    ),
+                    WordOp::Insert(tokens) => collect_token_audit_entries(
+                        tokens,
+                        "live_new_insert_token",
+                        format!("{path}.word_ops[{op_index}]"),
+                        entries,
+                    ),
+                    WordOp::Delete(tokens) => collect_token_audit_entries(
+                        tokens,
+                        "inert_old_delete_token",
+                        format!("{path}.word_ops[{op_index}]"),
+                        entries,
+                    ),
+                }
+            }
+        }
+        EditContent::Nested { base, edits } => {
+            collect_audit_entries(
+                &base.realized,
+                "live_new_nested_base",
+                format!("{path}.base"),
+                entries,
+            );
+            for (index, edit) in edits.iter().enumerate() {
+                collect_edit_audit_entries(edit, format!("{path}.nested[{index}]"), entries);
+            }
+        }
+    }
+}
+
+fn collect_token_audit_entries(
+    tokens: &[crate::diff::Token],
+    origin: &str,
+    path: String,
+    entries: &mut Vec<ProvenanceAuditEntry>,
+) {
+    for (index, token) in tokens.iter().enumerate() {
+        collect_audit_entries(
+            &token.content,
+            origin,
+            format!("{path}.tokens[{index}]"),
+            entries,
+        );
+    }
+}
+
+fn collect_audit_entries(
+    content: &Content,
+    origin: &str,
+    path: String,
+    entries: &mut Vec<ProvenanceAuditEntry>,
+) {
+    if let Some(entry) = audit_entry(content, origin, &path) {
+        entries.push(entry);
+    }
+
+    for (index, child) in content_children(content).into_iter().enumerate() {
+        collect_audit_entries(&child, origin, format!("{path}/{index}"), entries);
+    }
+}
+
+fn audit_entry(content: &Content, origin: &str, path: &str) -> Option<ProvenanceAuditEntry> {
+    let (node_kind, target) = if content.is::<ContextElem>() {
+        ("context", None)
+    } else if content.is::<StateUpdateElem>() {
+        ("state-update", None)
+    } else if content.is::<TagElem>() {
+        ("tag", None)
+    } else if content.is::<MetadataElem>() {
+        ("metadata", None)
+    } else if let Some(reference) = content.to_packed::<RefElem>() {
+        ("ref", Some(reference.target.resolve().to_string()))
+    } else if let Some(link) = content.to_packed::<LinkElem>() {
+        ("link", Some(link_target_label(&link.dest)))
+    } else {
+        return None;
+    };
+
+    Some(ProvenanceAuditEntry {
+        origin: origin.to_string(),
+        path: path.to_string(),
+        node_kind: node_kind.to_string(),
+        target,
+        plain_text_preview: preview(content.plain_text().as_str()),
+        content_hash: content_hash(content),
+    })
+}
+
+fn link_target_label(target: &LinkTarget) -> String {
+    match target {
+        LinkTarget::Label(label) => label.resolve().to_string(),
+        LinkTarget::Dest(dest) => format!("{dest:?}"),
     }
 }
 
@@ -904,6 +1139,7 @@ fn summarize_block_op(op: &BlockOp) -> BlockOpSummary {
 #[derive(Serialize)]
 struct DiffBlockEditSummary {
     index: usize,
+    base_provenance: String,
     page_style_count: usize,
     base: AnnotatedSummary,
     edits: Vec<RealizedEditSummary>,
@@ -1017,6 +1253,18 @@ fn summarize_realized_edit(edit: &RealizedEdit) -> RealizedEditSummary {
             anchor: None,
             content: summarize_edit_content(content),
         },
+        RealizedEdit::LogOnly(content) => RealizedEditSummary {
+            kind: "log_only".to_string(),
+            path: None,
+            anchor: None,
+            content: summarize_edit_content(content),
+        },
+        RealizedEdit::MarkBaseInserted(content) => RealizedEditSummary {
+            kind: "mark_base_inserted".to_string(),
+            path: None,
+            anchor: None,
+            content: summarize_edit_content(content),
+        },
     }
 }
 
@@ -1040,7 +1288,7 @@ fn summarize_edit_content(content: &EditContent) -> EditContentSummary {
         },
         EditContent::Deleted(content) => EditContentSummary {
             kind: "deleted".to_string(),
-            content: Some(summarize_content(content, 0)),
+            content: Some(summarize_content(content.as_content(), 0)),
             base: None,
             word_ops: Vec::new(),
             nested_edits: Vec::new(),
@@ -1048,11 +1296,11 @@ fn summarize_edit_content(content: &EditContent) -> EditContentSummary {
         EditContent::OpaqueReplacement { old, new } => EditContentSummary {
             kind: "opaque_replacement".to_string(),
             content: Some(summarize_content(new, 0)),
-            base: Some(summarize_content(old, 0)),
+            base: Some(summarize_content(old.as_content(), 0)),
             word_ops: Vec::new(),
             nested_edits: Vec::new(),
         },
-        EditContent::Modified { base, word_ops } => EditContentSummary {
+        EditContent::Modified { base, word_ops, .. } => EditContentSummary {
             kind: "modified".to_string(),
             content: None,
             base: Some(summarize_content(base, 0)),
