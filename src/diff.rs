@@ -51,7 +51,9 @@ use crate::annotated::{
     effective_render_content, effective_text_content,
 };
 use crate::container_ops;
+use crate::content_tree;
 use crate::decision::{DecisionEvent, DecisionSink, FallbackCode, bounded_preview};
+use crate::style_context;
 use crate::trace::{
     DebugEventSink, FrameTraceEvent, PipelineTraceEvent, RenderedRegionTraceEnd,
     RenderedRegionTraceStart, emit_pipeline_trace_event,
@@ -100,10 +102,7 @@ fn extract_block_units(content: &Content) -> Vec<DiffBlock> {
 fn make_page_styles_sticky(blocks: &mut [DiffBlock]) {
     let mut current = Styles::new();
     for block in &mut *blocks {
-        if !block.page_styles.is_empty() {
-            current = block.page_styles.clone();
-        }
-        block.page_styles = current.clone();
+        style_context::advance_sticky_page_styles(&mut current, &mut block.page_styles);
     }
 }
 
@@ -116,7 +115,7 @@ fn extract_block_units_with_styles(
     } else if let Some(styled) = content.to_packed::<StyledElem>() {
         let mut page_styles = inherited_page_styles;
         page_styles.apply(page_styles_from(&styled.styles));
-        let styles = non_page_styles(&styled.styles);
+        let styles = style_context::non_page_styles(&styled.styles);
 
         if let Some(seq) = styled.child.to_packed::<SequenceElem>() {
             if is_inline_sequence(seq) {
@@ -179,7 +178,7 @@ fn collect_blocks_from_children(
             let child_page_style_updates = page_styles_from(&styled.styles);
             let has_page_style_updates = !child_page_style_updates.is_empty();
             child_page_styles.apply(child_page_style_updates);
-            let styles = non_page_styles(&styled.styles);
+            let styles = style_context::non_page_styles(&styled.styles);
 
             if let Some(seq) = styled.child.to_packed::<SequenceElem>() {
                 if is_inline_sequence(seq) {
@@ -1619,7 +1618,7 @@ fn root_page_styles_raw(content: &Content) -> Styles {
     if let Some(styled) = content.to_packed::<StyledElem>()
         && styled.child.to_packed::<SequenceElem>().is_some()
     {
-        return page_styles_raw(&styled.styles);
+        return style_context::page_styles(&styled.styles);
     }
 
     let Some(seq) = content.to_packed::<SequenceElem>() else {
@@ -1634,23 +1633,14 @@ fn root_page_styles_raw(content: &Content) -> Styles {
                 .child
                 .to_packed::<SequenceElem>()
                 .is_some()
-                .then(|| page_styles_raw(&styled.styles))
+                .then(|| style_context::page_styles(&styled.styles))
         })
         .find(|styles| !styles.is_empty())
         .unwrap_or_default()
 }
 
-fn page_styles_raw(styles: &Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| is_page_style(style))
-        .cloned()
-        .map(Style::wrap)
-        .collect()
-}
-
 fn page_styles(styles: &Styles) -> Styles {
-    sanitize_page_styles(page_styles_raw(styles))
+    sanitize_page_styles(style_context::page_styles(styles))
 }
 
 fn sanitize_page_styles(mut styles: Styles) -> Styles {
@@ -1689,21 +1679,6 @@ fn sanitize_marginal(marginal: Smart<Option<Content>>) -> Smart<Option<Content>>
 
 fn page_styles_from(styles: &Styles) -> Styles {
     page_styles(styles)
-}
-
-fn non_page_styles(styles: &Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| !is_page_style(style))
-        .cloned()
-        .map(Style::wrap)
-        .collect()
-}
-
-fn is_page_style(style: &Style) -> bool {
-    style
-        .element()
-        .is_some_and(|element| element == PageElem::ELEM)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1912,7 +1887,7 @@ fn retain_old_display_content(content: &Content) -> Content {
 
     if let Some(styled) = content.to_packed::<StyledElem>() {
         let child = retain_old_display_content(&styled.child);
-        let styles = old_display_styles(&styled.styles);
+        let styles = style_context::non_page_styles(&styled.styles);
         return if styles.is_empty() {
             child
         } else {
@@ -2159,7 +2134,7 @@ fn retain_old_display_grid_item(item: &mut GridItem) {
 fn strip_old_display_styles(content: &Content) -> Content {
     if let Some(styled) = content.to_packed::<StyledElem>() {
         let child = strip_old_display_styles(&styled.child);
-        let styles = old_display_styles(&styled.styles);
+        let styles = style_context::non_page_styles(&styled.styles);
         return if styles.is_empty() {
             child
         } else {
@@ -2167,15 +2142,6 @@ fn strip_old_display_styles(content: &Content) -> Content {
         };
     }
     content.clone()
-}
-
-fn old_display_styles(styles: &Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| !is_page_style(style))
-        .cloned()
-        .map(Style::wrap)
-        .collect()
 }
 
 impl DiffResult {
@@ -6645,7 +6611,7 @@ fn visible_footnote_units(node: &AnnotatedContent) -> Option<Vec<VisibleFootnote
         .as_ref()
         .unwrap_or(&node.realized);
     let body_path = paragraph_body_path(surface)?;
-    let body = content_at_path(surface, &body_path)?;
+    let body = content_tree::realized_content_at_path(surface, &body_path)?;
     let seq = body.to_packed::<SequenceElem>()?;
     let mut footnote_number = 1;
     let mut out = Vec::new();
@@ -6679,16 +6645,6 @@ fn paragraph_body_path(content: &Content) -> Option<Vec<usize>> {
         return Some(path);
     }
     content.is::<ParElem>().then_some(vec![0])
-}
-
-fn content_at_path<'a>(content: &'a Content, path: &[usize]) -> Option<Content> {
-    let Some((index, rest)) = path.split_first() else {
-        return Some(content.clone());
-    };
-    let child = container_ops::realized_child_contents(content)
-        .get(*index)
-        .cloned()?;
-    content_at_path(&child, rest)
 }
 
 fn deleted_visible_text_before_first_footnote(
@@ -6752,25 +6708,10 @@ fn remove_footnote_calls(content: &Content) -> Content {
     if let Some(seq) = content.to_packed::<SequenceElem>() {
         return Content::sequence(seq.children.iter().map(remove_footnote_calls));
     }
-    if let Some(children) = maybe_map_realized_children(content, remove_footnote_calls) {
+    if let Some(children) = content_tree::map_realized_children(content, remove_footnote_calls) {
         return children;
     }
     content.clone()
-}
-
-fn maybe_map_realized_children(
-    content: &Content,
-    mut map_child: impl FnMut(&Content) -> Content,
-) -> Option<Content> {
-    let children = container_ops::realized_child_contents(content);
-    if children.is_empty() {
-        return None;
-    }
-    let mut mapped = content.clone();
-    for (index, child) in children.iter().enumerate() {
-        mapped = container_ops::replace_realized_child(&mapped, index, map_child(child))?;
-    }
-    Some(mapped)
 }
 
 fn diff_slot_edits(old_ann: &AnnotatedContent, new_ann: &AnnotatedContent) -> Vec<RealizedEdit> {

@@ -20,6 +20,7 @@ pub mod annotate;
 pub mod annotated;
 pub mod build_info;
 mod container_ops;
+mod content_tree;
 mod context_recording;
 pub mod debug;
 pub mod decision;
@@ -28,6 +29,7 @@ pub mod diff;
 pub mod eval;
 mod normalize;
 pub mod render;
+mod style_context;
 pub mod trace;
 pub mod world;
 

@@ -17,29 +17,26 @@
 //! started whenever the page styles change. This preserves `#set page(…)` boundaries
 //! (margins, headers, footers) across section breaks in the diff output.
 
-use typst::foundations::{Content, NativeElement, Smart, Style, Styles};
+use typst::foundations::{Content, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::{
-    Abs, AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, HideElem, PadElem, PageElem,
-    PlaceElem, Rel, Sides,
-};
+use typst::layout::{Abs, BlockBody, BlockElem, PageElem, Rel, Sides};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{
-    EmphElem, EnumElem, EnumItem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem,
-    HeadingElem, LinkElem, ListElem, ListItem, ParElem, ParbreakElem, StrongElem, TermItem,
-    TermsElem,
+    EmphElem, FigureCaption, FootnoteBody, FootnoteElem, HeadingElem, ParElem, ParbreakElem,
 };
-use typst::text::{HighlightElem, LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
-use typst::visualize::{CircleElem, Color, EllipseElem, RectElem, Stroke};
+use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
+use typst::visualize::{Color, Stroke};
 
 use crate::annotated::effective_render_content;
 use crate::container_ops;
+use crate::content_tree;
 #[cfg(test)]
 use crate::diff::BlockBaseProvenance;
 use crate::diff::{
     DiffBlock, DiffBlockEdit, DiffRegionEdit, EditContent, PageRegionKind, RealizedEdit,
     RegionPath, RenderedRegionAlignment, RenderedRegionEdit, RenderedRegionWrapper, Token, WordOp,
 };
+use crate::style_context;
 use crate::trace::{DebugEventSink, PipelineTraceEvent, emit_pipeline_trace_event};
 
 fn green() -> Color {
@@ -391,9 +388,9 @@ fn strip_inherited_styles(content: &Content, inherited: &Styles) -> Content {
         return content;
     }
 
-    if let Some(mapped) =
-        map_transparent_children(&content, |child| strip_inherited_styles(child, inherited))
-    {
+    if let Some(mapped) = content_tree::map_transparent_children(&content, |child| {
+        strip_inherited_styles(child, inherited)
+    }) {
         return mapped;
     }
 
@@ -405,7 +402,7 @@ fn strip_page_styles(content: &Content) -> Content {
 
     if let Some(styled) = content.to_packed_mut::<StyledElem>() {
         let child = strip_page_styles(&styled.child);
-        styled.styles = styles_without_page_styles(&styled.styles);
+        styled.styles = style_context::non_page_styles(&styled.styles);
         styled.child = child;
         if styled.styles.is_empty() {
             return styled.child.clone();
@@ -413,24 +410,11 @@ fn strip_page_styles(content: &Content) -> Content {
         return content;
     }
 
-    if let Some(mapped) = map_transparent_children(&content, strip_page_styles) {
+    if let Some(mapped) = content_tree::map_transparent_children(&content, strip_page_styles) {
         return mapped;
     }
 
     content
-}
-
-fn styles_without_page_styles(styles: &Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| {
-            style
-                .element()
-                .is_none_or(|element| element != PageElem::ELEM)
-        })
-        .cloned()
-        .map(Style::wrap)
-        .collect()
 }
 
 fn styles_without_inherited_sequence(styles: &Styles, inherited: &Styles) -> Option<Styles> {
@@ -471,186 +455,13 @@ fn is_inlineish(content: &Content) -> bool {
     !content.is::<ParElem>() && content.to_packed::<SequenceElem>().is_none()
 }
 
-fn map_transparent_children(
-    content: &Content,
-    mut map_child: impl FnMut(&Content) -> Content,
-) -> Option<Content> {
-    let mut content = content.clone();
-
-    if let Some(seq) = content.to_packed_mut::<SequenceElem>() {
-        seq.children = seq.children.iter().map(map_child).collect();
-        return Some(content);
-    }
-
-    if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        styled.child = map_child(&styled.child);
-        return Some(content);
-    }
-
-    if let Some(par) = content.to_packed_mut::<ParElem>() {
-        par.body = map_child(&par.body);
-        return Some(content);
-    }
-
-    if let Some(heading) = content.to_packed_mut::<HeadingElem>() {
-        heading.body = map_child(&heading.body);
-        return Some(content);
-    }
-
-    if let Some(link) = content.to_packed_mut::<LinkElem>() {
-        link.body = map_child(&link.body);
-        return Some(content);
-    }
-
-    if let Some(strong) = content.to_packed_mut::<StrongElem>() {
-        strong.body = map_child(&strong.body);
-        return Some(content);
-    }
-
-    if let Some(emph) = content.to_packed_mut::<EmphElem>() {
-        emph.body = map_child(&emph.body);
-        return Some(content);
-    }
-
-    if let Some(highlight) = content.to_packed_mut::<HighlightElem>() {
-        highlight.body = map_child(&highlight.body);
-        return Some(content);
-    }
-
-    if let Some(hidden) = content.to_packed_mut::<HideElem>() {
-        hidden.body = map_child(&hidden.body);
-        return Some(content);
-    }
-
-    if let Some(figure) = content.to_packed_mut::<FigureElem>() {
-        figure.body = map_child(&figure.body);
-        if let Some(caption) = figure.caption.as_option_mut().as_mut()
-            && let Some(caption) = caption.as_mut()
-        {
-            caption.body = map_child(&caption.body);
-        }
-        return Some(content);
-    }
-
-    if let Some(caption) = content.to_packed_mut::<FigureCaption>() {
-        caption.body = map_child(&caption.body);
-        return Some(content);
-    }
-
-    if let Some(footnote) = content.to_packed_mut::<FootnoteElem>()
-        && let FootnoteBody::Content(body) = &footnote.body
-    {
-        footnote.body = FootnoteBody::Content(map_child(body));
-        return Some(content);
-    }
-
-    if let Some(block) = content.to_packed_mut::<BlockElem>()
-        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
-    {
-        block.body.set(Some(BlockBody::Content(map_child(&body))));
-        return Some(content);
-    }
-
-    if let Some(align) = content.to_packed_mut::<AlignElem>() {
-        align.body = map_child(&align.body);
-        return Some(content);
-    }
-
-    if let Some(pad) = content.to_packed_mut::<PadElem>() {
-        pad.body = map_child(&pad.body);
-        return Some(content);
-    }
-
-    if let Some(place) = content.to_packed_mut::<PlaceElem>() {
-        place.body = map_child(&place.body);
-        return Some(content);
-    }
-
-    if let Some(columns) = content.to_packed_mut::<ColumnsElem>() {
-        columns.body = map_child(&columns.body);
-        return Some(content);
-    }
-
-    if let Some(box_elem) = content.to_packed_mut::<BoxElem>()
-        && let Some(body) = box_elem.body.get_cloned(StyleChain::default())
-    {
-        box_elem.body.set(Some(map_child(&body)));
-        return Some(content);
-    }
-
-    if let Some(rect) = content.to_packed_mut::<RectElem>()
-        && let Some(body) = rect.body.get_cloned(StyleChain::default())
-    {
-        rect.body.set(Some(map_child(&body)));
-        return Some(content);
-    }
-
-    if let Some(circle) = content.to_packed_mut::<CircleElem>()
-        && let Some(body) = circle.body.get_cloned(StyleChain::default())
-    {
-        circle.body.set(Some(map_child(&body)));
-        return Some(content);
-    }
-
-    if let Some(ellipse) = content.to_packed_mut::<EllipseElem>()
-        && let Some(body) = ellipse.body.get_cloned(StyleChain::default())
-    {
-        ellipse.body.set(Some(map_child(&body)));
-        return Some(content);
-    }
-
-    if let Some(strike) = content.to_packed_mut::<StrikeElem>() {
-        strike.body = map_child(&strike.body);
-        return Some(content);
-    }
-
-    if let Some(item) = content.to_packed_mut::<ListItem>() {
-        item.body = map_child(&item.body);
-        return Some(content);
-    }
-
-    if let Some(item) = content.to_packed_mut::<EnumItem>() {
-        item.body = map_child(&item.body);
-        return Some(content);
-    }
-
-    if let Some(item) = content.to_packed_mut::<TermItem>() {
-        item.term = map_child(&item.term);
-        item.description = map_child(&item.description);
-        return Some(content);
-    }
-
-    if let Some(list) = content.to_packed_mut::<ListElem>() {
-        for item in &mut list.children {
-            item.body = map_child(&item.body);
-        }
-        return Some(content);
-    }
-
-    if let Some(enm) = content.to_packed_mut::<EnumElem>() {
-        for item in &mut enm.children {
-            item.body = map_child(&item.body);
-        }
-        return Some(content);
-    }
-
-    if let Some(terms) = content.to_packed_mut::<TermsElem>() {
-        for item in &mut terms.children {
-            item.term = map_child(&item.term);
-            item.description = map_child(&item.description);
-        }
-        return Some(content);
-    }
-
-    None
-}
-
 /// Apply `fill` to the text content of `content` at the outer block level.
 ///
 /// The realized-edit pipeline uses this for inserted edit payloads so structural
 /// whitespace nodes remain bare.
 fn apply_fill_inside(content: &Content, fill: Color) -> Content {
-    if let Some(mapped) = map_transparent_children(content, |child| apply_fill_inside(child, fill))
+    if let Some(mapped) =
+        content_tree::map_transparent_children(content, |child| apply_fill_inside(child, fill))
     {
         return mapped;
     }
@@ -659,7 +470,7 @@ fn apply_fill_inside(content: &Content, fill: Color) -> Content {
 }
 
 fn apply_delete_inside(content: &Content) -> Content {
-    if let Some(mapped) = map_transparent_children(content, apply_delete_inside) {
+    if let Some(mapped) = content_tree::map_transparent_children(content, apply_delete_inside) {
         return mapped;
     }
 

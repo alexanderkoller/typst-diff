@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Content Tree And Style Context Are Shared Mechanics
+
+- Phase 3 extracts repeated content traversal and mutation mechanics into `content_tree`.
+- Path lookup, realized-content replacement, annotated-tree replacement, realized-child mapping, and transparent-wrapper descent now have one implementation.
+- The extraction is deliberately mechanical: container-specific child knowledge still stays in `container_ops`, while `content_tree` owns reusable tree navigation and rewrite operations.
+- Page-style partitioning now lives in `style_context`, including the shared page-style predicate, page/non-page splits, marginal style selection, and the sticky page-style state transition.
+- Diff construction, evaluation, and annotation call these helpers instead of maintaining local copies of the same filtering rules.
+- Root page-style marginal sanitization remains in `diff.rs` because it constructs concrete annotation wrapper content, not just style-context bookkeeping.
+
+Tradeoff: this phase reduces duplicated mechanics without introducing new matching behavior or new provenance rules. Some larger responsibilities from the target architecture, such as full child extraction ownership and page-region extraction, remain local to their current modules until they can move behind clearer data boundaries.
+
 ## Fallback Warnings Use Lightweight Decision Events
 
 - Fallback warnings are represented as compact `DecisionEvent` records keyed by stable `FallbackCode` labels.

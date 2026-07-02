@@ -20,11 +20,9 @@ use typst::World;
 use typst::comemo::Track;
 use typst::diag::{FileError, FileResult};
 use typst::engine::{Engine, Route, Sink, Traced};
-use typst::foundations::{
-    Bytes, Content, Datetime, NativeElement, Style, StyleChain, Styles, Target, TargetElem,
-};
+use typst::foundations::{Bytes, Content, Datetime, StyleChain, Target, TargetElem};
 use typst::introspection::{Introspector, Locator};
-use typst::layout::{PageElem, PagebreakElem, PagedDocument};
+use typst::layout::{PagebreakElem, PagedDocument};
 use typst::model::{DocumentInfo, FootnoteElem};
 use typst::routines::{Arenas, RealizationKind, Routines};
 use typst::syntax::{FileId, Source, VirtualPath};
@@ -35,6 +33,7 @@ use typst_kit::fonts::{FontSearcher, FontSlot};
 
 use crate::diag::format_diagnostics;
 use crate::normalize::normalize_list_item_runs;
+use crate::style_context;
 
 static DIFF_ROUTINES: LazyLock<Routines> = LazyLock::new(|| {
     let mut rules = typst::foundations::NativeRuleMap::new();
@@ -335,7 +334,7 @@ fn realize_to_content(
     let base = StyleChain::new(&library.styles);
     let styles = base.chain(&target);
     let style_map = styles.to_map().outside();
-    let root_page_styles = page_styles(&style_map);
+    let root_page_styles = style_context::page_styles(&style_map);
     let styles = StyleChain::new(&style_map);
 
     let traced = Traced::default();
@@ -372,9 +371,9 @@ fn realize_to_content(
 
     let realized = Content::sequence(realized.iter().map(|(realized_content, styles)| {
         let styles = if realized_content.is::<PagebreakElem>() {
-            marginal_styles(&styles.to_map())
+            style_context::marginal_styles(&styles.to_map())
         } else {
-            non_page_styles(styles.to_map())
+            style_context::non_page_styles(&styles.to_map())
         };
         (*realized_content).clone().styled_with_map(styles)
     }))
@@ -400,56 +399,14 @@ fn collect_footnotes(content: &Content) -> Vec<Content> {
     footnotes
 }
 
-/// Strip `PageElem` styles from a style map, keeping only inline/block styles.
-///
-/// Page styles must not be re-applied at the block level; they are handled
-/// separately per style group in `build_annotated_content`.
-fn non_page_styles(styles: Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| {
-            style
-                .element()
-                .is_none_or(|element| element != PageElem::ELEM)
-        })
-        .cloned()
-        .map(Style::wrap)
-        .collect()
-}
-
-fn page_styles(styles: &Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| {
-            style
-                .element()
-                .is_some_and(|element| element == PageElem::ELEM)
-        })
-        .cloned()
-        .map(Style::wrap)
-        .collect()
-}
-
-fn marginal_styles(styles: &Styles) -> Styles {
-    styles
-        .iter()
-        .filter(|style| {
-            style
-                .element()
-                .is_some_and(|element| element == PageElem::ELEM)
-                || (style.outside() && style.liftable())
-        })
-        .cloned()
-        .map(Style::wrap)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::world::SystemWorld;
     use std::fs;
     use tempfile::TempDir;
+    use typst::foundations::{NativeElement, Styles};
+    use typst::layout::PageElem;
     use typst::text::TextElem;
     use typst::visualize::Color;
 
@@ -566,9 +523,9 @@ mod tests {
         styles.push(PageElem::flipped.set(true));
         styles.push(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into()));
 
-        let pages = page_styles(&styles);
-        let non_pages = non_page_styles(styles.clone());
-        let marginal = marginal_styles(&styles);
+        let pages = style_context::page_styles(&styles);
+        let non_pages = style_context::non_page_styles(&styles);
+        let marginal = style_context::marginal_styles(&styles);
 
         assert!(!pages.is_empty());
         assert!(pages.iter().all(|style| {

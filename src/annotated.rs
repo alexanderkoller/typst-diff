@@ -6,6 +6,7 @@
 //! never mutated.
 
 use crate::container_ops::{self, ContainerKind};
+use crate::content_tree;
 use std::collections::VecDeque;
 use typst::foundations::{Content, ContextElem, SequenceElem, StyleChain, StyledElem};
 use typst::introspection::{Tag, TagElem};
@@ -520,7 +521,9 @@ fn annotate_footnote_paragraph_run(run: &[Content], realized: &Content) -> Annot
     let Some(body_path) = paragraph_body_path(realized) else {
         return annotate_realized(&pre_body, realized);
     };
-    let Some(patch_surface) = replace_content_path(realized, &body_path, pre_body) else {
+    let Some(patch_surface) =
+        content_tree::replace_realized_content_at_path(realized, &body_path, pre_body)
+    else {
         return annotate_realized(&Content::sequence(run.iter().cloned()), realized);
     };
     let patch_tree = annotate_realized(&patch_surface, &patch_surface);
@@ -590,21 +593,6 @@ fn paragraph_body_path(content: &Content) -> Option<Vec<usize>> {
         return Some(path);
     }
     content.is::<ParElem>().then_some(vec![0])
-}
-
-fn replace_content_path(
-    content: &Content,
-    path: &[usize],
-    replacement: Content,
-) -> Option<Content> {
-    let Some((index, rest)) = path.split_first() else {
-        return Some(replacement);
-    };
-    let child = container_ops::realized_child_contents(content)
-        .get(*index)
-        .cloned()?;
-    let patched_child = replace_content_path(&child, rest, replacement)?;
-    container_ops::replace_realized_child(content, *index, patched_child)
 }
 
 fn collect_promoted_footnote_slots(

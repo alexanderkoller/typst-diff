@@ -9,6 +9,7 @@ use crate::annotated::{
     AnnotatedContent, Annotation, SemanticKind, SemanticSlot, SlotStep, WrapperKind,
     annotate_realized,
 };
+use crate::content_tree;
 use crate::normalize::normalize_list_item_runs;
 use typst::foundations::{Content, Packed, SequenceElem, StyleChain, StyledElem, Styles};
 use typst::layout::{
@@ -619,14 +620,16 @@ impl ContainerOps for WrapperOps {
         let mut tree = anonymous_realized_tree(&surface);
         let realized_body = tree.get_path(&path)?.realized.clone();
         let replacement = annotate_realized(&pre_content, &realized_body);
-        replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
-            patch_surface: tree.realized,
-            children: tree.children,
-            slots: vec![SemanticSlot {
-                label: SlotStep::WrapperBody,
-                path,
-                patch_path: None,
-            }],
+        content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| {
+            SlotMapping {
+                patch_surface: tree.realized,
+                children: tree.children,
+                slots: vec![SemanticSlot {
+                    label: SlotStep::WrapperBody,
+                    path,
+                    patch_path: None,
+                }],
+            }
         })
     }
 
@@ -683,9 +686,9 @@ fn wrapper_slot_patch_surface(
     }
 
     let wrapper_path = unique_realized_wrapper_path(realized, kind)?;
-    let wrapper = content_at_realized_path(realized, &wrapper_path)?;
+    let wrapper = content_tree::realized_content_at_path(realized, &wrapper_path)?;
     let patched_wrapper = replace_wrapper_body(wrapper, pre_body.clone())?;
-    replace_content_at_path(realized, &wrapper_path, patched_wrapper)
+    content_tree::replace_realized_content_at_path(realized, &wrapper_path, patched_wrapper)
 }
 
 fn unique_realized_wrapper_path(content: &Content, kind: &WrapperKind) -> Option<Vec<usize>> {
@@ -996,7 +999,7 @@ fn map_slot_parts(
         }
         let pre_content = normalize_list_item_runs(part.pre_content);
         let replacement = annotate_realized(&pre_content, &realized_child);
-        if replace_annotated_at_path(&mut tree, &path, replacement) {
+        if content_tree::replace_annotated_at_path(&mut tree, &path, replacement) {
             slots.push(SemanticSlot {
                 label: part.label,
                 path,
@@ -1084,7 +1087,7 @@ fn find_realized_figure_body_path(
         .into_iter()
         .filter(|path| !path_is_under(path, caption_path))
         .find(|path| {
-            content_at_realized_path(content, path)
+            content_tree::realized_content_at_path(content, path)
                 .is_some_and(|child| !child.is::<ParbreakElem>() && child.func().name() != "v")
         })
 }
@@ -1150,27 +1153,6 @@ fn find_realized_path(
     None
 }
 
-fn content_at_realized_path(content: &Content, path: &[usize]) -> Option<Content> {
-    let mut current = content.clone();
-    for index in path {
-        current = realized_child_contents(&current).get(*index)?.clone();
-    }
-    Some(current)
-}
-
-fn replace_content_at_path(
-    content: &Content,
-    path: &[usize],
-    replacement: Content,
-) -> Option<Content> {
-    let Some((index, rest)) = path.split_first() else {
-        return Some(replacement);
-    };
-    let child = realized_child_contents(content).get(*index)?.clone();
-    let patched_child = replace_content_at_path(&child, rest, replacement)?;
-    replace_realized_child(content, *index, patched_child)
-}
-
 fn map_explicit_patch_surface(
     patch_surface: Content,
     parts: Vec<SlotPart>,
@@ -1182,7 +1164,7 @@ fn map_explicit_patch_surface(
     for (part, path) in parts.into_iter().zip(paths) {
         let pre_content = normalize_list_item_runs(part.pre_content);
         let replacement = annotate_realized(&pre_content, &pre_content);
-        if replace_annotated_at_path(&mut tree, &path, replacement) {
+        if content_tree::replace_annotated_at_path(&mut tree, &path, replacement) {
             slots.push(SemanticSlot {
                 label: part.label,
                 path,
@@ -1225,7 +1207,7 @@ fn map_unique_partial_item_container(
     let path = patch.path;
     let pre_content = normalize_list_item_runs(part.pre_content);
     let replacement = annotate_realized(&pre_content, realized);
-    replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
+    content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
         patch_surface: tree.realized,
         children: tree.children,
         slots: vec![SemanticSlot {
@@ -1360,21 +1342,6 @@ fn anonymous_realized_tree(realized: &Content) -> AnnotatedContent {
             .map(|child| anonymous_realized_tree(&child))
             .collect(),
     }
-}
-
-fn replace_annotated_at_path(
-    node: &mut AnnotatedContent,
-    path: &[usize],
-    replacement: AnnotatedContent,
-) -> bool {
-    let Some((first, rest)) = path.split_first() else {
-        *node = replacement;
-        return true;
-    };
-    let Some(child) = node.children.get_mut(*first) else {
-        return false;
-    };
-    replace_annotated_at_path(child, rest, replacement)
 }
 
 fn prepend_path_index(index: usize, mut paths: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
