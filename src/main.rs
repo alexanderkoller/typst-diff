@@ -30,6 +30,9 @@ struct Args {
     /// Show substitutions as blue without red strikethrough; insertions green, deletions red
     #[arg(short = 's', long)]
     compact_substitutions: bool,
+    /// Suppress fallback warnings on stderr; progress and hard errors are unchanged
+    #[arg(long)]
+    quiet: bool,
     /// Write structured YAML diagnostics next to the output PDF
     #[arg(long)]
     debug: bool,
@@ -304,6 +307,7 @@ fn debug_args(args: &Args) -> debug::DebugArgs {
         output: args.output.clone(),
         log_modifications: args.log_modifications.clone(),
         compact_substitutions: args.compact_substitutions,
+        quiet: args.quiet,
         debug: args.debug,
         debug_trace: args.debug_trace,
     }

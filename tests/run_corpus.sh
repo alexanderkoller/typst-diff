@@ -10,9 +10,14 @@
 #   --only-failures     Print only failed tests
 #   --verbose, -v       Print modification log for every test
 #   --filter PATTERN    Run only tests whose name contains PATTERN
+#   --exact NAME        Run exactly one corpus test by directory basename
 #   --list              Print test names and exit
 #   --open              Open output directory after run (macOS)
 #   --update-refs       Copy actual PNGs to corpus/<name>/ref/ (create/update references)
+#   --write-passing-list PATH
+#                       Write sorted names whose final status is PASS
+#   --require-passing-list PATH
+#                       Run only listed names and fail on missing, skipped, new, or failed
 #   --threshold PCT     Fuzz threshold for pixel comparison (default: 1%)
 #   --dpi N             DPI for PDF-to-PNG rendering (default: 150)
 #
@@ -43,9 +48,12 @@ RELEASE=0
 ONLY_FAILURES=0
 VERBOSE=0
 FILTER=""
+EXACT=""
 LIST_ONLY=0
 OPEN_OUTPUT=0
 UPDATE_REFS=0
+WRITE_PASSING_LIST=""
+REQUIRE_PASSING_LIST=""
 THRESHOLD="1%"
 DPI=150
 
@@ -56,15 +64,28 @@ while [[ $# -gt 0 ]]; do
     --only-failures|-f) ONLY_FAILURES=1 ;;
     --verbose|-v)       VERBOSE=1 ;;
     --filter|-k)        FILTER="${2:-}"; shift ;;
+    --exact)            EXACT="${2:-}"; shift ;;
     --list)             LIST_ONLY=1 ;;
     --open)             OPEN_OUTPUT=1 ;;
     --update-refs)      UPDATE_REFS=1 ;;
+    --write-passing-list) WRITE_PASSING_LIST="${2:-}"; shift ;;
+    --require-passing-list) REQUIRE_PASSING_LIST="${2:-}"; shift ;;
     --threshold)        THRESHOLD="${2:-1%}"; shift ;;
     --dpi)              DPI="${2:-150}"; shift ;;
     *) printf 'unknown flag: %s\n' "$1" >&2; exit 1 ;;
   esac
   shift
 done
+
+if [[ -n "$EXACT" && -n "$FILTER" ]]; then
+  printf 'cannot combine --exact and --filter\n' >&2
+  exit 1
+fi
+
+if [[ -n "$REQUIRE_PASSING_LIST" && $UPDATE_REFS -eq 1 ]]; then
+  printf 'cannot combine --require-passing-list and --update-refs\n' >&2
+  exit 1
+fi
 
 # ── colour support ────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -117,6 +138,18 @@ mkdir -p "$OUTPUT_DIR"
 # ── helpers ───────────────────────────────────────────────────────────────────
 hr() { printf '%0.s─' {1..72}; echo; }
 
+load_passing_list() {
+  local list_path="$1"
+  [[ -f "$list_path" ]] || {
+    printf "${RED}Required passing list not found: %s${RST}\n" "$list_path" >&2
+    exit 1
+  }
+  sed -E 's/[[:space:]]*#.*$//' "$list_path" \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+    | awk 'NF { print }' \
+    | sort -u
+}
+
 check_pdf() {
   local f="$1"
   [[ -f "$f" ]] || { echo "no output file"; return 1; }
@@ -134,9 +167,26 @@ skip=0
 new=0
 failed_names=()
 new_names=()
+passing_names=()
+missing_required_names=()
+required_gate_fail=0
 total_elapsed=0
 
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+required_names_file="$TMP_DIR/required-names.txt"
+seen_required_names_file="$TMP_DIR/seen-required-names.txt"
+: >"$required_names_file"
+: >"$seen_required_names_file"
+
+if [[ -n "$REQUIRE_PASSING_LIST" ]]; then
+  load_passing_list "$REQUIRE_PASSING_LIST" >"$required_names_file"
+fi
+
 printf "${BLD}Corpus: %s${RST}\n" "$CORPUS_DIR"
+if [[ -n "$REQUIRE_PASSING_LIST" ]]; then
+  printf "${DIM}Required passing list: %s${RST}\n" "$REQUIRE_PASSING_LIST"
+fi
 hr
 echo
 
@@ -144,6 +194,11 @@ while IFS= read -r test_dir; do
   name=$(basename "$test_dir")
 
   [[ -z "$FILTER" || "$name" == *"$FILTER"* ]] || continue
+  [[ -z "$EXACT" || "$name" == "$EXACT" ]] || continue
+  if [[ -n "$REQUIRE_PASSING_LIST" ]]; then
+    grep -Fxq "$name" "$required_names_file" || continue
+    printf '%s\n' "$name" >>"$seen_required_names_file"
+  fi
 
   if [[ -f "$test_dir/old.typ" && -f "$test_dir/new.typ" ]]; then
     old_path="$test_dir/old.typ"
@@ -154,6 +209,10 @@ while IFS= read -r test_dir; do
   else
     printf "${YLW}SKIP${RST}  %-42s  (no entry points)\n" "$name"
     skip=$((skip + 1))
+    if [[ -n "$REQUIRE_PASSING_LIST" ]]; then
+      failed_names+=("$name")
+      required_gate_fail=1
+    fi
     continue
   fi
 
@@ -295,6 +354,7 @@ while IFS= read -r test_dir; do
   case "$final_status" in
     PASS)
       pass=$((pass + 1))
+      passing_names+=("$name")
       if [[ $ONLY_FAILURES -eq 0 ]]; then
         printf "${GRN}PASS${RST}  %-42s  ${DIM}%ds  %dKB  %d mod(s)${RST}\n" \
                "$name" "$elapsed" "$pdf_kb" "$mod_count"
@@ -306,6 +366,9 @@ while IFS= read -r test_dir; do
     NEW)
       new=$((new + 1))
       new_names+=("$name")
+      if [[ -n "$REQUIRE_PASSING_LIST" ]]; then
+        required_gate_fail=1
+      fi
       if [[ $ONLY_FAILURES -eq 0 ]]; then
         printf "${BLU}NEW ${RST}  %-42s  ${DIM}%ds  %dKB  %d mod(s)${RST}\n" \
                "$name" "$elapsed" "$pdf_kb" "$mod_count"
@@ -323,6 +386,21 @@ while IFS= read -r test_dir; do
   esac
 
 done < <(find "$CORPUS_DIR" -mindepth 1 -maxdepth 1 -type d | sort -V)
+
+if [[ -n "$REQUIRE_PASSING_LIST" ]]; then
+  sort -u "$seen_required_names_file" -o "$seen_required_names_file"
+  while IFS= read -r required_name; do
+    missing_required_names+=("$required_name")
+  done < <(comm -23 "$required_names_file" "$seen_required_names_file")
+  if [[ ${#missing_required_names[@]} -gt 0 ]]; then
+    fail=$((fail + ${#missing_required_names[@]}))
+  fi
+fi
+
+if [[ -n "$WRITE_PASSING_LIST" ]]; then
+  mkdir -p "$(dirname "$WRITE_PASSING_LIST")"
+  printf '%s\n' "${passing_names[@]}" | sort -u >"$WRITE_PASSING_LIST"
+fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
 total=$((pass + fail + new + skip))
@@ -352,8 +430,25 @@ if [[ ${#new_names[@]} -gt 0 && $UPDATE_REFS -eq 0 ]]; then
   done
 fi
 
+if [[ ${#missing_required_names[@]} -gt 0 ]]; then
+  echo
+  printf "${BLD}Missing from required passing corpus:${RST}\n"
+  for n in "${missing_required_names[@]}"; do
+    printf "  ${RED}✗${RST} %s\n" "$n"
+  done
+fi
+
+if [[ -n "$WRITE_PASSING_LIST" ]]; then
+  printf "${DIM}Passing list written to %s${RST}\n" "$WRITE_PASSING_LIST"
+fi
+
 if [[ $OPEN_OUTPUT -eq 1 ]]; then
   open "$OUTPUT_DIR" 2>/dev/null || true
 fi
 
-[[ $fail -eq 0 ]]
+if [[ -n "$EXACT" && $total -eq 0 ]]; then
+  printf "${RED}No corpus test matched --exact %s${RST}\n" "$EXACT" >&2
+  exit 1
+fi
+
+[[ $fail -eq 0 && $required_gate_fail -eq 0 ]]

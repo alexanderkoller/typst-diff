@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Passing Corpus Gate And Fallback Ledger
+
+- Corpus regression protection now distinguishes the intended baseline from the full corpus state.
+- `tests/run_corpus.sh` can write the current passing cases, run an exact corpus basename, and require a recorded passing list.
+- `tests/run_passing_corpus.sh` uses `tests/corpus-passing-baseline.txt` so every currently passing corpus case must remain passing during refactors, while pre-existing failures stay visible but outside the gate.
+- Fallback debt has a stable code table in `src/decision.rs` and a human ledger in `docs/fallback-debt-ledger.md`.
+- The ledger audit checks that code labels and ledger warning-code entries stay synchronized before fallback instrumentation is threaded through production call sites.
+- The CLI accepts `--quiet` as the future fallback-warning suppression switch; ordinary progress logging and hard errors are intentionally unchanged.
+
+Tradeoff: the fallback warning codes are introduced before runtime warning emission. This keeps the first phase behavior-preserving and gives later instrumentation a stable naming contract, but the ledger entries remain `active` and not yet observable at runtime until Phase 2 call-site plumbing is implemented.
+
 ## Inert Old Display Preserves Alignment Wrappers
 
 - Deleted old content may still need non-page layout wrappers to render at the old visual position.

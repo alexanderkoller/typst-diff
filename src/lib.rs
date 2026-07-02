@@ -21,6 +21,7 @@ pub mod annotated;
 pub mod build_info;
 mod container_ops;
 mod context_recording;
+pub mod decision;
 pub mod debug;
 pub mod diag;
 pub mod diff;

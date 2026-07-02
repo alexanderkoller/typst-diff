@@ -49,6 +49,7 @@ pub struct DebugArgs {
     pub output: PathBuf,
     pub log_modifications: Option<PathBuf>,
     pub compact_substitutions: bool,
+    pub quiet: bool,
     pub debug: bool,
     pub debug_trace: bool,
 }
@@ -397,6 +398,7 @@ struct ManifestArgs {
     output: String,
     log_modifications: Option<String>,
     compact_substitutions: bool,
+    quiet: bool,
     debug: bool,
     debug_trace: bool,
 }
@@ -429,6 +431,7 @@ fn manifest(bundle: &DebugBundle<'_>) -> Manifest {
                 .as_ref()
                 .map(|path| path_string(path)),
             compact_substitutions: bundle.args.compact_substitutions,
+            quiet: bundle.args.quiet,
             debug: bundle.args.debug,
             debug_trace: bundle.args.debug_trace,
         },

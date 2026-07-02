@@ -13,6 +13,10 @@ information and make clean decisions, rather than adding heuristics.
 Avoid changes to the renderer. We want to leave it as close to the default Typst renderer
 as possible.
 
+Any new fallback, heuristic, or post-hoc guess must either be eliminated
+immediately or added to docs/fallback-debt-ledger.md with a warning code,
+debug/trace emission, tests, and removal criteria.
+
 If necessary, call typst-diff with the --debug or --debug-trace options to get diagnostic information.
 
 Distill nontrivial bugs into tests so they can be checked automatically.
