@@ -1,5 +1,15 @@
 # Technical Decisions
 
+## Diff Surfaces And Areas Name The Diff Boundary
+
+- Phase 6 introduces `diff_surface` and `diff_area` as the first shared model for what is being diffed.
+- Replacement selection now returns `DiffSurfaceEdit<EditContent>` instead of a bare `EditContent`, naming the chosen surface as word tokens, equation tokens, raw lines, non-token display content, or opaque visual content.
+- Rendered page-region page and segment diffs also pass through `DiffSurfaceEdit`, with explicit rendered-region surface kinds while preserving the existing `WordOp` payloads.
+- `DiffAreaKind` names body blocks, semantic page regions, rendered page regions, and structured container regions. The current phase uses these names for trace/selection plumbing without moving all area logic yet.
+- The word-diff-or-opaque fallback warning remains active for compatibility and because unsupported-surface handling is not complete. The fallback now carries an explicit selected surface in debug trace reasons, rather than hiding the surface choice in the ladder.
+
+Tradeoff: this phase introduces the surface/area contract before deleting the old specialized paths. Raw/code, equation, opaque, and rendered-region behavior is still implemented by existing functions, but their outputs now flow through a common selection wrapper that later phases can consolidate.
+
 ## Patch Surfaces Carry Their Invariant
 
 - Phase 5 introduces `PatchSurface` as the typed value stored by `Annotation::patch_surface` and returned by container slot mapping.

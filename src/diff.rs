@@ -50,6 +50,8 @@ use crate::container_ops;
 use crate::content_key;
 use crate::content_tree;
 use crate::decision::{DecisionEvent, DecisionSink, FallbackCode, bounded_preview};
+use crate::diff_area::DiffAreaKind;
+use crate::diff_surface::{DiffSurfaceEdit, DiffSurfaceKind};
 use crate::style_context;
 use crate::trace::{
     DebugEventSink, FrameTraceEvent, PipelineTraceEvent, RenderedRegionTraceEnd,
@@ -2401,14 +2403,18 @@ fn replace_block_edit(
         ));
     }
 
-    let edits = word_or_opaque_replacement_edits(
-        old_block,
-        new_block,
+    let surface = select_modified_fragment_surface(
+        &old_block.content,
+        &new_block.content,
         old_ann,
         new_ann,
         old_equation_origins,
         new_equation_origins,
     );
+    let selected_surface_kind = surface.as_ref().map(|surface| surface.kind());
+    let edits = surface
+        .map(|surface| vec![RealizedEdit::WholeBlock(surface.into_content())])
+        .unwrap_or_default();
     let selected_edit_kind = edits.first().map(realized_edit_kind).unwrap_or("noop");
     emit_fallback_decision(
         decision_events,
@@ -2426,7 +2432,13 @@ fn replace_block_edit(
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("diff/replace-block", "selected")
-            .reason("word diff or opaque fallback")
+            .reason(format!(
+                "area={}; word diff or opaque fallback; surface={}",
+                DiffAreaKind::BodyBlock.trace_name(),
+                selected_surface_kind
+                    .map(DiffSurfaceKind::trace_name)
+                    .unwrap_or("unsupported")
+            ))
             .old_content(&old_block.content)
             .new_content(&new_block.content)
             .selected_edit_kind(selected_edit_kind),
@@ -2447,7 +2459,7 @@ fn word_or_opaque_replacement_edits(
     old_equation_origins: &[Content],
     new_equation_origins: &[Content],
 ) -> Vec<RealizedEdit> {
-    modified_fragment_edit_content(
+    select_modified_fragment_surface(
         &old_block.content,
         &new_block.content,
         old_ann,
@@ -2455,7 +2467,7 @@ fn word_or_opaque_replacement_edits(
         old_equation_origins,
         new_equation_origins,
     )
-    .map(|content| vec![RealizedEdit::WholeBlock(content)])
+    .map(|surface| vec![RealizedEdit::WholeBlock(surface.into_content())])
     .unwrap_or_default()
 }
 
@@ -2467,8 +2479,27 @@ fn modified_fragment_edit_content(
     old_equation_origins: &[Content],
     new_equation_origins: &[Content],
 ) -> Option<EditContent> {
+    select_modified_fragment_surface(
+        old_content,
+        new_content,
+        old_ann,
+        new_ann,
+        old_equation_origins,
+        new_equation_origins,
+    )
+    .map(DiffSurfaceEdit::into_content)
+}
+
+fn select_modified_fragment_surface(
+    old_content: &Content,
+    new_content: &Content,
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+    old_equation_origins: &[Content],
+    new_equation_origins: &[Content],
+) -> Option<DiffSurfaceEdit<EditContent>> {
     if let Some(content) = raw_block_modified_content(old_content, new_content, old_ann, new_ann) {
-        return Some(content);
+        return Some(DiffSurfaceEdit::new(DiffSurfaceKind::RawLines, content));
     }
 
     let (old_word_ann, new_word_ann) = balanced_word_annotations(old_ann, new_ann);
@@ -2493,28 +2524,42 @@ fn modified_fragment_edit_content(
     }
     word_ops = old_display_delete_ops(word_ops);
     if has_textual_word_change(&word_ops) {
+        let kind = if !old_equation_origins.is_empty() || !new_equation_origins.is_empty() {
+            DiffSurfaceKind::EquationTokens
+        } else {
+            DiffSurfaceKind::WordTokens
+        };
         return Some(
             if contains_non_token_display_container_for(old_content, old_ann)
                 || contains_non_token_display_container_for(new_content, new_ann)
             {
-                EditContent::OpaqueReplacement {
-                    old: old_display_surface_for_annotated(old_content, old_ann),
-                    new: new_content.clone(),
-                }
+                DiffSurfaceEdit::new(
+                    DiffSurfaceKind::NonTokenDisplay,
+                    EditContent::OpaqueReplacement {
+                        old: old_display_surface_for_annotated(old_content, old_ann),
+                        new: new_content.clone(),
+                    },
+                )
             } else {
-                EditContent::Modified {
-                    base: new_content.clone(),
-                    word_ops,
-                }
+                DiffSurfaceEdit::new(
+                    kind,
+                    EditContent::Modified {
+                        base: new_content.clone(),
+                        word_ops,
+                    },
+                )
             },
         );
     }
 
     if opaque_visual_surface_changed(old_content, new_content, old_ann, new_ann) {
-        return Some(EditContent::OpaqueReplacement {
-            old: old_opaque_display_surface(old_content, old_ann),
-            new: new_content.clone(),
-        });
+        return Some(DiffSurfaceEdit::new(
+            DiffSurfaceKind::OpaqueVisual,
+            EditContent::OpaqueReplacement {
+                old: old_opaque_display_surface(old_content, old_ann),
+                new: new_content.clone(),
+            },
+        ));
     }
 
     None
@@ -4246,6 +4291,7 @@ fn diff_page_region(
     old_content: Option<Content>,
     new_content: Option<Content>,
 ) -> Option<DiffRegionEdit> {
+    let _area = DiffAreaKind::SemanticPageRegion;
     match (old_content, new_content) {
         (None, None) => None,
         (None, Some(new_content)) => {
@@ -4397,6 +4443,7 @@ fn diff_rendered_region_texts(
     old_pages: &[RenderedRegionText],
     new_pages: &[RenderedRegionText],
 ) -> Option<RenderedRegionEdit> {
+    let _area = DiffAreaKind::RenderedPageRegion;
     let mut has_change = false;
     let pages = new_pages
         .iter()
@@ -4409,8 +4456,12 @@ fn diff_rendered_region_texts(
                 .unwrap_or_else(|| TextElem::packed(""));
             let old_tokens = extract_words(&old_content);
             let new_tokens = extract_words(&new_content);
-            let word_ops = diff_words(&old_tokens, &new_tokens);
+            let surface = DiffSurfaceEdit::new(
+                DiffSurfaceKind::RenderedRegionText,
+                diff_words(&old_tokens, &new_tokens),
+            );
             let segments = diff_rendered_region_segments(old_page, new_page);
+            let word_ops = surface.into_content();
             let changed = old_pages.get(index).is_some() && has_textual_word_change(&word_ops);
             has_change |= changed;
             RenderedRegionPageEdit {
@@ -4451,9 +4502,13 @@ fn diff_rendered_region_segments(
         .map(|(old_cluster, new_cluster)| {
             let old_tokens = extract_words(&old_cluster.content);
             let new_tokens = extract_words(&new_cluster.content);
+            let surface = DiffSurfaceEdit::new(
+                DiffSurfaceKind::RenderedRegionSegment,
+                diff_words(&old_tokens, &new_tokens),
+            );
             RenderedRegionSegmentEdit {
                 base: new_cluster.content.clone(),
-                word_ops: diff_words(&old_tokens, &new_tokens),
+                word_ops: surface.into_content(),
             }
         })
         .collect()
@@ -6582,7 +6637,11 @@ fn diff_slot_edits_with_events(
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("diff/slot", "start")
-            .reason(mode)
+            .reason(format!(
+                "area={}; mode={}",
+                DiffAreaKind::StructuredContainerRegion.trace_name(),
+                mode
+            ))
             .old_content(&old_ann.realized)
             .new_content(&new_ann.realized),
     )?;

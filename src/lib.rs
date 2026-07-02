@@ -27,6 +27,8 @@ pub mod debug;
 pub mod decision;
 pub mod diag;
 pub mod diff;
+mod diff_area;
+mod diff_surface;
 pub mod eval;
 mod normalize;
 mod patch_surface;

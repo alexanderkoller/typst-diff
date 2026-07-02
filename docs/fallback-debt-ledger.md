@@ -130,15 +130,15 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-010 Word-Diff-Or-Opaque Replacement Ladder
 
 - Warning code: `FB-010-word-diff-or-opaque-replacement-ladder`
-- Status: `instrumented`
-- Current source sites: replacement selection ladder in `src/diff.rs`.
-- Why this is a guess: the algorithm escalates through word diff and opaque replacement choices after prior structural routes fail.
+- Status: `partially-replaced`
+- Current source sites: `DiffSurfaceEdit` replacement selection in `src/diff.rs`.
+- Why this is a guess: the algorithm now records the selected surface kind, but unsupported-surface cases still use the legacy final word/opaque replacement warning after prior structural routes fail.
 - User-visible risk: structured changes can become misleading word edits or overly broad opaque frames.
 - Runtime warning behavior: emits by default when the final replacement ladder is selected; suppressed on stderr by `--quiet`.
 - Debug/debug-trace event names: `decision_event` with phase `diff/replace-block`.
 - Tests: low-similarity container, table/grid, raw block, and opaque visual tests; `cli_emits_fallback_warning_by_default_and_quiet_suppresses_stderr_only`; `cli_debug_trace_records_pipeline_events_without_frame_trace_for_normal_text`.
-- Replacement abstraction: `diff_surface` and `diff_area` with typed surface kinds.
-- Removal criteria: replacement kind is selected from an explicit diff surface, or unsupported structured content is diagnosed.
+- Replacement abstraction: `diff_surface` and `diff_area` with typed surface kinds and unsupported-surface diagnostics.
+- Removal criteria: replacement kind is selected from an explicit diff surface and unsupported structured content is diagnosed without the legacy word-or-opaque fallback warning.
 
 ## FB-011 Broad Empty-Block Equation Carrier Recognition
 
