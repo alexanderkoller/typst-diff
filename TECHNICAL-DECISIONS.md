@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Legacy Cleanup Keeps Only Proven Bridges
+
+- Phase 11 records the current production Rust line count at 19,010 lines after the deep-cut refactor phases.
+- The active consistency review now distinguishes resolved debt from remaining debt: unique changed slot pairing, unique slot-bearing descendant search, duplicate finished-edit pruning by text signature, broad empty-block equation carrier recognition, and the generated rendered-region snippet panic path are no longer described as live production paths.
+- The technical reference module list now includes the refactor boundary modules: `content_tree`, `content_key`, `patch_surface`, `diff_surface`, `diff_area`, `edit_script`, `style_context`, and `attributed_block_stream`.
+- The older invariant cleanup plan is marked historical so it remains useful design background without competing with the current deep-cut phase plan.
+- The fallback ledger remains synchronized with active warning codes. `FB-013` stays active because opaque contextual page-region wrappers still need source-span `align(...)` parsing until context output carries wrapper provenance.
+- `BlockOwnerCursor` and `EquationOriginBlockCursor` remain in production only inside attributed stream construction. They are no longer used at block-op decision points, but deleting them requires retained owner/path IDs from annotation and block extraction rather than a mechanical rename.
+
+Tradeoff: this phase trims stale documentation and records the current architecture without pretending every bridge is gone. The remaining cursor bridge and visible-text/source-string debts are intentionally left explicit and ledgered instead of hidden behind a superficial cleanup.
+
 ## Page Regions Share Area And Surface Concepts
 
 - Phase 10 keeps semantic page regions and rendered page regions under the `DiffAreaKind` boundary introduced earlier: semantic header/footer/background/foreground edits use `SemanticPageRegion`, while contextual rendered text changes use `RenderedPageRegion`.

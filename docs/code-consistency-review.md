@@ -13,14 +13,17 @@ tables, figures, footnotes, wrappers, and page regions. Most recent tests also
 encode useful contracts around slot-local edits and rendering.
 
 The remaining inconsistency is that several older bridge mechanisms still sit
-beside the annotated-tree model. The most important cleanup targets are:
+beside the annotated-tree model. Earlier phases have removed the unique changed
+slot pair fallback, the unique slot-bearing descendant fallback, duplicate edit
+pruning by text signature, broad empty-block equation carrier recognition, and
+the generated rendered-region snippet panic path. The most important cleanup
+targets that remain are:
 
 - plain-text matching used as identity,
-- positional and uniqueness fallbacks used when structural paths are absent,
-- patch surfaces that inject `ParbreakElem` based on nested-list conditions,
-- rendered page-region parsing built from source-string scanning and coordinate
-  bands,
-- duplicate-edit pruning by textual signature.
+- positional and visible-text fallbacks used when structural paths are absent,
+- remaining anonymous or carrier-recovered patch-surface decisions,
+- rendered page-region parsing that still uses source-string scanning for
+  opaque contextual wrappers and coordinate bands for extraction.
 
 These mechanisms may be pragmatic, but they are exactly the kind of remnants
 that can make future behavior harder to reason about.
@@ -35,12 +38,12 @@ looks suspicious. These are the contracts I found in the current design:
 | `SystemWorld` is a stable snapshot for one evaluation. | Package downloads and Git snapshot mode are external inputs; tests should keep these separate from diff correctness. |
 | `AnnotatedContent.realized` preserves Typst output verbatim. | Patch surfaces and edit application must not blur "what Typst produced" with "what we render after edits." |
 | Every semantic slot path resolves through `children`. | Index-based slot mapping and opaque realization can produce missing or misleading paths. |
-| `semantic_kind` gates structural recursion. | Unique-descendant fallbacks bypass direct ownership and infer locality after the fact. |
-| Patch surfaces are renderable local edit surfaces. | Leading `ParbreakElem` injection and pre-container grafting encode visual repairs rather than a named patch-surface contract. |
+| `semantic_kind` gates structural recursion. | The old unique-descendant fallbacks have been removed; remaining pressure comes from owner/path recovery gaps. |
+| Patch surfaces are renderable local edit surfaces. | Patch surfaces now have typed variants, but some carrier associations still rely on recovered owners. |
 | Page styles are separate from ordinary content styles. | Rendered page-region diffs synthesize new style content through a separate string-based path. |
 | Plain text is similarity, not identity. | Block pairing, layout matching, slot LCS, and partial container mapping all use visible text for decisions that can affect ownership. |
-| The edit script is a render contract. | Duplicate pruning and failed insert/replace paths can silently drop edits before rendering. |
-| Provenance beats recognition. | Equation origins, footnote markers, and rendered-region wrappers are currently recognized by broad predicates or source-string scans. |
+| The edit script is a render contract. | Failed insert/replace paths can still silently drop edits before rendering. |
+| Provenance beats recognition. | Footnote markers and opaque contextual rendered-region wrappers still need retained provenance rather than visible-number or source-string recognition. |
 
 The findings below are organized around places where the code bends one of
 these invariants.
@@ -134,33 +137,28 @@ Suggested direction:
   preservation, so the code no longer needs list-specific checks in multiple
   modules.
 
-### 4. Unique-descendant fallback is a useful bridge but not a general diff rule
+### 4. Unique-descendant fallback has been replaced by edit scripts
 
-Location: `src/diff.rs`, especially `find_unique_changed_slot_pair` and
-`find_slot_bearing_descendant_pair` around lines 2129-2281.
+Former location: `src/diff.rs` `find_unique_changed_slot_pair` and
+`find_slot_bearing_descendant_pair`.
 
-When direct owner matching fails, the diff searches for exactly one changed
-slot-bearing descendant and recurses into it. This works for cases like "one
-nested list changed inside an outer item," but it makes correctness depend on
-uniqueness in the current tree rather than on a structural relation established
-during annotation.
+This is no longer production debt. The diff no longer searches for exactly one
+changed slot-bearing descendant and no longer depends on uniqueness in the
+current tree to recurse into nested containers.
 
-The risk is silent widening or narrowing. If a future document has two changed
-nested containers, the fallback disappears and the algorithm drops to a word
-diff. If two containers are structurally similar, uniqueness may not reflect
-the user's intended edit locality.
+Replacement invariant: ordered slot and child edit scripts drive nested
+container recursion. When a paired child contains slot-bearing descendants, its
+meaningful children are diffed by script, so multiple nested changes can produce
+multiple nested edits.
 
-Invariant affected: block and slot ownership should flow forward from
-annotation and extraction, not be rediscovered by searching for a unique changed
-descendant.
+Remaining pressure point: some owner relationships are still recovered while
+building the attributed block stream. That is FB-003 visible-text owner/block
+matching debt, not unique-descendant debt.
 
 Suggested direction:
 
-- Store owner relationships and block ownership during annotation/block
-  extraction so `diff_annotated` can ask "which semantic node owns this block?"
-  directly.
-- Treat "unique changed descendant" as a temporary compatibility path and add
-  tests that pin its current behavior before replacing it.
+- Continue replacing owner recovery with retained owner/path IDs from annotation
+  and block extraction.
 
 ### 5. Plain text is used as identity in several places where it should only be a similarity signal
 
@@ -193,31 +191,27 @@ Suggested direction:
   reference inside repeated structures. There are corpus cases for link/label
   changes; a repeated-container variant would probe identity ambiguity better.
 
-### 6. Duplicate edit pruning by text signature can hide legitimate repeated changes
+### 6. Duplicate edit pruning by text signature has been removed
 
-Location: `src/diff.rs`, `prune_duplicate_empty_container_edits` around lines
-1576-1612.
+Former location: `src/diff.rs` `prune_duplicate_empty_container_edits`.
 
-This pass removes edits from empty-text container blocks when a matching
-signature has already appeared in nonempty blocks or earlier blocks. The
-signature is based on single-line base/deleted/inserted text.
+This pass is no longer in production code. Duplicate prevention for the
+repeated-container and opaque-wrapper regressions now comes from owner, slot,
+and edit-script selection instead of a late single-line text signature pass.
 
-This is a post-hoc cleanup, not a structural guarantee. If a document really
-has two identical edits in two empty realized containers, one may be hidden. It
-also masks upstream ownership ambiguity instead of fixing the duplication at
-the point where edit claims are made.
+Replacement invariant: every edit claim should be made by the owner/slot/script
+route that owns it; broad finished-edit pruning should not decide whether a
+repeated visible change is legitimate.
 
-Invariant affected: every edit claim should have an owner. Duplicate
-suppression should operate on owner identity, not on rendered text signatures.
+Remaining pressure point: duplicate-surface suppression for already-recursed
+semantic owners still uses normalized visible text because anonymous realized
+surfaces do not yet carry owner keys. That is narrower than the removed
+finished-edit pruning pass and is tracked in `TECHNICAL-DECISIONS.md`.
 
 Suggested direction:
 
-- Replace text signatures with stable edit ownership IDs derived from annotated
-  paths or block ownership.
-- Add a regression test with two identical wrapper/list/table edits that should
-  both be reported.
-- Keep any duplicate suppression local to the ownership conflict it resolves,
-  not as a broad pass over finished edits.
+- Carry owner keys onto anonymous realized surfaces so duplicate-surface
+  suppression can use retained provenance instead of normalized visible text.
 
 ### 7. Rendered page-region diffing is a second diff pipeline
 

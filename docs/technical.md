@@ -59,7 +59,16 @@ src/
 ├── world.rs           — World trait implementation (filesystem + fonts)
 ├── eval.rs            — Content tree extraction from a World
 ├── annotated.rs       — Realized tree plus semantic annotations
+├── attributed_block_stream.rs
+│                      — Per-block semantic owner/equation/footnote attribution
 ├── container_ops.rs   — Container-owned slot mapping and patch surfaces
+├── content_tree.rs    — Shared tree navigation and rewrite helpers
+├── content_key.rs     — Named comparison keys for equality/similarity/presentation
+├── patch_surface.rs   — Typed non-realized edit surface reasons
+├── diff_surface.rs    — Named diff surface kinds
+├── diff_area.rs       — Named diff area kinds
+├── edit_script.rs     — Shared ordered edit-script builder
+├── style_context.rs   — Page/non-page style partitioning
 ├── diff.rs            — Block, semantic-owner, slot, word, and region diff
 ├── annotate.rs        — Build annotated Content from a DiffResult
 ├── render.rs          — layout_document + typst_pdf → Vec<u8>
@@ -86,9 +95,9 @@ old/main.typ ──► SystemWorld A ──► eval_to_realized_content ──�
                                                                        │
 new/main.typ ──► SystemWorld B ──► eval_to_realized_content ──► new_content: Content
                                                                        │
-                                                        diff::diff_content(&old, &new)
+                                                        diff::diff_annotated(&old, &new)
                                                                        │ DiffResult
-                                                        annotate::build_annotated_content
+                                                        annotate::build_annotated_content_from_tree
                                                                        │ Content
                                                render::render_to_pdf(content, world_b)
                                                                        │

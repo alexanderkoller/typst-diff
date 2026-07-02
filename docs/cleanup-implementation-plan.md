@@ -1,5 +1,12 @@
 # Invariant-Driven Cleanup Plan For typst-diff
 
+> Historical note: this plan predates the deep-cut refactor phases in
+> `docs/deep-cut-refactor-implementation-plan.md`. Several items here have
+> since been implemented or superseded by explicit modules such as
+> `content_key`, `patch_surface`, `diff_surface`, `diff_area`,
+> `edit_script`, and `attributed_block_stream`. Treat this document as design
+> background, not the current execution checklist.
+
 ## Summary
 
 This is the implementation roadmap for cleaning up `typst-diff` around explicit
