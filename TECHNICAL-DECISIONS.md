@@ -5,6 +5,8 @@
 - Corpus regression protection now distinguishes the intended baseline from the full corpus state.
 - `tests/run_corpus.sh` can write the current passing cases, run an exact corpus basename, and require a recorded passing list.
 - `tests/run_passing_corpus.sh` uses `tests/corpus-passing-baseline.txt` so every currently passing corpus case must remain passing during refactors, while pre-existing failures stay visible but outside the gate.
+- The corpus harness accepts test-only environment overrides for the corpus directory, output directory, manifest, and binary path; the default corpus behavior is unchanged.
+- `tests/check_corpus_harness.sh` exercises list mode, exact mode, passing-list writes, and missing required entries using a miniature temporary corpus.
 - Fallback debt has a stable code table in `src/decision.rs` and a human ledger in `docs/fallback-debt-ledger.md`.
 - The ledger audit checks that code labels and ledger warning-code entries stay synchronized before fallback instrumentation is threaded through production call sites.
 - The CLI accepts `--quiet` as the future fallback-warning suppression switch; ordinary progress logging and hard errors are intentionally unchanged.

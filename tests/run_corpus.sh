@@ -38,9 +38,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORPUS_DIR="$SCRIPT_DIR/corpus"
-OUTPUT_DIR="$SCRIPT_DIR/corpus_output"
-MANIFEST="$SCRIPT_DIR/../Cargo.toml"
+CORPUS_DIR="${TYPST_DIFF_CORPUS_DIR:-$SCRIPT_DIR/corpus}"
+OUTPUT_DIR="${TYPST_DIFF_CORPUS_OUTPUT_DIR:-$SCRIPT_DIR/corpus_output}"
+MANIFEST="${TYPST_DIFF_MANIFEST:-$SCRIPT_DIR/../Cargo.toml}"
 
 # ── parse flags ───────────────────────────────────────────────────────────────
 BUILD=1
@@ -127,7 +127,7 @@ if [[ $BUILD -eq 1 ]]; then
   echo
 fi
 
-BINARY="$SCRIPT_DIR/../target/$BINARY_SUBDIR/typst-diff"
+BINARY="${TYPST_DIFF_BINARY:-$SCRIPT_DIR/../target/$BINARY_SUBDIR/typst-diff}"
 if [[ ! -x "$BINARY" ]]; then
   printf "${RED}Binary not found: %s${RST}\n" "$BINARY" >&2
   exit 1
