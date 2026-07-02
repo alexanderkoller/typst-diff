@@ -31,8 +31,8 @@ use typst::foundations::{
 };
 use typst::introspection::{MetadataElem, StateUpdateElem, Tag, TagElem};
 use typst::layout::{
-    BlockBody, BlockElem, BoxElem, Frame, FrameItem, GridChild, GridElem, GridItem, PageElem,
-    PagebreakElem, PagedDocument, Point, Rel,
+    AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, Frame, FrameItem, GridChild, GridElem,
+    GridItem, PadElem, PageElem, PagebreakElem, PagedDocument, PlaceElem, Point, Rel,
 };
 use typst::math::EquationElem;
 use typst::model::{
@@ -44,6 +44,7 @@ use typst::text::{
     HighlightElem, LinebreakElem, OverlineElem, RawElem, RawLine, SpaceElem, StrikeElem, SubElem,
     SuperElem, TextElem, UnderlineElem,
 };
+use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
 use crate::annotated::{
     AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind, annotate_realized,
@@ -2021,6 +2022,70 @@ fn retain_old_display_content(content: &Content) -> Content {
             .expect("checked block")
             .body
             .set(Some(BlockBody::Content(retain_old_display_content(&body))));
+        return kept;
+    }
+
+    if let Some(align) = content.to_packed::<AlignElem>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<AlignElem>()
+            .expect("checked align")
+            .body = retain_old_display_content(&align.body);
+        return kept;
+    }
+
+    if let Some(pad) = content.to_packed::<PadElem>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<PadElem>().expect("checked pad").body =
+            retain_old_display_content(&pad.body);
+        return kept;
+    }
+
+    if let Some(place) = content.to_packed::<PlaceElem>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<PlaceElem>()
+            .expect("checked place")
+            .body = retain_old_display_content(&place.body);
+        return kept;
+    }
+
+    if let Some(columns) = content.to_packed::<ColumnsElem>() {
+        let mut kept = content.clone();
+        kept.to_packed_mut::<ColumnsElem>()
+            .expect("checked columns")
+            .body = retain_old_display_content(&columns.body);
+        return kept;
+    }
+
+    if let Some(rect) = content.to_packed::<RectElem>() {
+        let mut kept = content.clone();
+        if let Some(body) = rect.body.get_cloned(StyleChain::default()) {
+            kept.to_packed_mut::<RectElem>()
+                .expect("checked rect")
+                .body
+                .set(Some(retain_old_display_content(&body)));
+        }
+        return kept;
+    }
+
+    if let Some(circle) = content.to_packed::<CircleElem>() {
+        let mut kept = content.clone();
+        if let Some(body) = circle.body.get_cloned(StyleChain::default()) {
+            kept.to_packed_mut::<CircleElem>()
+                .expect("checked circle")
+                .body
+                .set(Some(retain_old_display_content(&body)));
+        }
+        return kept;
+    }
+
+    if let Some(ellipse) = content.to_packed::<EllipseElem>() {
+        let mut kept = content.clone();
+        if let Some(body) = ellipse.body.get_cloned(StyleChain::default()) {
+            kept.to_packed_mut::<EllipseElem>()
+                .expect("checked ellipse")
+                .body
+                .set(Some(retain_old_display_content(&body)));
+        }
         return kept;
     }
 

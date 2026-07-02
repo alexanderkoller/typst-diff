@@ -19,7 +19,10 @@
 
 use typst::foundations::{Content, NativeElement, Smart, Style, Styles};
 use typst::foundations::{SequenceElem, StyleChain, StyledElem};
-use typst::layout::{Abs, BlockBody, BlockElem, HideElem, PageElem, Rel, Sides};
+use typst::layout::{
+    Abs, AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, HideElem, PadElem, PageElem,
+    PlaceElem, Rel, Sides,
+};
 use typst::math::{CancelElem, EquationElem};
 use typst::model::{
     EmphElem, EnumElem, EnumItem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem,
@@ -27,7 +30,7 @@ use typst::model::{
     TermsElem,
 };
 use typst::text::{HighlightElem, LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
-use typst::visualize::{Color, Stroke};
+use typst::visualize::{CircleElem, Color, EllipseElem, RectElem, Stroke};
 
 use crate::annotated::effective_render_content;
 use crate::container_ops;
@@ -545,6 +548,54 @@ fn map_transparent_children(
         && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
     {
         block.body.set(Some(BlockBody::Content(map_child(&body))));
+        return Some(content);
+    }
+
+    if let Some(align) = content.to_packed_mut::<AlignElem>() {
+        align.body = map_child(&align.body);
+        return Some(content);
+    }
+
+    if let Some(pad) = content.to_packed_mut::<PadElem>() {
+        pad.body = map_child(&pad.body);
+        return Some(content);
+    }
+
+    if let Some(place) = content.to_packed_mut::<PlaceElem>() {
+        place.body = map_child(&place.body);
+        return Some(content);
+    }
+
+    if let Some(columns) = content.to_packed_mut::<ColumnsElem>() {
+        columns.body = map_child(&columns.body);
+        return Some(content);
+    }
+
+    if let Some(box_elem) = content.to_packed_mut::<BoxElem>()
+        && let Some(body) = box_elem.body.get_cloned(StyleChain::default())
+    {
+        box_elem.body.set(Some(map_child(&body)));
+        return Some(content);
+    }
+
+    if let Some(rect) = content.to_packed_mut::<RectElem>()
+        && let Some(body) = rect.body.get_cloned(StyleChain::default())
+    {
+        rect.body.set(Some(map_child(&body)));
+        return Some(content);
+    }
+
+    if let Some(circle) = content.to_packed_mut::<CircleElem>()
+        && let Some(body) = circle.body.get_cloned(StyleChain::default())
+    {
+        circle.body.set(Some(map_child(&body)));
+        return Some(content);
+    }
+
+    if let Some(ellipse) = content.to_packed_mut::<EllipseElem>()
+        && let Some(body) = ellipse.body.get_cloned(StyleChain::default())
+    {
+        ellipse.body.set(Some(map_child(&body)));
         return Some(content);
     }
 

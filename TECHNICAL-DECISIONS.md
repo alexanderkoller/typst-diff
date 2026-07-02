@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Inert Old Display Preserves Alignment Wrappers
+
+- Deleted old content may still need non-page layout wrappers to render at the old visual position.
+- `align` wrappers are retained in old display surfaces, with only their body sanitized recursively.
+- The same retention rule applies to the other semantic wrapper bodies that typst-diff already recognizes: `pad`, `place`, `columns`, `box`, `block`, and body-bearing shape wrappers.
+- Annotation also treats these wrappers as transparent child wrappers so delete/insert styling is applied inside the wrapper rather than replacing it with plain text.
+- Page styles are still stripped from inert old display surfaces; preserving `align` does not make old headers, footers, counters, or page configuration live again.
+- Explicit non-page styles inside deleted header content, such as `text(font: ...)[...]`, are retained. Ambient layout-time styles that Typst applies to a header from outside the header content are not available in the semantic page-region payload; preserving them requires retaining page-region style provenance or carrying rendered-run style information, not guessing from nearby body content.
+
+Tradeoff: this preserves known source/layout structure for deleted content instead of inferring alignment from rendered coordinates. Other layout wrappers should be added only when their retained body can be sanitized cleanly and they do not reactivate old document state.
+
 ## Semantic Owner Edits Anchor To Realized Carriers
 
 - Semantic owners may supply provenance, slots, and source equation origins for edit construction.

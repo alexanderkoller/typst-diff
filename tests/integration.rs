@@ -53,6 +53,7 @@ struct TextRun {
     width: f64,
     size: f64,
     fill: typst::visualize::Paint,
+    font_family: String,
 }
 
 fn rendered_text_runs(frame: &typst::layout::Frame) -> Vec<TextRun> {
@@ -67,6 +68,7 @@ fn rendered_text_runs(frame: &typst::layout::Frame) -> Vec<TextRun> {
                     width: text.width().to_pt(),
                     size: text.size.to_pt(),
                     fill: text.fill.clone(),
+                    font_family: text.font.info().family.clone(),
                 }),
                 typst::layout::FrameItem::Group(group) => {
                     collect(&group.frame, absolute, out);
@@ -5297,6 +5299,8 @@ fn corpus_82_deleted_header_does_not_restyle_body_text() {
     );
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
     let runs = rendered_text_runs(&document.pages[0].frame);
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let page_width = document.pages[0].frame.width().to_pt();
 
     assert!(
         runs.iter().any(|run| run.text.contains("Report")),
@@ -5306,6 +5310,12 @@ fn corpus_82_deleted_header_does_not_restyle_body_text() {
         runs.iter()
             .any(|run| run.text.contains("The body text is unchanged.")),
         "body paragraph should remain on page 1: {runs:?}"
+    );
+    assert!(
+        runs.iter().any(|run| {
+            run.text.contains("Old Header") && run.fill == red && run.x > page_width * 0.65
+        }),
+        "deleted header should keep the old right alignment on page 1: {runs:?}"
     );
 }
 
@@ -5672,6 +5682,59 @@ Body unchanged.
             })
         }),
         "style-only static header change should produce modified delete/insert word ops"
+    );
+}
+
+#[test]
+fn deleted_static_header_preserves_explicit_font_style() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set page(header: text(font: "New Computer Modern Sans")[Old Header])
+
+Body unchanged.
+"#,
+        r#"Body unchanged.
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let runs = rendered_text_runs(&document.pages[0].frame);
+
+    assert!(
+        runs.iter().any(|run| {
+            run.text.contains("Old Header")
+                && run.fill == red
+                && run.font_family == "New Computer Modern Sans"
+        }),
+        "deleted header should keep its explicit font style: {runs:?}"
+    );
+}
+
+#[test]
+fn deleted_static_header_preserves_pad_wrapper() {
+    let (_dir, old_world, new_world) = temp_worlds(
+        r#"#set page(header: pad(left: 2cm)[Old Header])
+
+Body unchanged.
+"#,
+        r#"Body unchanged.
+"#,
+    );
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result = typst_diff::diff::diff_annotated(&old, &new);
+    let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
+    let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
+    let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
+    let runs = rendered_text_runs(&document.pages[0].frame);
+
+    assert!(
+        runs.iter()
+            .any(|run| { run.text.contains("Old Header") && run.fill == red && run.x > 120.0 }),
+        "deleted header should keep its pad wrapper: {runs:?}"
     );
 }
 
