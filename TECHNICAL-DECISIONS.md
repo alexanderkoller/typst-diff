@@ -1,5 +1,16 @@
 # Technical Decisions
 
+## Content Keys Name The Comparison Purpose
+
+- Phase 4 introduces `content_key` as the single home for comparison keys.
+- Block LCS uses `BlockEqualityKey`: equality and hashing remain Typst structural content equality, while ordering uses visible text plus structural hash only to satisfy the `similar` API contract.
+- Token, child-sequence, slot-LCS, context, visible-unit, normalized-visible-text, and opaque-replacement comparisons now call named key constructors instead of local ad hoc string helpers.
+- Presentation keys intentionally include visible formatting identity such as emphasis, heading, equation blockness, raw/code, highlight, and visual block decoration, while ignoring metadata-only wrappers such as tags.
+- Context presentation keys intentionally ignore ordinary text payload and focus on the surrounding structural context that can affect rendered references or headings.
+- Normalized visible-text keys remain explicitly named fallback-style comparisons. They are still used only where the current pipeline lacks stronger provenance, so the visible-text ledger entries remain active rather than being treated as solved.
+
+Tradeoff: this phase mostly centralizes existing semantics instead of eliminating every visible-text identity fallback. That makes later replacement work auditable: call sites now reveal whether they are asking for structural equality, presentation identity, context identity, similarity support, or an acknowledged normalized-visible-text match.
+
 ## Content Tree And Style Context Are Shared Mechanics
 
 - Phase 3 extracts repeated content traversal and mutation mechanics into `content_tree`.

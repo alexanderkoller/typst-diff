@@ -20,6 +20,7 @@ pub mod annotate;
 pub mod annotated;
 pub mod build_info;
 mod container_ops;
+mod content_key;
 mod content_tree;
 mod context_recording;
 pub mod debug;

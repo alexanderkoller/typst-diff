@@ -8,7 +8,7 @@
 //!    styles that were active at each block's position.
 //!
 //! 2. **Block-level LCS** — [`diff_block_units_raw`] wraps each block in
-//!    [`HashableContent`] and feeds the slice to `similar::capture_diff_slices`
+//!    content-key wrappers and feeds the slice to `similar::capture_diff_slices`
 //!    (Myers algorithm). This produces `Equal / Delete / Insert` operations.
 //!
 //! 3. **Edit-zone matching** — [`match_edit_zones`] scans the raw ops for contiguous
@@ -26,8 +26,7 @@ use std::hash::{Hash, Hasher};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use typst::World;
 use typst::foundations::{
-    Content, ContextElem, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem,
-    Styles,
+    Content, ContextElem, Repr, SequenceElem, Smart, StyleChain, StyledElem, Styles,
 };
 use typst::introspection::{MetadataElem, StateUpdateElem, Tag, TagElem};
 use typst::layout::{
@@ -40,10 +39,7 @@ use typst::model::{
     LinkElem, ListElem, ParElem, ParbreakElem, RefElem, StrongElem, TableChild, TableElem,
     TableItem,
 };
-use typst::text::{
-    HighlightElem, LinebreakElem, OverlineElem, RawElem, RawLine, SpaceElem, StrikeElem, SubElem,
-    SuperElem, TextElem, UnderlineElem,
-};
+use typst::text::{HighlightElem, LinebreakElem, RawElem, RawLine, SpaceElem, TextElem};
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
 use crate::annotated::{
@@ -51,6 +47,7 @@ use crate::annotated::{
     effective_render_content, effective_text_content,
 };
 use crate::container_ops;
+use crate::content_key;
 use crate::content_tree;
 use crate::decision::{DecisionEvent, DecisionSink, FallbackCode, bounded_preview};
 use crate::style_context;
@@ -373,7 +370,8 @@ pub struct Token {
 impl PartialEq for Token {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
-            && presentation_key(&self.content) == presentation_key(&other.content)
+            && content_key::presentation_key(&self.content)
+                == content_key::presentation_key(&other.content)
     }
 }
 impl Eq for Token {}
@@ -384,178 +382,17 @@ impl PartialOrd for Token {
 }
 impl Ord for Token {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.text
-            .cmp(&other.text)
-            .then_with(|| presentation_key(&self.content).cmp(&presentation_key(&other.content)))
+        self.text.cmp(&other.text).then_with(|| {
+            content_key::presentation_key(&self.content)
+                .cmp(&content_key::presentation_key(&other.content))
+        })
     }
 }
 impl Hash for Token {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.text.hash(state);
-        presentation_key(&self.content).hash(state);
+        content_key::presentation_key(&self.content).hash(state);
     }
-}
-
-fn presentation_key(content: &Content) -> String {
-    let mut out = String::new();
-    write_presentation_key(content, &mut out);
-    out
-}
-
-fn write_presentation_key(content: &Content, out: &mut String) {
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        out.push_str("seq[");
-        for child in &seq.children {
-            if is_metadata_tag(child) {
-                continue;
-            }
-            write_presentation_key(child, out);
-            out.push(';');
-        }
-        out.push(']');
-    } else if let Some(styled) = content.to_packed::<StyledElem>() {
-        let styles_key = styles_key(&styled.styles);
-        if styles_key.is_empty() {
-            write_presentation_key(&styled.child, out);
-            return;
-        }
-        out.push_str("styled(");
-        out.push_str(&styles_key);
-        out.push_str(")[");
-        write_presentation_key(&styled.child, out);
-        out.push(']');
-    } else if let Some(par) = content.to_packed::<ParElem>() {
-        out.push_str("par[");
-        write_presentation_key(&par.body, out);
-        out.push(']');
-    } else if let Some(heading) = content.to_packed::<HeadingElem>() {
-        out.push_str("heading[");
-        write_presentation_key(&heading.body, out);
-        out.push(']');
-    } else if let Some(block) = content.to_packed::<BlockElem>() {
-        out.push_str("block(");
-        if block_has_visual_decoration(block) {
-            out.push_str("visual:");
-            out.push_str(content.repr().as_str());
-            out.push(')');
-            return;
-        }
-        out.push_str(match block.body.get_cloned(StyleChain::default()) {
-            Some(BlockBody::Content(_)) => "content",
-            Some(_) => "other",
-            None => "auto",
-        });
-        out.push_str(")[");
-        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
-            write_presentation_key(&body, out);
-        }
-        out.push(']');
-    } else if let Some(equation) = content.to_packed::<EquationElem>() {
-        out.push_str("equation(");
-        out.push_str(if equation.block.get(StyleChain::default()) {
-            "block"
-        } else {
-            "inline"
-        });
-        out.push_str("):");
-        out.push_str(equation.body.repr().as_str());
-    } else if let Some(link) = content.to_packed::<LinkElem>() {
-        write_presentation_key(&link.body, out);
-    } else if let Some(strong) = content.to_packed::<StrongElem>() {
-        out.push_str("strong[");
-        write_presentation_key(&strong.body, out);
-        out.push(']');
-    } else if let Some(emph) = content.to_packed::<EmphElem>() {
-        out.push_str("emph[");
-        write_presentation_key(&emph.body, out);
-        out.push(']');
-    } else if let Some(highlight) = content.to_packed::<HighlightElem>() {
-        out.push_str("highlight(");
-        out.push_str(&format!("{highlight:?}"));
-        out.push_str(")[");
-        write_presentation_key(&highlight.body, out);
-        out.push(']');
-    } else if let Some(sub) = content.to_packed::<SubElem>() {
-        out.push_str("sub[");
-        write_presentation_key(&sub.body, out);
-        out.push(']');
-    } else if let Some(sup) = content.to_packed::<SuperElem>() {
-        out.push_str("super[");
-        write_presentation_key(&sup.body, out);
-        out.push(']');
-    } else if let Some(underline) = content.to_packed::<UnderlineElem>() {
-        out.push_str("underline[");
-        write_presentation_key(&underline.body, out);
-        out.push(']');
-    } else if let Some(overline) = content.to_packed::<OverlineElem>() {
-        out.push_str("overline[");
-        write_presentation_key(&overline.body, out);
-        out.push(']');
-    } else if let Some(strike) = content.to_packed::<StrikeElem>() {
-        out.push_str("strike[");
-        write_presentation_key(&strike.body, out);
-        out.push(']');
-    } else if content.is::<TextElem>() {
-        out.push_str("text");
-    } else if content.is::<SpaceElem>() {
-        out.push_str("space");
-    } else if is_opaque_visual_element_name(content.func().name()) {
-        out.push_str(content.func().name());
-        out.push(':');
-        out.push_str(content.repr().as_str());
-    } else if is_metadata_tag(content) {
-    } else {
-        let children = container_ops::semantic_diff_child_contents(content);
-        if !children.is_empty() {
-            out.push_str(content.func().name());
-            out.push('[');
-            for child in children {
-                if is_metadata_tag(&child) {
-                    continue;
-                }
-                write_presentation_key(&child, out);
-                out.push(';');
-            }
-            out.push(']');
-        } else {
-            out.push_str(content.func().name());
-            out.push(':');
-            out.push_str(content.plain_text().as_str());
-        }
-    }
-}
-
-fn is_metadata_tag(content: &Content) -> bool {
-    content.func().name() == "tag"
-}
-
-fn write_styles_key(styles: &Styles, out: &mut String) {
-    out.push_str(&styles_key(styles));
-}
-
-fn styles_key(styles: &Styles) -> String {
-    let mut out = String::new();
-    for style in styles.iter() {
-        if !is_presentation_style(style) {
-            continue;
-        }
-        // `Style` equality can include realization provenance. The debug
-        // signature is the same normalization used for inherited-style stripping.
-        out.push_str(&format!("{style:?}"));
-        out.push(';');
-    }
-    out
-}
-
-fn is_presentation_style(style: &Style) -> bool {
-    style.property().is_some()
-        && style.element().is_some_and(|element| {
-            element == TextElem::ELEM
-                || element == ParElem::ELEM
-                || element == HeadingElem::ELEM
-                || element == EquationElem::ELEM
-                || element == RawElem::ELEM
-        })
 }
 
 /// Walk a block's inline content and produce a flat list of [`Token`]s.
@@ -695,7 +532,7 @@ fn collect_tokens(content: &Content, out: &mut Vec<Token>) {
             text: " ".to_string(),
             content: content.clone(),
         });
-    } else if is_metadata_tag(content) {
+    } else if content_key::is_metadata_tag(content) {
     } else {
         out.push(Token {
             text: content.plain_text().to_string(),
@@ -884,48 +721,6 @@ fn text_token_kind(ch: char) -> TextTokenKind {
     }
 }
 
-/// Newtype that adds `Eq + Ord` to `Content` so it can be used with `similar`.
-///
-/// `Content` only implements `PartialEq` and `Hash`; `similar::capture_diff_slices`
-/// requires full `Eq + Ord`. Ordering is by plain-text first, then by hash as a
-/// tiebreaker — this satisfies the `Ord`/`Eq` consistency contract because two nodes
-/// with the same hash (structurally equal) will always compare `Equal`.
-#[derive(Clone)]
-struct HashableContent(Content);
-impl PartialEq for HashableContent {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl Eq for HashableContent {}
-impl PartialOrd for HashableContent {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HashableContent {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Primary: plain_text for semantic grouping. Secondary: hash as tiebreaker
-        // so that structurally equal Content (same hash) always compares Equal,
-        // satisfying the Ord/Eq consistency contract.
-        let text_cmp = self.0.plain_text().cmp(&other.0.plain_text());
-        if text_cmp != std::cmp::Ordering::Equal {
-            return text_cmp;
-        }
-        let mut h1 = std::collections::hash_map::DefaultHasher::new();
-        let mut h2 = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::Hasher as _;
-        self.0.hash(&mut h1);
-        other.0.hash(&mut h2);
-        h1.finish().cmp(&h2.finish())
-    }
-}
-impl Hash for HashableContent {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state)
-    }
-}
-
 /// Block-level diff operation produced by [`diff_block_units_raw`] and [`match_edit_zones`].
 ///
 /// `Equal` and `Replace` carry both the old and new block so the caller can
@@ -964,13 +759,13 @@ pub fn diff_blocks_raw(old: &[Content], new: &[Content]) -> Vec<BlockOp> {
 }
 
 fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
-    let old_h: Vec<HashableContent> = old
+    let old_h: Vec<content_key::BlockEqualityKey> = old
         .iter()
-        .map(|block| HashableContent(block.content.clone()))
+        .map(|block| content_key::BlockEqualityKey::new(block.content.clone()))
         .collect();
-    let new_h: Vec<HashableContent> = new
+    let new_h: Vec<content_key::BlockEqualityKey> = new
         .iter()
-        .map(|block| HashableContent(block.content.clone()))
+        .map(|block| content_key::BlockEqualityKey::new(block.content.clone()))
         .collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_h, &new_h);
     let mut result = Vec::new();
@@ -1606,12 +1401,6 @@ fn single_line(text: &str) -> String {
         }
     }
     result.trim().to_string()
-}
-
-fn content_signature(content: &Content) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn root_page_styles_raw(content: &Content) -> Styles {
@@ -3271,7 +3060,7 @@ fn block_context_key_for(
     annotated: Option<&AnnotatedContent>,
 ) -> Option<String> {
     if annotated.is_some_and(|node| node.annotation.semantic_kind == Some(SemanticKind::Heading)) {
-        return Some(context_presentation_key(content));
+        return Some(content_key::context_presentation_key(content).to_string());
     }
     annotated
         .and_then(annotated_block_context_key)
@@ -3281,7 +3070,9 @@ fn block_context_key_for(
 fn annotated_block_context_key(node: &AnnotatedContent) -> Option<String> {
     match node.annotation.semantic_kind {
         Some(SemanticKind::Paragraph) => block_context_key(&node.realized),
-        Some(SemanticKind::Heading) => Some(context_presentation_key(&node.realized)),
+        Some(SemanticKind::Heading) => {
+            Some(content_key::context_presentation_key(&node.realized).to_string())
+        }
         _ => None,
     }
 }
@@ -3296,64 +3087,6 @@ fn semantic_heading_context(
             if old.annotation.semantic_kind == Some(SemanticKind::Heading)
                 && new.annotation.semantic_kind == Some(SemanticKind::Heading)
     )
-}
-
-fn context_presentation_key(content: &Content) -> String {
-    let mut out = String::new();
-    write_context_presentation_key(content, &mut out);
-    out
-}
-
-fn write_context_presentation_key(content: &Content, out: &mut String) {
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        out.push_str("seq[");
-        for child in &seq.children {
-            write_context_presentation_key(child, out);
-            out.push(';');
-        }
-        out.push(']');
-    } else if let Some(styled) = content.to_packed::<StyledElem>() {
-        out.push_str("styled(");
-        write_styles_key(&styled.styles, out);
-        out.push_str(")[");
-        write_context_presentation_key(&styled.child, out);
-        out.push(']');
-    } else if let Some(par) = content.to_packed::<ParElem>() {
-        out.push_str("par[");
-        write_context_presentation_key(&par.body, out);
-        out.push(']');
-    } else if let Some(heading) = content.to_packed::<HeadingElem>() {
-        out.push_str("heading(");
-        out.push_str(&format!(
-            "level={:?}:depth={}:offset={}",
-            heading.level.get(StyleChain::default()),
-            heading.depth.get(StyleChain::default()).get(),
-            heading.offset.get(StyleChain::default())
-        ));
-        out.push_str(")[");
-        write_context_presentation_key(&heading.body, out);
-        out.push(']');
-    } else if let Some(block) = content.to_packed::<BlockElem>() {
-        out.push_str("block[");
-        if let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default()) {
-            write_context_presentation_key(&body, out);
-        }
-        out.push(']');
-    } else if is_metadata_tag(content) || content.is::<TextElem>() || content.is::<SpaceElem>() {
-    } else {
-        let children = container_ops::semantic_diff_child_contents(content);
-        if !children.is_empty() {
-            out.push_str(content.func().name());
-            out.push('[');
-            for child in children {
-                write_context_presentation_key(&child, out);
-                out.push(';');
-            }
-            out.push(']');
-        } else {
-            out.push_str(content.func().name());
-        }
-    }
 }
 
 fn block_context_key(content: &Content) -> Option<String> {
@@ -3448,7 +3181,8 @@ fn presentation_changed(
         }
     }
 
-    presentation_key(&old_block.content) != presentation_key(&new_block.content)
+    content_key::presentation_key(&old_block.content)
+        != content_key::presentation_key(&new_block.content)
 }
 
 fn inserted_block_edit(
@@ -4359,8 +4093,8 @@ fn collect_edit_content_signature(content: &EditContent, signatures: &mut HashSe
         EditContent::OpaqueReplacement { old, new } => {
             signatures.insert(format!(
                 "opaque\n{}\n{}",
-                content_signature(old.as_content()),
-                content_signature(new)
+                content_key::opaque_signature(old.as_content()),
+                content_key::opaque_signature(new)
             ));
         }
         EditContent::Inserted(_) | EditContent::Deleted(_) | EditContent::Modified { .. } => {}
@@ -5716,7 +5450,7 @@ fn unique_enclosed_diff_region_owner(node: &AnnotatedContent) -> Option<&Annotat
 }
 
 fn owned_block_matches(owner_block: &Content, target: &Content) -> bool {
-    owner_block == target || normalized_visible_text_matches(owner_block, target)
+    owner_block == target || content_key::normalized_visible_text_matches(owner_block, target)
 }
 
 fn semantic_owner_claims_match(
@@ -5814,20 +5548,6 @@ fn layout_content_matches(layout: &Content, target: &Content) -> bool {
     !layout_text.is_empty() && layout_text == target_text
 }
 
-fn normalized_visible_text_matches(left: &Content, right: &Content) -> bool {
-    let left = normalized_visible_text(left);
-    let right = normalized_visible_text(right);
-    !left.is_empty() && left == right
-}
-
-fn normalized_visible_text(content: &Content) -> String {
-    content
-        .plain_text()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) -> AnnotatedContent {
     if let Some(source) = source {
         return source.clone();
@@ -5884,8 +5604,10 @@ fn collect_single_block_semantic_owners<'a>(
         if matches!(
             node.annotation.semantic_kind,
             Some(SemanticKind::Table | SemanticKind::Grid)
-        ) && normalized_visible_text_matches(&effective_render_content(node), target)
-        {
+        ) && content_key::normalized_visible_text_matches(
+            &effective_render_content(node),
+            target,
+        ) {
             out.push(node);
         }
         let blocks = owner_block_units(node);
@@ -6112,13 +5834,13 @@ fn child_sequence_structural_edit_content(
         return None;
     }
 
-    let old_keys: Vec<String> = old_children
+    let old_keys: Vec<content_key::ContentKey> = old_children
         .iter()
-        .map(|(_, child)| structural_child_key(child))
+        .map(|(_, child)| content_key::structural_child_key(child))
         .collect();
-    let new_keys: Vec<String> = new_children
+    let new_keys: Vec<content_key::ContentKey> = new_children
         .iter()
-        .map(|(_, child)| structural_child_key(child))
+        .map(|(_, child)| content_key::structural_child_key(child))
         .collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_keys, &new_keys);
 
@@ -6228,15 +5950,6 @@ fn is_structural_separator_child(child: &AnnotatedContent) -> bool {
             .is_empty()
 }
 
-fn structural_child_key(child: &AnnotatedContent) -> String {
-    format!(
-        "{:?}:{}:{}",
-        child.annotation.semantic_kind,
-        effective_text_content(child).plain_text(),
-        presentation_key(&effective_render_content(child))
-    )
-}
-
 fn push_deleted_child_sequence_edit(
     edits: &mut Vec<RealizedEdit>,
     old_child: &AnnotatedContent,
@@ -6335,13 +6048,14 @@ fn mark_recursed_display_surface(recursed: &mut Vec<Content>, owner: &AnnotatedC
 }
 
 fn consume_recursed_display_surface(recursed: &mut Vec<Content>, content: &Content) -> bool {
-    if !contains_non_token_display_container(content) && normalized_visible_text(content).is_empty()
+    if !contains_non_token_display_container(content)
+        && content_key::normalized_visible_text(content).is_empty()
     {
         return false;
     }
     let Some(index) = recursed
         .iter()
-        .position(|surface| normalized_visible_text_matches(surface, content))
+        .position(|surface| content_key::normalized_visible_text_matches(surface, content))
     else {
         return false;
     };
@@ -6549,7 +6263,7 @@ fn visible_footnote_unit_key(unit: &VisibleFootnoteUnit) -> String {
     if unit.is_footnote {
         format!("footnote:{}", unit.text)
     } else {
-        format!("visible:{}:{}", unit.text, presentation_key(&unit.content))
+        content_key::visible_unit_key(&unit.text, &unit.content).to_string()
     }
 }
 
@@ -6893,19 +6607,19 @@ fn diff_slot_edits_lcs(
 ) -> Vec<RealizedEdit> {
     let old_slots = resolved_slots(old_ann);
     let new_slots = resolved_slots(new_ann);
-    let old_h: Vec<String> = old_ann
+    let old_h: Vec<content_key::ContentKey> = old_ann
         .annotation
         .slots
         .iter()
         .filter_map(|slot| old_ann.get_path(&slot.path))
-        .map(slot_child_match_key)
+        .map(content_key::slot_child_match_key)
         .collect();
-    let new_h: Vec<String> = new_ann
+    let new_h: Vec<content_key::ContentKey> = new_ann
         .annotation
         .slots
         .iter()
         .filter_map(|slot| new_ann.get_path(&slot.path))
-        .map(slot_child_match_key)
+        .map(content_key::slot_child_match_key)
         .collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_h, &new_h);
 
@@ -7008,14 +6722,6 @@ fn diff_slot_edits_lcs(
     edits
 }
 
-fn slot_child_match_key(child: &AnnotatedContent) -> String {
-    format!(
-        "{}:{}",
-        effective_text_content(child).plain_text(),
-        presentation_key(&effective_render_content(child))
-    )
-}
-
 fn push_deleted_slot_edit(
     edits: &mut Vec<RealizedEdit>,
     old_child: &AnnotatedContent,
@@ -7056,6 +6762,7 @@ fn deleted_edit_for_annotated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use typst::foundations::NativeElement;
     use typst::model::HeadingElem;
     use typst::text::TextElem;
 
