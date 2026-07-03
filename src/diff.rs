@@ -4439,6 +4439,11 @@ fn rendered_region_alignment(content: &Content) -> Option<RenderedRegionAlignmen
     if let Some(align) = content.to_packed::<AlignElem>() {
         return rendered_region_horizontal_alignment(align.alignment.get(StyleChain::default()));
     }
+    if let Some(context) = content.to_packed::<ContextElem>() {
+        return crate::context_recording::peek(context.span())
+            .as_ref()
+            .and_then(rendered_region_alignment);
+    }
     if let Some(styled) = content.to_packed::<StyledElem>() {
         return rendered_region_alignment(&styled.child);
     }

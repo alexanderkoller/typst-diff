@@ -23,6 +23,7 @@ pub enum FallbackCode {
     WordDiffOrOpaqueReplacementLadder,
     FootnoteMarkerMatchingByVisibleNumber,
     RenderedRegionSourceStringAlignParsing,
+    RenderedRegionLayoutAlignmentFallback,
 }
 
 impl FallbackCode {
@@ -36,6 +37,7 @@ impl FallbackCode {
         Self::WordDiffOrOpaqueReplacementLadder,
         Self::FootnoteMarkerMatchingByVisibleNumber,
         Self::RenderedRegionSourceStringAlignParsing,
+        Self::RenderedRegionLayoutAlignmentFallback,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -58,6 +60,9 @@ impl FallbackCode {
             }
             Self::RenderedRegionSourceStringAlignParsing => {
                 "FB-013-rendered-region-source-string-align-parsing"
+            }
+            Self::RenderedRegionLayoutAlignmentFallback => {
+                "FB-014-rendered-region-layout-alignment-fallback"
             }
         }
     }
@@ -84,6 +89,9 @@ impl FallbackCode {
             }
             Self::RenderedRegionSourceStringAlignParsing => {
                 "parsed rendered-region wrapper from source text"
+            }
+            Self::RenderedRegionLayoutAlignmentFallback => {
+                "inferred rendered-region wrapper from layout geometry"
             }
         }
     }

@@ -1,5 +1,57 @@
 # Technical Decisions
 
+## Lean Phase 9 Exposes Rendered-Region Wrapper Provenance Debt
+
+- Attempting to delete rendered-region source parsing showed that direct
+  `AlignElem` inspection plus recorded `ContextElem` output is not yet enough.
+  `tests/run_passing_corpus.sh` regressed `41-running-header-query` because the
+  contextual running header lost its right alignment.
+- `rendered_region_source_wrapper`, `authored_align_wrapper`, and
+  `parse_align_call_alignment` therefore remain active for now, and
+  `FB-013-rendered-region-source-string-align-parsing` remains ledgered.
+- `rendered_region_layout_wrapper` is also fallback debt. It infers wrapper
+  alignment from rendered geometry when retained wrapper provenance is absent.
+  It is now tracked as `FB-014-rendered-region-layout-alignment-fallback`.
+- A proposed widening of layout alignment from edge/center checks to broad
+  left-half/right-half classification was rejected. That made the corpus pass,
+  but it was a new geometry heuristic rather than retained provenance.
+- Current Typst context outputs often expose rendered text rather than the
+  authored wrapper body. Retiring `FB-013` and `FB-014` requires recording
+  wrapper/provenance metadata for page-region `ContextElem` outputs, or an
+  explicit unsupported-wrapper boundary.
+
+Tradeoff: keeping the source parser is not clean, but it is narrower and already
+ledgered. Replacing it with a broader layout classifier would make the code look
+cleaner while increasing post-hoc guessing.
+
+Deferred improvement: context recording should carry page-region wrapper
+provenance, including alignment wrappers around contextual output. Once that
+exists, delete the source parser and then the layout classifier.
+
+## Rendered-Region Wrapper Fallbacks Are A Dedicated Phase
+
+- `FB-013` source-string align parsing and `FB-014` layout alignment inference
+  are separate fallbacks, and both should be removed. The project should not
+  replace one post-hoc guess with another broader post-hoc guess.
+- The valid replacement is retained wrapper provenance for rendered page
+  regions, especially contextual page regions whose rendered text varies by
+  page.
+- `41-running-header-query` is the key behavioral guard. It currently needs
+  `align(right, ...)` from inside a contextual running-header closure. Direct
+  `AlignElem` inspection and current recorded context output were insufficient;
+  deleting the source parser without new provenance made the header render at
+  the wrong alignment.
+- The attempted broad layout classifier (`x_start > page_width / 2` means
+  right-aligned, and symmetric left-half logic) was rejected even though it made
+  the corpus pass. It inferred authorial wrapper intent from coincidental page
+  geometry and violated the no-new-fallbacks rule.
+- A new plan phase now precedes cleanup: retain rendered-region wrapper
+  provenance, then delete both `FB-013` and `FB-014`.
+
+Tradeoff: this keeps known debt active for now, but avoids hiding it behind a
+larger geometry heuristic. The eventual cleanup should reduce code and improve
+correctness by making wrapper identity available before layout.
+
 ## Lean Phase 8 Consolidates Diff Selection And Context Keys
 
 - Replacement-style decisions now use `diff_surface::DiffSelection<T>`, which
@@ -229,7 +281,10 @@ table/grid/raw ownership during attributed extraction.
 - The active consistency review now distinguishes resolved debt from remaining debt: unique changed slot pairing, unique slot-bearing descendant search, duplicate finished-edit pruning by text signature, broad empty-block equation carrier recognition, and the generated rendered-region snippet panic path are no longer described as live production paths.
 - The technical reference module list now includes the refactor boundary modules: `content_tree`, `content_key`, `patch_surface`, `diff_surface`, `diff_area`, `edit_script`, `style_context`, and `attributed_block_stream`.
 - The older invariant cleanup plan is marked historical so it remains useful design background without competing with the current deep-cut phase plan.
-- The fallback ledger remains synchronized with active warning codes. `FB-013` stays active because opaque contextual page-region wrappers still need source-span `align(...)` parsing until context output carries wrapper provenance.
+- The fallback ledger remains synchronized with active warning codes. Phase 9
+  later showed that `FB-013` cannot yet be retired safely: contextual page
+  regions still need retained wrapper provenance before source-span
+  `align(...)` parsing can be deleted.
 - `BlockOwnerCursor` and `EquationOriginBlockCursor` have now been deleted. The remaining owner/equation claim collectors still live inside attributed stream construction until retained owner/path IDs can replace realized-content recovery.
 
 Tradeoff: this phase trims stale documentation and records the current architecture without pretending every bridge is gone. The remaining cursor bridge and visible-text/source-string debts are intentionally left explicit and ledgered instead of hidden behind a superficial cleanup.
@@ -239,12 +294,23 @@ Tradeoff: this phase trims stale documentation and records the current architect
 - Phase 10 keeps semantic page regions and rendered page regions under the `DiffAreaKind` boundary introduced earlier: semantic header/footer/background/foreground edits use `SemanticPageRegion`, while contextual rendered text changes use `RenderedPageRegion`.
 - Rendered-region word and segment diffs continue to use explicit `DiffSurfaceKind::RenderedRegionText` and `RenderedRegionSegment` surfaces rather than anonymous word operations.
 - Rendered-region alignment preservation now reads `AlignElem` from the page-region content tree and maps its horizontal alignment directly before considering older recovery paths.
-- When an opaque `ContextElem` hides the authored wrapper body, rendered-region alignment may still use the source-span `align(...)` parser as a ledgered fallback. Extracted rendered text geometry is used only after structural and source-span wrapper recovery fail, and only when all non-empty rendered pages agree on the same left, center, or right placement.
+- When an opaque `ContextElem` hides the authored wrapper body, rendered-region
+  alignment now tries recorded context output before falling back to rendered
+  text geometry. The earlier source-span `align(...)` parser was deleted in
+  Phase 9.
 - Generated rendered-region Typst snippets still exist for the page-number-dependent context expression, but construction is now fallible and returns an error instead of panicking with `expect`.
 - Regression coverage includes rendered header text containing brackets, hashes, backslashes, quotes, and non-ASCII text, plus an assertion that alignment comes from the retained `AlignElem` wrapper.
-- The generated-snippet panic warning code has been retired from the fallback ledger. The source-string align parsing code remains active but partially replaced because contextual page-region closures do not expose their bodies as `Content`.
+- The generated-snippet panic warning code has been retired from the fallback
+  ledger. Phase 9 later kept the source-string align parser and added a separate
+  layout-alignment fallback entry because contextual page-region closures can
+  lack retained wrapper provenance.
 
-Tradeoff: rendered page-region extraction remains layout-dependent because contextual headers and footers can differ per page only after layout. This phase removes the panic path and makes content-tree wrapper analysis the first route, but keeps the source parser visible in the ledger for opaque context output; direct `ContextElem` construction and inserted/deleted rendered-only page instances remain later cleanup work.
+Tradeoff: rendered page-region extraction remains layout-dependent because
+contextual headers and footers can differ per page only after layout. This phase
+removed the panic path and made content-tree wrapper analysis the first route;
+Phase 9 later showed the source parser cannot be deleted safely until contextual
+wrapper provenance is retained. Direct `ContextElem` construction and
+inserted/deleted rendered-only page instances remain later cleanup work.
 
 ## Footnote And Equation Provenance In The Block Stream
 

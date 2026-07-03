@@ -891,40 +891,197 @@ Target design:
   for now, because direct `ContextElem` construction requires Typst closure
   internals and is not a low-risk deletion step.
 
+Progress:
+
+- Blocked: a deletion attempt removed source parsing and made structural wrapper
+  recovery inspect direct `AlignElem` plus recorded `ContextElem` output. Focused
+  rendered-region tests passed, but `tests/run_passing_corpus.sh` failed
+  `41-running-header-query` because the contextual running header lost its
+  right alignment.
+- Rejected: widening `rendered_region_layout_wrapper` from edge/center detection
+  to broad left-half/right-half classification made the corpus pass, but it was
+  a new geometry heuristic and violated the project rule against adding
+  fallbacks except as a last resort.
+- Restored: `rendered_region_source_wrapper`, `authored_align_wrapper`, and
+  `parse_align_call_alignment` remain for now. `FB-013` remains active.
+- Recorded: `rendered_region_layout_wrapper` is now explicitly tracked as
+  `FB-014` fallback debt. It should be retired with retained wrapper provenance,
+  not expanded.
+- Observed technical limit: current Typst context outputs often expose rendered
+  text rather than the authored wrapper body. The recorded-context route is not
+  enough for contextual running headers unless wrapper provenance is retained
+  separately.
+
 Implementation steps:
 
-1. Try structural wrapper extraction from:
+1. Partially done: try structural wrapper extraction from:
    - `page_region_content(new_source_styles, kind)`,
-   - recorded context output for the region span when available,
-   - existing retained semantic region content if present.
-2. Keep `rendered_region_layout_wrapper` as a layout fallback when no structural
-   wrapper exists.
-3. Delete:
+   - recorded context output for the region span when available.
+   Existing retained semantic region content remains unnecessary for rendered
+   fallback cases because semantic region diffs skip rendered-region fallback.
+2. Kept: `rendered_region_layout_wrapper` remains as an existing fallback when
+   no structural wrapper exists. Do not expand it.
+3. Blocked: delete:
    - `rendered_region_source_wrapper`
    - `authored_align_wrapper`
    - `parse_align_call_alignment`
-4. Remove `FB-013` warning code only if no source-string parser remains. If
-   layout alignment is still considered a fallback, record it separately and
-   accurately.
+4. Blocked: remove `FB-013` warning code. It cannot be retired until the source
+   parser is actually gone.
 
 Tests to add or update:
 
-- Header/footer with `align(right)[...]` preserves alignment via `AlignElem`.
-- Contextual header/footer with recorded output preserves wrapper if recording
-  exposes it.
-- Source text containing the word `align` inside ordinary text does not affect
-  wrapper detection.
-- Rendered layout alignment still works when no structural wrapper exists.
+- Covered: header/footer with `align(right)[...]` preserves alignment via
+  `AlignElem`.
+- Not yet covered as a passing replacement: contextual header/footer recorded
+  output is not currently sufficient for `41-running-header-query`; retaining
+  wrapper provenance is required.
+- Deferred: source text containing the word `align` inside ordinary text should
+  not affect wrapper detection once source parsing is deleted.
+- Covered: rendered layout alignment still works when no structural wrapper
+  exists.
 
 Exit criteria:
 
-- No production hits for the deleted source parser symbols.
-- No source text is inspected to infer rendered-region wrapper identity.
+- Not met: production still contains the source parser symbols.
+- Not met: source text is still inspected for contextual rendered-region wrapper
+  identity.
+- Not met without restored debt: passing corpus regresses when the parser is
+  removed without retained wrapper provenance.
+
+Actual LOC result: no valid reduction yet. The safe state keeps the old parser
+and records the remaining debt explicitly.
+
+Improvements not made:
+
+- Direct construction of contextual page-region content was not attempted.
+  Typst closure internals still make that a higher-risk change.
+- The source parser was not deleted because `41-running-header-query` still
+  depends on recovering `align(right, ...)` from a contextual closure.
+- The layout classifier was not expanded. It is fallback debt and now has its
+  own ledger entry.
+
+Further improvement opportunity:
+
+- A later context-recording phase could record both the evaluated output and
+  wrapper/provenance metadata for `ContextElem` page regions. That would reduce
+  reliance on rendered layout geometry without reintroducing source parsing.
+
+## Phase 10: Retain Rendered-Region Wrapper Provenance
+
+Clean abstractions to promote: `context_recording`, retained page-region wrapper
+metadata, `RenderedRegionWrapper`, and explicit unsupported rendered-region
+wrapper diagnostics.
+
+Problem today: rendered page-region wrapper recovery still has two fallbacks:
+
+- `FB-013`: source-string parsing of `align(...)` through
+  `rendered_region_source_wrapper`, `authored_align_wrapper`, and
+  `parse_align_call_alignment`.
+- `FB-014`: layout-geometry inference through `rendered_region_layout_wrapper`
+  and `rendered_region_page_layout_alignment`.
+
+Both are post-hoc guesses. Source parsing guesses wrapper structure from text
+that was available earlier as program structure. Layout classification guesses
+wrapper intent from rendered positions after layout. We should delete both, not
+choose one as the replacement for the other.
+
+Technical findings from the Phase 9 deletion attempt:
+
+- Direct `AlignElem` inspection works for ordinary page-region content such as
+  static `align(right)[...]` headers and footers.
+- A deletion attempt that used direct `AlignElem` inspection plus recorded
+  `ContextElem` output passed focused rendered-region tests but failed
+  `tests/run_passing_corpus.sh` at `41-running-header-query`.
+- `41-running-header-query` has `align(right, ...)` inside a contextual running
+  header closure. Current recorded context output exposes enough rendered text
+  for page-specific content, but not enough retained wrapper provenance to
+  reconstruct the authored right alignment.
+- Widening `rendered_region_layout_wrapper` from edge/center checks to broad
+  left-half/right-half classification made the corpus pass, but it was rejected
+  because it was a new layout heuristic, not retained provenance.
+- The existing layout classifier is itself debt. It should be removed after
+  retained wrapper provenance exists, not expanded.
+- Source parsing is also debt. It remains only because it is the current narrow
+  behavior-preserving bridge for contextual `align(...)` wrappers.
+
+Target design:
+
+- Page-region wrapper decisions come from retained provenance:
+  - direct structural page-region content (`AlignElem` and similar wrappers),
+  - recorded contextual page-region output plus wrapper metadata,
+  - or annotated page-style extraction that preserves wrapper identity.
+- `RenderedRegionWrapper` is selected before rendered text geometry is needed.
+- If wrapper provenance is unavailable, the result is an explicit unsupported
+  wrapper boundary or diagnostic, not source parsing and not geometry inference.
+- `FB-013` and `FB-014` are deleted from `FallbackCode` and the fallback ledger.
+
+Implementation steps:
+
+1. Extend context/page-region recording so a contextual page-region evaluation
+   records wrapper provenance alongside rendered content. This may be a new
+   small struct rather than plain `Content`, for example:
+
+   ```rust
+   struct RecordedContextOutput {
+       content: Content,
+       wrapper: Option<RenderedRegionWrapper>,
+   }
+   ```
+
+   The concrete type should avoid depending on `diff.rs` from
+   `context_recording`; if needed, store a small alignment enum locally and map
+   it to `RenderedRegionWrapper` in `diff.rs`.
+2. Capture direct wrapper provenance before contextual output is flattened. For
+   the known blocker, preserve `align(right, ...)` around the contextual running
+   header in `41-running-header-query`.
+3. Change rendered-region wrapper selection to consult:
+   - direct structural wrapper content,
+   - recorded contextual wrapper provenance,
+   - explicit unsupported wrapper result.
+4. Delete source-string parsing:
+   - `rendered_region_source_wrapper`
+   - `authored_align_wrapper`
+   - `parse_align_call_alignment`
+5. Delete layout-geometry wrapper inference:
+   - `rendered_region_layout_wrapper`
+   - `rendered_region_page_layout_alignment`
+6. Remove `FallbackCode::RenderedRegionSourceStringAlignParsing`,
+   `FallbackCode::RenderedRegionLayoutAlignmentFallback`, `FB-013`, and
+   `FB-014`.
+7. If any rendered-region case cannot provide wrapper provenance, make it
+   explicit in diagnostics/debug trace and document the unsupported boundary.
+
+Tests to add or update:
+
+- `41-running-header-query` passes without source parsing and without layout
+  alignment inference.
+- Contextual footer total-pages keeps centered alignment through retained
+  wrapper provenance.
+- Static `align(right)[...]` headers still preserve alignment via direct
+  `AlignElem`.
+- Source text containing `align(right)` as ordinary text does not influence
+  wrapper selection.
+- A page-region whose wrapper provenance is genuinely unavailable reports an
+  unsupported wrapper diagnostic instead of guessing from layout.
+- Fallback ledger check passes with no `FB-013` or `FB-014` entries.
+
+Exit criteria:
+
+- No production hits for `rendered_region_source_wrapper`,
+  `authored_align_wrapper`, `parse_align_call_alignment`,
+  `rendered_region_layout_wrapper`, or `rendered_region_page_layout_alignment`.
+- No production hits for `RenderedRegionSourceStringAlignParsing`,
+  `RenderedRegionLayoutAlignmentFallback`,
+  `FB-013-rendered-region-source-string-align-parsing`, or
+  `FB-014-rendered-region-layout-alignment-fallback`.
 - Passing-corpus gate passes.
+- `TECHNICAL-DECISIONS.md` records the retained wrapper provenance model and any
+  explicit unsupported boundary.
 
-Estimated net production LOC: -40 to -90.
+Estimated net production LOC: -70 to -160, depending on how much wrapper
+metadata is needed in `context_recording`.
 
-## Phase 10: Prune Debug, Ledger, And Docs
+## Phase 11: Prune Debug, Ledger, And Docs
 
 Purpose: remove documentation and diagnostics that only exist for deleted
 legacy paths.
@@ -956,6 +1113,7 @@ Steps:
    rg "collect_block_owner_claims|collect_equation_origin_block_claims|BlockOwnerClaim|EquationOriginBlockClaim" src docs tests
    rg "map_slot_parts|map_unique_partial_item_container|opaque_pre_surface" src docs tests
    rg "rendered_region_source_wrapper|authored_align_wrapper|parse_align_call_alignment" src docs tests
+   rg "rendered_region_layout_wrapper|rendered_region_page_layout_alignment|RenderedRegionLayoutAlignmentFallback" src docs tests
    rg "word_or_opaque_replacement_edits|patchable_surface_for_index" src docs tests
    ```
 
@@ -967,7 +1125,7 @@ Exit criteria:
 
 Estimated net production LOC: -150 to -250.
 
-## Phase 11: Retire FB-010 With Unsupported-Surface Diagnostics
+## Phase 12: Retire FB-010 With Unsupported-Surface Diagnostics
 
 Clean abstractions to promote: `DiffSelection`, `DiffSurfaceKind`,
 `DiffAreaKind`, and explicit unsupported-surface diagnostics.

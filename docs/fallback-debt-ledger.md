@@ -117,12 +117,25 @@ When a code is instrumented, default CLI execution should warn unless
 ## FB-013 Rendered-Region Source-String Align Parsing
 
 - Warning code: `FB-013-rendered-region-source-string-align-parsing`
-- Status: `partially-replaced`
+- Status: `active`
 - Current source sites: `src/diff.rs` `rendered_region_source_wrapper`.
-- Why this is a guess: content-tree `AlignElem` analysis now handles visible wrappers first, but opaque `ContextElem` closures can still hide an authored `align(...)` wrapper from the content tree.
-- User-visible risk: unusual source formatting or nested contextual wrappers can produce inaccurate rendered-region annotation.
+- Why this is a guess: when a contextual page-region expression hides its authored wrapper behind a `ContextElem`, the diff recovers `align(...)` by reading the source span instead of using retained wrapper provenance.
+- User-visible risk: ordinary source text or unusual formatting can be mistaken for wrapper structure.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/rendered-region-source-string-align-parsing`.
-- Tests: contextual page header/footer and rendered-region alignment tests.
-- Replacement abstraction: retained context-output wrapper provenance or direct content construction for rendered page-region contexts.
-- Removal criteria: contextual page-region wrapper decisions come from retained semantic/rendered provenance rather than source-string parsing.
+- Tests: contextual page header/footer and running-header corpus tests.
+- Replacement abstraction: retained page-region/context wrapper provenance from `context_recording` or annotated page-style extraction.
+- Removal criteria: rendered-region wrapper decisions come from retained structural wrapper provenance or explicit unsupported diagnostics, never source-string parsing.
+
+## FB-014 Rendered-Region Layout Alignment Fallback
+
+- Warning code: `FB-014-rendered-region-layout-alignment-fallback`
+- Status: `active`
+- Current source sites: `src/diff.rs` `rendered_region_layout_wrapper` and `rendered_region_page_layout_alignment`.
+- Why this is a guess: when no retained wrapper is available, the diff infers alignment from rendered text geometry after layout.
+- User-visible risk: page geometry, margins, or coincidental text placement can be mistaken for an authored wrapper.
+- Runtime warning behavior: not yet instrumented.
+- Debug/debug-trace event names: planned `fallback/rendered-region-layout-alignment-fallback`.
+- Tests: contextual footer total-pages and running-header corpus tests.
+- Replacement abstraction: retained page-region/context wrapper provenance that records the wrapper used to produce each rendered page-region instance.
+- Removal criteria: rendered-region wrappers are retained from semantic/context provenance, or missing wrapper provenance is reported as unsupported without geometry inference.
