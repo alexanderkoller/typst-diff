@@ -366,3 +366,27 @@ Tradeoff: the fix stays in token annotation because diffing already retained equ
 - General semantic-owner classification does not use this layouter-carrier predicate. Textual wrappers such as `pad` may also lower through custom layouter blocks, but their authored wrapper owners already retain textual patch surfaces and should keep word-level edits.
 
 Tradeoff: CeTZ changes are currently represented as whole opaque old/new visual replacements rather than word-level label edits. This uses retained Typst layout-carrier provenance and avoids renderer changes or source-structure guesses.
+
+## ContainerOps Owns Slot Mapping Decisions
+
+- The global `map_slot_parts` fallback has been removed. `map_container` now
+  either uses the selected container's `map_slots` implementation or returns an
+  empty mapping.
+- Container-specific mappers now choose slot paths and patch surfaces for list,
+  enum, terms, table, grid, stack, quote, figure, and wrapper containers.
+- The old global helper names for unique partial-item mapping, opaque pre-surface
+  grafting, nested-list detection, and unique wrapper recovery were deleted.
+- Three bridge behaviors remain active but narrowed and ledgered as
+  container-owned debt: FB-007 unique wrapper recovery, FB-008 single realized
+  item recovery by unique visible text after span provenance fails, and FB-009
+  pre-container patch surfaces for realized carriers with fewer leaf paths than
+  source slots.
+- Quote owners now claim their text-empty realized carrier directly in block
+  owner claim construction. A block quote's visible text lives inside the quote
+  body slot even when the layout carrier itself has empty `plain_text`.
+
+Tradeoff: this phase improves ownership boundaries but does not yet deliver the
+intended LOC reduction. The remaining FB-007/008/009 bridges are behaviorally
+required until Phase 8 retains block/slot/wrapper provenance during extraction,
+at which point these container-owned debt paths should be deleted rather than
+kept for their tests.

@@ -169,6 +169,29 @@ Problem today: `ContainerOps` names container-specific behavior, but the generic
 `map_slot_parts` tail can still invent mappings by leaf order, unique visible
 text, and opaque grafting. That means the old mapping model remains active.
 
+Progress:
+
+- Done: the global `map_slot_parts` tail is deleted. `map_container` no longer
+  invents a mapping after a container mapper declines.
+- Done: list, enum, terms, table, grid, stack, quote, figure, and wrapper
+  mapping decisions live in the corresponding `ContainerOps::map_slots`
+  implementations.
+- Done: the old helper names `map_unique_partial_item_container`,
+  `patch_surface_for_opaque_realization`, `graft_opaque_patch_surface`,
+  `opaque_pre_surface`, `has_nested_list_container`,
+  `unique_realized_wrapper_path`, and `collect_realized_wrapper_paths` are gone.
+- Done: quote owners now claim their text-empty realized carrier directly during
+  block-owner stream construction, so quote body changes remain slot edits.
+- Narrowed but not retired: `FB-007`, `FB-008`, and `FB-009` remain active under
+  container-owned helper names. Tests showed these are still required when block
+  extraction presents a single realized item, a text-empty wrapper carrier, or
+  fewer realized leaf paths than source slots. Removing them cleanly requires
+  the retained block/slot/wrapper provenance deferred to Phase 8.
+- Actual LOC result for this phase is not a reduction: the old global code was
+  deleted, but the behavior-preserving container-owned routes and ledger updates
+  are net-positive. The later reduction now depends more heavily on Phase 8
+  replacing the narrowed FB-007/008/009 bridges with retained provenance.
+
 Target design:
 
 - `ContainerOps::map_slots` is the only authority for a container's slot paths.

@@ -5436,6 +5436,17 @@ fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
 
 fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<BlockOwnerClaim<'a>>) {
     let blocks = owner_block_units(node);
+    if node.annotation.semantic_kind == Some(SemanticKind::Quote)
+        && !node.annotation.slots.is_empty()
+        && let Some(block) = blocks.first()
+    {
+        out.push(BlockOwnerClaim {
+            content: block.content.clone(),
+            owner: Some(node),
+            key: None,
+        });
+        return;
+    }
     if blocks.len() == 1 {
         let owner = if is_owned_diff_region(node)
             || has_equation_origins(node)
@@ -5540,6 +5551,9 @@ fn current_annotated_page_styles(blocks: &[DiffBlockEdit]) -> Styles {
 
 fn should_defer_invisible_owner_edit(block: &Content, owner: &AnnotatedContent) -> bool {
     if !block.plain_text().trim().is_empty() {
+        return false;
+    }
+    if owner.annotation.semantic_kind == Some(SemanticKind::Quote) {
         return false;
     }
     if !owner.annotation.slots.is_empty()

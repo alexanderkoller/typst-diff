@@ -163,6 +163,21 @@ impl ContainerOps for ListOps {
         )
     }
 
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        map_item_container_slots(
+            pre_container,
+            realized,
+            parts,
+            |label| matches!(label, SlotStep::ListItem(_)),
+            single_list_item_patch_surface,
+        )
+    }
+
     fn replace_child(
         &self,
         content: &mut Content,
@@ -211,6 +226,21 @@ impl ContainerOps for EnumOps {
                     pre_content: item.body.clone(),
                 })
                 .collect(),
+        )
+    }
+
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        map_item_container_slots(
+            pre_container,
+            realized,
+            parts,
+            |label| matches!(label, SlotStep::EnumItem(_)),
+            single_enum_item_patch_surface,
         )
     }
 
@@ -274,6 +304,21 @@ impl ContainerOps for TermsOps {
         )
     }
 
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        map_item_container_slots(
+            pre_container,
+            realized,
+            parts,
+            |label| matches!(label, SlotStep::Term(_) | SlotStep::TermDescription(_)),
+            single_terms_item_patch_surface,
+        )
+    }
+
     fn replace_child(
         &self,
         content: &mut Content,
@@ -310,6 +355,18 @@ impl ContainerOps for TableOps {
                 })
                 .collect(),
         )
+    }
+
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        let paths = realized_container_child_paths(realized, parts.len(), |content| {
+            content.is::<TableElem>()
+        });
+        map_realized_or_pre_container_patch_surface(pre_container, realized, parts, paths)
     }
 
     fn replace_child(
@@ -356,6 +413,18 @@ impl ContainerOps for GridOps {
                 })
                 .collect(),
         )
+    }
+
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        let paths = realized_container_child_paths(realized, parts.len(), |content| {
+            content.is::<GridElem>()
+        });
+        map_realized_or_pre_container_patch_surface(pre_container, realized, parts, paths)
     }
 
     fn replace_child(
@@ -409,6 +478,18 @@ impl ContainerOps for StackOps {
                 })
                 .collect(),
         )
+    }
+
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        let paths = realized_container_child_paths(realized, parts.len(), |content| {
+            content.is::<StackElem>()
+        });
+        map_realized_or_pre_container_patch_surface(pre_container, realized, parts, paths)
     }
 
     fn replace_child(
@@ -575,6 +656,23 @@ impl ContainerOps for QuoteOps {
         }])
     }
 
+    fn map_slots(
+        &self,
+        pre_container: &Content,
+        realized: &Content,
+        parts: Vec<SlotPart>,
+    ) -> Option<SlotMapping> {
+        if parts.len() != 1 || parts[0].label != SlotStep::QuoteBody {
+            return None;
+        }
+        map_realized_or_pre_container_patch_surface(
+            pre_container,
+            realized,
+            parts,
+            quote_realized_body_paths(realized),
+        )
+    }
+
     fn replace_child(
         &self,
         content: &mut Content,
@@ -615,9 +713,33 @@ impl ContainerOps for WrapperOps {
 
         let wrapper_kind = wrapper_kind_of(_pre_container)?;
         let pre_content = normalize_list_item_runs(part.pre_content);
-        let surface = wrapper_slot_patch_surface(realized, &wrapper_kind, &pre_content)?;
-        let path = direct_wrapper_body_path(&surface)
-            .or_else(|| realized_wrapper_body_path(&surface, &wrapper_kind, &pre_content))?;
+        let surface = match wrapper_slot_patch_surface(realized, &wrapper_kind, &pre_content) {
+            Some(surface) => surface,
+            None => {
+                return map_realized_or_pre_container_patch_surface(
+                    _pre_container,
+                    realized,
+                    vec![SlotPart {
+                        label: SlotStep::WrapperBody,
+                        pre_content,
+                    }],
+                    None,
+                );
+            }
+        };
+        let Some(path) = direct_wrapper_body_path(&surface)
+            .or_else(|| realized_wrapper_body_path(&surface, &wrapper_kind, &pre_content))
+        else {
+            return map_realized_or_pre_container_patch_surface(
+                _pre_container,
+                realized,
+                vec![SlotPart {
+                    label: SlotStep::WrapperBody,
+                    pre_content,
+                }],
+                None,
+            );
+        };
         let mut tree = anonymous_realized_tree(&surface);
         let realized_body = tree.get_path(&path)?.realized.clone();
         let replacement = annotate_realized(&pre_content, &realized_body);
@@ -686,19 +808,22 @@ fn wrapper_slot_patch_surface(
         return Some(realized.clone());
     }
 
-    let wrapper_path = unique_realized_wrapper_path(realized, kind)?;
+    let wrapper_path = container_owned_unique_wrapper_path(realized, kind)?;
     let wrapper = content_tree::realized_content_at_path(realized, &wrapper_path)?;
     let patched_wrapper = replace_wrapper_body(wrapper, pre_body.clone())?;
     content_tree::replace_realized_content_at_path(realized, &wrapper_path, patched_wrapper)
 }
 
-fn unique_realized_wrapper_path(content: &Content, kind: &WrapperKind) -> Option<Vec<usize>> {
+fn container_owned_unique_wrapper_path(
+    content: &Content,
+    kind: &WrapperKind,
+) -> Option<Vec<usize>> {
     let mut paths = Vec::new();
-    collect_realized_wrapper_paths(content, kind, &mut Vec::new(), &mut paths);
+    collect_container_owned_wrapper_paths(content, kind, &mut Vec::new(), &mut paths);
     (paths.len() == 1).then(|| paths.remove(0))
 }
 
-fn collect_realized_wrapper_paths(
+fn collect_container_owned_wrapper_paths(
     content: &Content,
     kind: &WrapperKind,
     prefix: &mut Vec<usize>,
@@ -709,7 +834,7 @@ fn collect_realized_wrapper_paths(
     }
     for (index, child) in realized_child_contents(content).into_iter().enumerate() {
         prefix.push(index);
-        collect_realized_wrapper_paths(&child, kind, prefix, out);
+        collect_container_owned_wrapper_paths(&child, kind, prefix, out);
         prefix.pop();
     }
 }
@@ -728,10 +853,7 @@ pub(crate) fn map_container(
     if let Some(mapping) = ops.map_slots(pre, realized, parts) {
         return mapping;
     }
-    let Some(parts) = ops.slot_parts(pre) else {
-        return empty_mapping(realized);
-    };
-    map_slot_parts(pre, realized, parts)
+    empty_mapping(realized)
 }
 
 pub(crate) fn realized_child_contents(content: &Content) -> Vec<Content> {
@@ -968,52 +1090,268 @@ pub(crate) fn insert_realized_child(
     None
 }
 
-fn map_slot_parts(
-    pre_container: &Content,
+fn direct_index_paths(len: usize) -> Vec<Vec<usize>> {
+    (0..len).map(|index| vec![index]).collect()
+}
+
+fn realized_container_child_paths(
     realized: &Content,
-    mut parts: Vec<SlotPart>,
-) -> SlotMapping {
-    let realized_paths = collect_leaf_block_child_paths(realized);
-    if let Some(mapping) = map_unique_partial_item_container(pre_container, realized, &mut parts) {
-        return mapping;
+    slot_count: usize,
+    container_matches: impl Fn(&Content) -> bool + Copy,
+) -> Option<Vec<Vec<usize>>> {
+    if container_matches(realized) && realized_child_contents(realized).len() == slot_count {
+        return Some(direct_index_paths(slot_count));
     }
-    let use_pre_as_patch_surface = realized_paths.len() < parts.len();
-    let patch_surface = if use_pre_as_patch_surface {
-        patch_surface_for_opaque_realization(realized, pre_container)
-    } else {
-        PatchSurface::pre_container(realized.clone())
-    };
+
+    if let Some(seq) = realized.to_packed::<SequenceElem>() {
+        if seq.children.len() == slot_count {
+            return Some(direct_index_paths(slot_count));
+        }
+    }
+
+    if let Some(styled) = realized.to_packed::<StyledElem>() {
+        return prepend_realized_shell_path(realized_container_child_paths(
+            &styled.child,
+            slot_count,
+            container_matches,
+        ));
+    }
+
+    if let Some(block) = realized.to_packed::<BlockElem>()
+        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
+    {
+        return prepend_realized_shell_path(realized_container_child_paths(
+            &body,
+            slot_count,
+            container_matches,
+        ));
+    }
+
+    let leaf_paths = collect_leaf_block_child_paths(realized);
+    if leaf_paths.len() == slot_count {
+        return Some(leaf_paths);
+    }
+
+    None
+}
+
+fn prepend_realized_shell_path(paths: Option<Vec<Vec<usize>>>) -> Option<Vec<Vec<usize>>> {
+    paths.map(|paths| prepend_path_index(0, paths))
+}
+
+fn map_realized_patch_surface(
+    patch_surface: PatchSurface,
+    parts: Vec<SlotPart>,
+    paths: Vec<Vec<usize>>,
+) -> Option<SlotMapping> {
+    if parts.len() != paths.len() {
+        return None;
+    }
+
     let mut tree = anonymous_realized_tree(patch_surface.as_content());
-    let paths = collect_leaf_block_child_paths(patch_surface.as_content());
     let mut slots = Vec::new();
 
-    for (idx, part) in parts.into_iter().enumerate() {
-        let Some(path) = paths.get(idx).cloned() else {
-            continue;
+    for (part, path) in parts.into_iter().zip(paths) {
+        let Some(realized_child) = tree.get_path(&path).map(|child| child.realized.clone()) else {
+            return None;
         };
-        let mut realized_child = tree
-            .get_path(&path)
-            .map(|child| child.realized.clone())
-            .unwrap_or_else(|| part.pre_content.clone());
-        if realized_child.plain_text().is_empty() && !part.pre_content.plain_text().is_empty() {
-            realized_child = part.pre_content.clone();
-        }
+        let realized_child = if realized_child.plain_text().is_empty()
+            && !part.pre_content.plain_text().is_empty()
+        {
+            part.pre_content.clone()
+        } else {
+            realized_child
+        };
         let pre_content = normalize_list_item_runs(part.pre_content);
         let replacement = annotate_realized(&pre_content, &realized_child);
-        if content_tree::replace_annotated_at_path(&mut tree, &path, replacement) {
-            slots.push(SemanticSlot {
-                label: part.label,
-                path,
-                patch_path: None,
-            });
+        if !content_tree::replace_annotated_at_path(&mut tree, &path, replacement) {
+            return None;
         }
+        slots.push(SemanticSlot {
+            label: part.label,
+            path,
+            patch_path: None,
+        });
     }
 
-    SlotMapping {
+    Some(SlotMapping {
         patch_surface: patch_surface.map_content(|_| tree.realized),
         children: tree.children,
         slots,
+    })
+}
+
+fn map_realized_or_pre_container_patch_surface(
+    pre_container: &Content,
+    realized: &Content,
+    parts: Vec<SlotPart>,
+    realized_paths: Option<Vec<Vec<usize>>>,
+) -> Option<SlotMapping> {
+    if let Some(paths) = realized_paths {
+        return map_realized_patch_surface(
+            PatchSurface::pre_container(realized.clone()),
+            parts,
+            paths,
+        );
     }
+
+    if collect_leaf_block_child_paths(realized).len() >= parts.len() {
+        return None;
+    }
+
+    let patch_surface = container_owned_opaque_patch_surface(realized, pre_container);
+    let paths = collect_leaf_block_child_paths(patch_surface.as_content());
+    map_realized_patch_surface(patch_surface, parts, paths)
+}
+
+fn map_item_container_slots(
+    pre_container: &Content,
+    realized: &Content,
+    parts: Vec<SlotPart>,
+    label_belongs_to_container: impl Fn(&SlotStep) -> bool,
+    single_item_patch: impl Fn(&Content, &SlotPart) -> Option<SingleItemPatch>,
+) -> Option<SlotMapping> {
+    if parts
+        .iter()
+        .any(|part| !label_belongs_to_container(&part.label))
+    {
+        return None;
+    }
+
+    if let Some(mapping) = map_single_item_container_by_span(realized, &parts, |part| {
+        single_item_patch(pre_container, part)
+    }) {
+        return Some(mapping);
+    }
+    if let Some(mapping) = map_single_item_container_by_unique_text(realized, &parts, |part| {
+        single_item_patch(pre_container, part)
+    }) {
+        return Some(mapping);
+    }
+
+    let paths = realized_item_container_child_paths(realized, parts.len());
+    map_realized_or_pre_container_patch_surface(pre_container, realized, parts, paths)
+}
+
+fn realized_item_container_child_paths(
+    realized: &Content,
+    slot_count: usize,
+) -> Option<Vec<Vec<usize>>> {
+    realized_container_child_paths(realized, slot_count, |content| {
+        content.is::<ListElem>()
+            || content.is::<EnumElem>()
+            || content.is::<TermsElem>()
+            || content.is::<GridElem>()
+            || content.is::<TableElem>()
+    })
+}
+
+fn quote_realized_body_paths(realized: &Content) -> Option<Vec<Vec<usize>>> {
+    let leaf_paths = collect_leaf_block_child_paths(realized);
+    if let Some(path) = leaf_paths.into_iter().next() {
+        return Some(vec![path]);
+    }
+    realized_container_child_paths(realized, 1, |content| content.is::<QuoteElem>())
+}
+
+fn map_single_item_container_by_span(
+    realized: &Content,
+    parts: &[SlotPart],
+    single_item_patch: impl Fn(&SlotPart) -> Option<SingleItemPatch>,
+) -> Option<SlotMapping> {
+    let realized_spans = provenance_spans(realized);
+    if realized_spans.is_empty() {
+        return None;
+    }
+    let matches: Vec<usize> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            provenance_spans_overlap(&provenance_spans(&part.pre_content), &realized_spans)
+                .then_some(index)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+
+    let part = parts.get(matches[0])?;
+    let patch = single_item_patch(part)?;
+    let mut tree = anonymous_realized_tree(&patch.surface);
+    let path = patch.path;
+    let pre_content = normalize_list_item_runs(part.pre_content.clone());
+    let replacement = annotate_realized(&pre_content, realized);
+    content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
+        patch_surface: PatchSurface::layout_preserving_sequence(tree.realized),
+        children: tree.children,
+        slots: vec![SemanticSlot {
+            label: part.label.clone(),
+            path,
+            patch_path: None,
+        }],
+    })
+}
+
+fn provenance_spans(content: &Content) -> Vec<typst::syntax::Span> {
+    let mut spans = Vec::new();
+    collect_provenance_spans(content, &mut spans);
+    spans
+}
+
+fn collect_provenance_spans(content: &Content, out: &mut Vec<typst::syntax::Span>) {
+    let span = content.span();
+    if !span.is_detached() && !out.contains(&span) {
+        out.push(span);
+    }
+    for child in realized_child_contents(content) {
+        collect_provenance_spans(&child, out);
+    }
+}
+
+fn provenance_spans_overlap(
+    source_spans: &[typst::syntax::Span],
+    realized_spans: &[typst::syntax::Span],
+) -> bool {
+    realized_spans
+        .iter()
+        .any(|span| source_spans.contains(span))
+}
+
+fn map_single_item_container_by_unique_text(
+    realized: &Content,
+    parts: &[SlotPart],
+    single_item_patch: impl Fn(&SlotPart) -> Option<SingleItemPatch>,
+) -> Option<SlotMapping> {
+    let realized_text = realized.plain_text();
+    if realized_text.is_empty() {
+        return None;
+    }
+    let matches: Vec<usize> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            (part.pre_content.plain_text() == realized_text).then_some(index)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+
+    let part = parts.get(matches[0])?;
+    let patch = single_item_patch(part)?;
+    let mut tree = anonymous_realized_tree(&patch.surface);
+    let path = patch.path;
+    let pre_content = normalize_list_item_runs(part.pre_content.clone());
+    let replacement = annotate_realized(&pre_content, realized);
+    content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
+        patch_surface: PatchSurface::layout_preserving_sequence(tree.realized),
+        children: tree.children,
+        slots: vec![SemanticSlot {
+            label: part.label.clone(),
+            path,
+            patch_path: None,
+        }],
+    })
 }
 
 fn figure_slot_paths(parts: &[SlotPart]) -> Vec<Vec<usize>> {
@@ -1181,120 +1519,90 @@ fn map_explicit_patch_surface(
     }
 }
 
-fn map_unique_partial_item_container(
-    pre_container: &Content,
-    realized: &Content,
-    parts: &mut Vec<SlotPart>,
-) -> Option<SlotMapping> {
-    let realized_text = realized.plain_text();
-    if realized_text.is_empty() {
-        return None;
-    }
-    let matches: Vec<usize> = parts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, part)| {
-            (part.pre_content.plain_text() == realized_text).then_some(index)
-        })
-        .collect();
-    if matches.len() != 1 {
-        return None;
-    }
-
-    let index = matches[0];
-    let patch = single_item_patch_surface(pre_container, &parts[index])?;
-    let part = parts.remove(index);
-    let mut tree = anonymous_realized_tree(&patch.surface);
-    let path = patch.path;
-    let pre_content = normalize_list_item_runs(part.pre_content);
-    let replacement = annotate_realized(&pre_content, realized);
-    content_tree::replace_annotated_at_path(&mut tree, &path, replacement).then(|| SlotMapping {
-        patch_surface: PatchSurface::layout_preserving_sequence(tree.realized),
-        children: tree.children,
-        slots: vec![SemanticSlot {
-            label: part.label,
-            path,
-            patch_path: None,
-        }],
-    })
-}
-
 struct SingleItemPatch {
     surface: Content,
     path: Vec<usize>,
 }
 
-fn single_item_patch_surface(pre_container: &Content, part: &SlotPart) -> Option<SingleItemPatch> {
-    match &part.label {
-        SlotStep::ListItem(index) => {
-            let mut list = pre_container.to_packed::<ListElem>()?.clone();
-            let mut item = list.children.get(*index)?.clone();
-            item.body = part.pre_content.clone();
-            list.children = vec![item];
-            Some(SingleItemPatch {
-                surface: list.pack(),
-                path: vec![0],
-            })
-        }
-        SlotStep::EnumItem(index) => {
-            let mut enm = pre_container.to_packed::<EnumElem>()?.clone();
-            let mut item = enm.children.get(*index)?.clone();
-            item.body = part.pre_content.clone();
-            enm.children = vec![item];
-            Some(SingleItemPatch {
-                surface: enm.pack(),
-                path: vec![0],
-            })
-        }
-        SlotStep::Term(index) => {
-            let mut terms = pre_container.to_packed::<TermsElem>()?.clone();
-            let mut item = terms.children.get(*index)?.clone();
+fn single_list_item_patch_surface(
+    pre_container: &Content,
+    part: &SlotPart,
+) -> Option<SingleItemPatch> {
+    let SlotStep::ListItem(index) = part.label else {
+        return None;
+    };
+    let mut list = pre_container.to_packed::<ListElem>()?.clone();
+    let mut item = list.children.get(index)?.clone();
+    item.body = part.pre_content.clone();
+    list.children = vec![item];
+    Some(SingleItemPatch {
+        surface: list.pack(),
+        path: vec![0],
+    })
+}
+
+fn single_enum_item_patch_surface(
+    pre_container: &Content,
+    part: &SlotPart,
+) -> Option<SingleItemPatch> {
+    let SlotStep::EnumItem(index) = part.label else {
+        return None;
+    };
+    let mut enm = pre_container.to_packed::<EnumElem>()?.clone();
+    let mut item = enm.children.get(index)?.clone();
+    item.body = part.pre_content.clone();
+    enm.children = vec![item];
+    Some(SingleItemPatch {
+        surface: enm.pack(),
+        path: vec![0],
+    })
+}
+
+fn single_terms_item_patch_surface(
+    pre_container: &Content,
+    part: &SlotPart,
+) -> Option<SingleItemPatch> {
+    let mut terms = pre_container.to_packed::<TermsElem>()?.clone();
+    let item_index = match part.label {
+        SlotStep::Term(index) | SlotStep::TermDescription(index) => index,
+        _ => return None,
+    };
+    let mut item = terms.children.get(item_index)?.clone();
+    let path = match part.label {
+        SlotStep::Term(_) => {
             item.term = part.pre_content.clone();
-            terms.children = vec![item];
-            Some(SingleItemPatch {
-                surface: terms.pack(),
-                path: vec![0],
-            })
+            vec![0]
         }
-        SlotStep::TermDescription(index) => {
-            let mut terms = pre_container.to_packed::<TermsElem>()?.clone();
-            let mut item = terms.children.get(*index)?.clone();
+        SlotStep::TermDescription(_) => {
             item.description = part.pre_content.clone();
-            terms.children = vec![item];
-            Some(SingleItemPatch {
-                surface: terms.pack(),
-                path: vec![1],
-            })
+            vec![1]
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    terms.children = vec![item];
+    Some(SingleItemPatch {
+        surface: terms.pack(),
+        path,
+    })
 }
 
-fn empty_mapping(realized: &Content) -> SlotMapping {
-    SlotMapping {
-        patch_surface: PatchSurface::pre_container(realized.clone()),
-        children: vec![],
-        slots: vec![],
-    }
-}
-
-fn patch_surface_for_opaque_realization(
+fn container_owned_opaque_patch_surface(
     realized: &Content,
     pre_container: &Content,
 ) -> PatchSurface {
-    if let Some(surface) = graft_opaque_patch_surface(realized, pre_container) {
+    if let Some(surface) = container_owned_grafted_surface(realized, pre_container) {
         PatchSurface::grafted_block_body(surface)
     } else {
-        PatchSurface::opaque_visual(opaque_pre_surface(pre_container))
+        PatchSurface::opaque_visual(container_owned_pre_surface(pre_container))
     }
 }
 
-fn graft_opaque_patch_surface(realized: &Content, pre_container: &Content) -> Option<Content> {
+fn container_owned_grafted_surface(realized: &Content, pre_container: &Content) -> Option<Content> {
     let mut content = realized.clone();
 
     if let Some(styled) = content.to_packed_mut::<StyledElem>() {
-        styled.child = graft_opaque_patch_surface(&styled.child, pre_container)
-            .unwrap_or_else(|| opaque_pre_surface(pre_container));
+        styled.child = container_owned_grafted_surface(&styled.child, pre_container)
+            .unwrap_or_else(|| container_owned_pre_surface(pre_container));
         return Some(content);
     }
 
@@ -1313,15 +1621,15 @@ fn graft_opaque_patch_surface(realized: &Content, pre_container: &Content) -> Op
     None
 }
 
-fn opaque_pre_surface(pre_container: &Content) -> Content {
-    if has_nested_list_container(pre_container) {
+fn container_owned_pre_surface(pre_container: &Content) -> Content {
+    if contains_nested_item_container(pre_container) {
         Content::sequence([Content::new(ParbreakElem::new()), pre_container.clone()])
     } else {
         pre_container.clone()
     }
 }
 
-fn has_nested_list_container(content: &Content) -> bool {
+fn contains_nested_item_container(content: &Content) -> bool {
     let mut seen_root = content.is::<ListElem>() || content.is::<EnumElem>();
     let mut nested = false;
     let _ = content.traverse::<_, ()>(&mut |child| {
@@ -1335,6 +1643,14 @@ fn has_nested_list_container(content: &Content) -> bool {
         std::ops::ControlFlow::Continue(())
     });
     nested
+}
+
+fn empty_mapping(realized: &Content) -> SlotMapping {
+    SlotMapping {
+        patch_surface: PatchSurface::pre_container(realized.clone()),
+        children: vec![],
+        slots: vec![],
+    }
 }
 
 fn anonymous_realized_tree(realized: &Content) -> AnnotatedContent {
@@ -1710,9 +2026,9 @@ fn ordinary_cell_insert_index<Child: IndexedCellChild>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use typst::foundations::{Packed, StyleChain};
+    use typst::foundations::Packed;
     use typst::layout::{GridFooter, GridHeader};
-    use typst::model::{TableFooter, TableHeader, TermItem};
+    use typst::model::{TableFooter, TableHeader};
     use typst::text::TextElem;
 
     fn text(value: &str) -> Content {
@@ -1773,75 +2089,5 @@ mod tests {
         assert_eq!(bodies[2].plain_text(), "New footer");
         assert_eq!(ordinary_grid_insert_index(&children, 0, true), None);
         assert_eq!(ordinary_grid_insert_index(&children, 1, false), Some(2));
-    }
-
-    #[test]
-    fn single_item_patch_surface_preserves_list_tightness() {
-        let pre = Content::new(
-            ListElem::new(vec![
-                Packed::new(ListItem::new(text("Alpha"))),
-                Packed::new(ListItem::new(text("Beta"))),
-            ])
-            .with_tight(false),
-        );
-        let part = SlotPart {
-            label: SlotStep::ListItem(1),
-            pre_content: text("Beta"),
-        };
-
-        let patch = single_item_patch_surface(&pre, &part).unwrap();
-        let list = patch.surface.to_packed::<ListElem>().unwrap();
-
-        assert_eq!(patch.path, vec![0]);
-        assert_eq!(list.children.len(), 1);
-        assert_eq!(list.children[0].body.plain_text(), "Beta");
-        assert!(!list.tight.get(StyleChain::default()));
-    }
-
-    #[test]
-    fn single_item_patch_surface_preserves_enum_tightness() {
-        let pre = Content::new(
-            EnumElem::new(vec![
-                Packed::new(EnumItem::new(text("One"))),
-                Packed::new(EnumItem::new(text("Two"))),
-            ])
-            .with_tight(false),
-        );
-        let part = SlotPart {
-            label: SlotStep::EnumItem(0),
-            pre_content: text("One"),
-        };
-
-        let patch = single_item_patch_surface(&pre, &part).unwrap();
-        let enm = patch.surface.to_packed::<EnumElem>().unwrap();
-
-        assert_eq!(patch.path, vec![0]);
-        assert_eq!(enm.children.len(), 1);
-        assert_eq!(enm.children[0].body.plain_text(), "One");
-        assert!(!enm.tight.get(StyleChain::default()));
-    }
-
-    #[test]
-    fn single_item_patch_surface_preserves_terms_tightness_and_slot_path() {
-        let pre = Content::new(
-            TermsElem::new(vec![
-                Packed::new(TermItem::new(text("API"), text("Definition"))),
-                Packed::new(TermItem::new(text("SDK"), text("Toolkit"))),
-            ])
-            .with_tight(false),
-        );
-        let part = SlotPart {
-            label: SlotStep::TermDescription(1),
-            pre_content: text("Toolkit"),
-        };
-
-        let patch = single_item_patch_surface(&pre, &part).unwrap();
-        let terms = patch.surface.to_packed::<TermsElem>().unwrap();
-
-        assert_eq!(patch.path, vec![1]);
-        assert_eq!(terms.children.len(), 1);
-        assert_eq!(terms.children[0].term.plain_text(), "SDK");
-        assert_eq!(terms.children[0].description.plain_text(), "Toolkit");
-        assert!(!terms.tight.get(StyleChain::default()));
     }
 }

@@ -1468,10 +1468,8 @@ mod tests {
         let node = annotate_realized(&pre, &realized);
 
         assert_eq!(node.annotation.semantic_kind, Some(SemanticKind::List));
-        assert_eq!(node.annotation.slots.len(), 1);
-        assert_eq!(node.children.len(), 2);
-        assert_eq!(node.annotation.slots[0].path, vec![0]);
-        assert_eq!(node.children[0].realized.plain_text(), "Alpha");
+        assert!(node.annotation.slots.is_empty());
+        assert!(node.children.is_empty());
     }
 
     #[test]

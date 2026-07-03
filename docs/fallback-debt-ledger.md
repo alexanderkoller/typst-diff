@@ -53,40 +53,40 @@ When a code is instrumented, default CLI execution should warn unless
 
 - Warning code: `FB-007-unique-wrapper-body-recovery`
 - Status: `active`
-- Current source sites: `src/container_ops.rs` `unique_realized_wrapper_path`.
-- Why this is a guess: wrapper body recovery uses uniqueness in the realized subtree when direct paths are absent.
-- User-visible risk: repeated wrappers with identical text can map to the wrong body.
+- Current source sites: `src/container_ops.rs` `container_owned_unique_wrapper_path`.
+- Why this is a guess: when direct wrapper-body paths and body-text wrapper paths are unavailable, wrapper mapping recovers a body through exactly one realized wrapper of the same kind.
+- User-visible risk: a wrapper edit can degrade to opaque replacement if retained wrapper provenance is absent and more than one same-kind wrapper exists.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/unique-wrapper-body-recovery`.
-- Tests: wrapper body edit tests and paragraph-split-inside-wrapper corpus case.
-- Replacement abstraction: `content_tree` path mapping with retained wrapper provenance.
-- Removal criteria: wrapper descendants are addressed by retained path or explicit unsupported mapping.
+- Tests: opaque wrapper, repeated wrapper, and show-wrapper context table integration tests.
+- Replacement abstraction: retained wrapper path provenance from annotated block extraction, deferred to Phase 8.
+- Removal criteria: wrapper descendants carry retained body paths, or ambiguous wrapper bodies report unsupported structure without unique-wrapper recovery.
 
 ## FB-008 Unique Partial Item Container Mapping
 
 - Warning code: `FB-008-unique-partial-item-container-mapping`
 - Status: `active`
-- Current source sites: `src/container_ops.rs` `map_unique_partial_item_container`.
-- Why this is a guess: partial item correspondence is recovered from a unique structural-looking match.
-- User-visible risk: list/terms edits can move into the wrong repeated item.
+- Current source sites: `src/container_ops.rs` `map_single_item_container_by_unique_text`.
+- Why this is a guess: when block extraction presents only one realized list/enum/terms item body and span provenance is absent, the mapper recovers the source slot by requiring exactly one source item with the same visible text.
+- User-visible risk: repeated equal item text remains unsupported by this route and can lose slot-level recursion instead of guessing.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/unique-partial-item-container-mapping`.
-- Tests: nested list, enum, and terms insertion/deletion tests.
-- Replacement abstraction: `edit_script` over explicit item IDs or stable slot paths.
-- Removal criteria: partial item edits use retained container slots or report unsupported structure.
+- Tests: list, enum, terms, and nested-list slot-recursion integration tests.
+- Replacement abstraction: retained block-to-slot provenance from annotated block extraction, deferred to Phase 8.
+- Removal criteria: single realized item blocks carry retained slot identity, or the block boundary reports unsupported structure without visible-text recovery.
 
 ## FB-009 Anonymous Opaque Pre-Surface Grafting
 
 - Warning code: `FB-009-anonymous-opaque-pre-surface-grafting`
-- Status: `partially-replaced`
-- Current source sites: opaque patch-surface selection in `src/container_ops.rs`.
-- Why this is a guess: opaque visual and grafted block-body patch surfaces are now named, but the carrier association can still depend on a recovered opaque realized surface rather than a retained owner/carrier ID.
-- User-visible risk: whole-surface visual replacement can obscure finer structural edits or attach to the wrong carrier.
+- Status: `active`
+- Current source sites: `src/container_ops.rs` `map_realized_or_pre_container_patch_surface` and `container_owned_opaque_patch_surface`.
+- Why this is a guess: when a realized block exposes fewer structural leaf paths than the source container slots, the mapper uses the pre container as a patch surface and grafts it into the realized wrapper if possible.
+- User-visible risk: a missing retained carrier/slot proof can preserve layout while still attaching the replacement surface to a broad realized wrapper.
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/anonymous-opaque-pre-surface-grafting`.
-- Tests: opaque graphic and figure body tests.
-- Replacement abstraction: `patch_surface::PatchSurface::OpaqueVisual` and `PatchSurface::GraftedBlockBody` with explicit carrier provenance from an attributed block stream.
-- Removal criteria: every opaque graft records its patch-surface variant and a retained owner/carrier proof, and remaining opaque-graft decisions are instrumented or removed.
+- Tests: list, nested-list, table, grid, boxed/shown table, and opaque-wrapper integration tests.
+- Replacement abstraction: retained block-to-slot and carrier provenance from annotated block extraction, deferred to Phase 8.
+- Removal criteria: container mappers receive proved patch-surface paths for single-block and opaque realized carriers, or report an explicit unsupported boundary.
 
 ## FB-010 Word-Diff-Or-Opaque Replacement Ladder
 
