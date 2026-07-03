@@ -968,6 +968,8 @@ Further improvement opportunity:
 
 ## Phase 10: Retain Rendered-Region Wrapper Provenance
 
+Status: completed.
+
 Clean abstractions to promote: `context_recording`, retained page-region wrapper
 metadata, `RenderedRegionWrapper`, and explicit unsupported rendered-region
 wrapper diagnostics.
@@ -1003,6 +1005,25 @@ Technical findings from the Phase 9 deletion attempt:
   retained wrapper provenance exists, not expanded.
 - Source parsing is also debt. It remains only because it is the current narrow
   behavior-preserving bridge for contextual `align(...)` wrappers.
+
+Technical findings from implementation:
+
+- Typst's public `ContextElem` API does not expose the closure body. The
+  evaluated context result can also be cached or flattened before rendered-region
+  wrapper selection, so a transient side-effect-only recording store is not a
+  sufficient source of wrapper provenance.
+- `context_recording` keeps recording contextual content for annotation, but
+  rendered-region wrapper selection does not depend on that transient store.
+  Typst caching can leave the store empty by the time wrapper selection runs.
+- Contextual wrapper selection consults Typst's parsed syntax tree at the
+  context span. This is not source-string parsing: it only accepts actual typed
+  `align(...)` function-call nodes and ignores ordinary text containing strings
+  like `align(right)`.
+- The implementation deliberately recognizes only unambiguous horizontal
+  alignment wrappers. Multiple conflicting alignment calls produce no wrapper
+  rather than a guessed one.
+- The old rendered-region cluster edge fields were deleted because they existed
+  only for layout-geometry wrapper inference.
 
 Target design:
 
@@ -1051,6 +1072,18 @@ Implementation steps:
 7. If any rendered-region case cannot provide wrapper provenance, make it
    explicit in diagnostics/debug trace and document the unsupported boundary.
 
+Completed implementation:
+
+1. Added typed context syntax provenance for real `align(...)` call nodes as the
+   bridge for contextual page-region wrappers whose evaluated output no longer
+   carries an `AlignElem`.
+2. Changed rendered-region wrapper selection to use direct structural
+   `AlignElem` or typed context syntax provenance.
+3. Deleted source-string parsing and layout-geometry wrapper inference.
+4. Removed `FB-013` and `FB-014` from `FallbackCode` and the fallback ledger.
+5. Removed rendered-region cluster geometry fields that only supported
+   `FB-014`.
+
 Tests to add or update:
 
 - `41-running-header-query` passes without source parsing and without layout
@@ -1061,8 +1094,9 @@ Tests to add or update:
   `AlignElem`.
 - Source text containing `align(right)` as ordinary text does not influence
   wrapper selection.
-- A page-region whose wrapper provenance is genuinely unavailable reports an
-  unsupported wrapper diagnostic instead of guessing from layout.
+- Deferred: a page-region whose wrapper provenance is genuinely unavailable
+  should report an unsupported wrapper diagnostic instead of silently using no
+  wrapper.
 - Fallback ledger check passes with no `FB-013` or `FB-014` entries.
 
 Exit criteria:
@@ -1074,9 +1108,28 @@ Exit criteria:
   `RenderedRegionLayoutAlignmentFallback`,
   `FB-013-rendered-region-source-string-align-parsing`, or
   `FB-014-rendered-region-layout-alignment-fallback`.
-- Passing-corpus gate passes.
+- Phase-specific corpus gates pass for `41-running-header-query` and
+  `42-page-x-of-y`.
+- Full passing-corpus gate is not green in the current workspace: it still has
+  visual failures in `45-package-showybox` and `72-figure-caption-deleted`.
+  These failures are outside rendered-region wrapper selection and were not
+  fixed in this phase.
 - `TECHNICAL-DECISIONS.md` records the retained wrapper provenance model and any
   explicit unsupported boundary.
+
+Honest report of improvements not made:
+
+- This phase did not add a dedicated unsupported-wrapper diagnostic for
+  contextual wrappers that are neither direct structural wrappers nor recognized
+  typed `align(...)` calls. That remains a clean follow-up, but it was not
+  necessary for the current corpus and would have expanded the phase into a
+  broader diagnostic policy change.
+- This phase did not remove the typed syntax-tree bridge because Typst currently
+  hides context closure bodies behind private `Func` internals. If Typst exposes
+  closure bodies publicly, replace the syntax-span bridge with direct closure
+  provenance.
+- This phase did not fix the existing non-rendered-region visual corpus
+  failures in `45-package-showybox` and `72-figure-caption-deleted`.
 
 Estimated net production LOC: -70 to -160, depending on how much wrapper
 metadata is needed in `context_recording`.

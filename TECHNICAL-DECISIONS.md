@@ -1,5 +1,81 @@
 # Technical Decisions
 
+## Corpus 72 Fixed By Retaining Figure Caption Display Surface
+
+- Deleted figure captions now retain the full `FigureCaption` slot surface
+  instead of only the authored caption body. This preserves Typst-generated
+  caption labels such as `Figure 1:` when the old caption is displayed inertly.
+- Caption replacement and insertion still unwrap `FigureCaption` wrappers when
+  writing back into a live `FigureElem` caption body. Deleted/struck caption
+  insertions stay inert and are appended to the figure body rather than becoming
+  a live new caption, which avoids renumbering as `Figure 2`.
+- During evaluation, realized `FigureCaption` nodes get a retained display
+  patch surface produced through Typst's own caption realization while the
+  converged introspector is available. This keeps counter/supplement text as
+  retained provenance instead of reconstructing labels later.
+
+Tradeoff: caption display realization now runs as a small post-annotation
+provenance pass. It uses Typst's existing `FigureCaption::realize` API and does
+not change normal rendering, but it does add one more retained-surface hook in
+`eval.rs`.
+
+## Corpus 45 Showybox Requires Source-Level Or Rendered-Body Strategy
+
+- `45-package-showybox` is not failing because a normal semantic block is being
+  misclassified. The realized `Content` tree contains the heading plus
+  text-empty package/internal contexts, counters, tags, and layout artifacts;
+  the visible showybox body text is only present in the final laid-out frame.
+- Context recording does not recover the authored showybox body. The surviving
+  realized context spans point into `@preview/showybox:2.0.4/lib/shadows.typ`,
+  not the user's `#showybox(...)[...]` calls, and the recorded context output is
+  still text-empty for block-diff purposes.
+- A log-only fix would be fake: the corpus reference expects the new showybox
+  layout with inline red/green word edits inside the boxes.
+- The clean fixes are either source-level package-call rewriting for calls whose
+  authored bodies survive in source but not in `Content`, or a first-class
+  rendered page-body text mechanism that can place/replace text at rendered
+  positions. Both are broader features and should not be smuggled in as an
+  unledgered local fallback.
+
+Tradeoff: this leaves corpus 45 unresolved for now, but avoids adding a
+package-name special case or a geometry/text overlay fallback without an explicit
+design phase.
+
+## Lean Phase 10 Removes Rendered-Region Wrapper Fallbacks
+
+- Rendered-region wrapper selection no longer parses source strings or infers
+  alignment from rendered geometry. `rendered_region_source_wrapper`,
+  `authored_align_wrapper`, `parse_align_call_alignment`,
+  `rendered_region_layout_wrapper`, and `rendered_region_page_layout_alignment`
+  were deleted.
+- `context_recording` now exposes typed context syntax provenance for
+  horizontal `align(...)` wrappers. `diff.rs` maps the local
+  `RecordedAlignment` enum to `RenderedRegionWrapper` so `context_recording`
+  does not depend on rendered-region diff types.
+- Typst does not expose a public `ContextElem` closure-body accessor, and
+  rendered context output can be cached or flattened before wrapper selection.
+  To handle that, context wrapper provenance comes from Typst's parsed syntax
+  tree at the context span. This is deliberately typed AST inspection: only an
+  actual `align(...)` function-call node contributes alignment provenance;
+  ordinary rendered/source text containing `align(right)` does not.
+- The old layout edge fields on rendered-region clusters were removed because
+  they only served the deleted layout classifier.
+- `FB-013` and `FB-014` were removed from `FallbackCode` and from the fallback
+  debt ledger. `41-running-header-query` and `42-page-x-of-y` now guard the
+  contextual right/center alignment cases without those fallbacks.
+
+Tradeoff: the retained provenance path is clean for known `align(...)` page
+region wrappers, but it still relies on Typst's parsed source AST because the
+public Typst API hides context closure bodies. This is materially cleaner than
+source-string parsing and layout guessing, but a future Typst API exposing
+closure bodies would let us remove the syntax-tree bridge too.
+
+Deferred improvement: add an explicit unsupported-wrapper diagnostic for
+contextual page-region wrappers that are neither direct structural wrappers nor
+recognized typed `align(...)` syntax. This was not needed to remove `FB-013` and
+`FB-014`, and broadening the phase into a general wrapper policy change would
+increase risk.
+
 ## Lean Phase 9 Exposes Rendered-Region Wrapper Provenance Debt
 
 - Attempting to delete rendered-region source parsing showed that direct

@@ -22,8 +22,6 @@ pub enum FallbackCode {
     AnonymousOpaquePreSurfaceGrafting,
     WordDiffOrOpaqueReplacementLadder,
     FootnoteMarkerMatchingByVisibleNumber,
-    RenderedRegionSourceStringAlignParsing,
-    RenderedRegionLayoutAlignmentFallback,
 }
 
 impl FallbackCode {
@@ -36,8 +34,6 @@ impl FallbackCode {
         Self::AnonymousOpaquePreSurfaceGrafting,
         Self::WordDiffOrOpaqueReplacementLadder,
         Self::FootnoteMarkerMatchingByVisibleNumber,
-        Self::RenderedRegionSourceStringAlignParsing,
-        Self::RenderedRegionLayoutAlignmentFallback,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -57,12 +53,6 @@ impl FallbackCode {
             }
             Self::FootnoteMarkerMatchingByVisibleNumber => {
                 "FB-012-footnote-marker-matching-by-visible-number"
-            }
-            Self::RenderedRegionSourceStringAlignParsing => {
-                "FB-013-rendered-region-source-string-align-parsing"
-            }
-            Self::RenderedRegionLayoutAlignmentFallback => {
-                "FB-014-rendered-region-layout-alignment-fallback"
             }
         }
     }
@@ -86,12 +76,6 @@ impl FallbackCode {
             }
             Self::FootnoteMarkerMatchingByVisibleNumber => {
                 "matched footnote marker/body by visible number"
-            }
-            Self::RenderedRegionSourceStringAlignParsing => {
-                "parsed rendered-region wrapper from source text"
-            }
-            Self::RenderedRegionLayoutAlignmentFallback => {
-                "inferred rendered-region wrapper from layout geometry"
             }
         }
     }

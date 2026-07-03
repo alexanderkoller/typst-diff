@@ -1371,6 +1371,10 @@ fn deleted_figure_caption_uses_inert_old_display_payload() {
     );
 
     assert!(rendered_text.contains(expected), "{rendered_text}");
+    assert!(
+        rendered_text.contains("Figure 1: Distribution of measurements"),
+        "deleted caption should keep the generated figure label: {rendered_text}"
+    );
     assert_eq!(
         rendered_text
             .matches("Distribution of measurements")
@@ -5383,7 +5387,7 @@ fn corpus_82_deleted_header_does_not_restyle_body_text() {
 
 #[test]
 fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
-    use typst_diff::diff::PageRegionKind;
+    use typst_diff::diff::{PageRegionKind, RenderedRegionAlignment, RenderedRegionWrapper};
 
     let old_world = corpus_world("42-page-x-of-y/old.typ");
     let new_world = corpus_world("42-page-x-of-y/new.typ");
@@ -5402,6 +5406,11 @@ fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
         footer.pages.len(),
         3,
         "expected every new footer instance to be renderable"
+    );
+    assert_eq!(
+        footer.wrapper,
+        RenderedRegionWrapper::Align(RenderedRegionAlignment::Center),
+        "contextual footer alignment should come from typed context provenance"
     );
 
     let log = result.modification_log();
@@ -5457,7 +5466,9 @@ fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
 
 #[test]
 fn corpus_41_contextual_header_style_change_is_rendered_region_edit() {
-    use typst_diff::diff::{PageRegionKind, WordOp};
+    use typst_diff::diff::{
+        PageRegionKind, RenderedRegionAlignment, RenderedRegionWrapper, WordOp,
+    };
 
     let old_world = corpus_world("41-running-header-query/old.typ");
     let new_world = corpus_world("41-running-header-query/new.typ");
@@ -5471,6 +5482,11 @@ fn corpus_41_contextual_header_style_change_is_rendered_region_edit() {
         .iter()
         .find(|region| region.kind == PageRegionKind::Header)
         .expect("expected contextual header rendered region edit");
+    assert_eq!(
+        header.wrapper,
+        RenderedRegionWrapper::Align(RenderedRegionAlignment::Right),
+        "contextual running header alignment should come from typed context provenance"
+    );
     let first_page = header
         .pages
         .iter()
@@ -5531,6 +5547,39 @@ fn corpus_41_contextual_header_style_change_is_rendered_region_edit() {
     assert!(
         green_header_text.contains("First Chapter"),
         "expected inserted page-1 running header in green: {header_runs:?}"
+    );
+}
+
+#[test]
+fn rendered_region_source_text_does_not_select_wrapper() {
+    use typst_diff::diff::{PageRegionKind, RenderedRegionWrapper};
+
+    let old_source = r#"#set page(header: context [align(right) #counter(page).final().first()])
+
+Body.
+"#;
+    let new_source = r#"#set page(header: context [align(right) #counter(page).final().first()])
+
+Body.
+#pagebreak()
+More body.
+"#;
+    let (_dir, old_world, new_world) = temp_worlds(old_source, new_source);
+    let old = typst_diff::eval_to_realized_content(&old_world).unwrap();
+    let new = typst_diff::eval_to_realized_content(&new_world).unwrap();
+    let result =
+        typst_diff::diff::diff_annotated_with_rendered_regions(&old, &new, &old_world, &new_world)
+            .unwrap();
+    let header = result
+        .rendered_regions
+        .iter()
+        .find(|region| region.kind == PageRegionKind::Header)
+        .expect("expected contextual header rendered region edit");
+
+    assert_eq!(
+        header.wrapper,
+        RenderedRegionWrapper::None,
+        "ordinary rendered text containing align(right) must not become wrapper provenance"
     );
 }
 

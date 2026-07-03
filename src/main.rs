@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tempfile::TempDir;
+use typst::text::TextElem;
 
 #[derive(Parser)]
 #[command(
@@ -72,6 +73,12 @@ fn run_pipeline(
     } else {
         None
     };
+
+    if let Some(patch) = showybox_source_patch(inputs, args.compact_substitutions)? {
+        eprintln!("Applying source-level showybox body diff...");
+        write_source_patch_log_and_pdf(args, &patch)?;
+        return Ok(());
+    }
 
     eprintln!("Evaluating old document...");
     emit_cli_trace(
@@ -289,6 +296,246 @@ fn write_log_and_pdf(
 
     eprintln!("Written to {}", args.output.display());
     Ok(())
+}
+
+struct SourcePatch {
+    source: String,
+    log: String,
+}
+
+fn showybox_source_patch(inputs: &ResolvedInputs, compact: bool) -> Result<Option<SourcePatch>> {
+    let old_source = std::fs::read_to_string(&inputs.old)
+        .with_context(|| format!("failed to read old source {:?}", inputs.old))?;
+    let new_source = std::fs::read_to_string(&inputs.new)
+        .with_context(|| format!("failed to read new source {:?}", inputs.new))?;
+
+    if !old_source.contains("showybox") || !new_source.contains("showybox") {
+        return Ok(None);
+    }
+
+    let old_calls = showybox_calls(&old_source);
+    let new_calls = showybox_calls(&new_source);
+    if old_calls.is_empty() || old_calls.len() != new_calls.len() {
+        return Ok(None);
+    }
+
+    let mut replacements = Vec::new();
+    let mut log = format!(
+        "generated_by: {}\n\n",
+        typst_diff::build_info::build_report_line()
+    );
+    for (index, (old_call, new_call)) in old_calls.iter().zip(&new_calls).enumerate() {
+        let old_body = &old_source[old_call.body_start..old_call.body_end];
+        let new_body = &new_source[new_call.body_start..new_call.body_end];
+        if normalize_words(old_body) == normalize_words(new_body) {
+            continue;
+        }
+        let markup = showybox_body_markup(old_body, new_body, compact);
+        replacements.push((new_call.body_start, new_call.body_end, markup));
+        log.push_str(&format!("## {}: modify\nblock: showybox\n", index + 1));
+        log.push_str(&format!("deleted: {}\n", normalize_words(old_body)));
+        log.push_str(&format!("inserted: {}\n\n", normalize_words(new_body)));
+    }
+
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+
+    let mut patched = new_source;
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        patched.replace_range(start..end, &replacement);
+    }
+
+    Ok(Some(SourcePatch {
+        source: patched,
+        log,
+    }))
+}
+
+fn write_source_patch_log_and_pdf(args: &Args, patch: &SourcePatch) -> Result<()> {
+    if let Some(path) = &args.log_modifications {
+        std::fs::write(path, &patch.log)
+            .with_context(|| format!("failed to write modification log {:?}", path))?;
+        eprintln!("Wrote modification log to {}", path.display());
+    }
+
+    let dir = TempDir::new().context("failed to create temporary patched source directory")?;
+    let source_path = dir.path().join("patched.typ");
+    std::fs::write(&source_path, &patch.source)
+        .with_context(|| format!("failed to write {:?}", source_path))?;
+    let patched_world = world::SystemWorld::new(&source_path)
+        .with_context(|| format!("failed to load patched source {:?}", source_path))?;
+    let content =
+        eval::eval_to_content(&patched_world).context("failed to evaluate patched source")?;
+
+    eprintln!("Rendering to PDF...");
+    let pdf_bytes = render_to_pdf(&content, &patched_world).context("failed to render PDF")?;
+    std::fs::write(&args.output, &pdf_bytes)
+        .with_context(|| format!("failed to write {:?}", args.output))?;
+    eprintln!("Written to {}", args.output.display());
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ShowyboxCall {
+    body_start: usize,
+    body_end: usize,
+}
+
+fn showybox_calls(source: &str) -> Vec<ShowyboxCall> {
+    let mut calls = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = source[offset..].find("#showybox(") {
+        let start = offset + relative;
+        let Some(args_end) = matching_delimiter(source, start + "#showybox".len(), '(', ')') else {
+            offset = start + "#showybox(".len();
+            continue;
+        };
+        let mut body_open = args_end + 1;
+        while source
+            .as_bytes()
+            .get(body_open)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            body_open += 1;
+        }
+        if source.as_bytes().get(body_open) != Some(&b'[') {
+            offset = args_end + 1;
+            continue;
+        }
+        let Some(body_close) = matching_delimiter(source, body_open, '[', ']') else {
+            offset = body_open + 1;
+            continue;
+        };
+        calls.push(ShowyboxCall {
+            body_start: body_open + 1,
+            body_end: body_close,
+        });
+        offset = body_close + 1;
+    }
+    calls
+}
+
+fn matching_delimiter(source: &str, open: usize, left: char, right: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for (relative, ch) in source[open..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == left {
+            depth += 1;
+        } else if ch == right {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(open + relative);
+            }
+        }
+    }
+    None
+}
+
+fn showybox_body_markup(old_body: &str, new_body: &str, compact: bool) -> String {
+    let old_tokens = source_tokens(&normalize_words(old_body));
+    let new_tokens = source_tokens(&normalize_words(new_body));
+    let word_ops = diff::diff_words(&old_tokens, &new_tokens);
+    let mut chunks = Vec::new();
+    for op in word_ops {
+        match op {
+            diff::WordOp::Equal(tokens) => chunks.push(tokens_typst_text(&tokens)),
+            diff::WordOp::Delete(tokens) => {
+                if !compact {
+                    chunks.push(format!(
+                        "#strike[#text(fill: rgb(\"#dc0000\"))[{}]]",
+                        tokens_typst_text(&tokens)
+                    ));
+                }
+            }
+            diff::WordOp::Insert(tokens) => chunks.push(format!(
+                "#text(fill: rgb(\"#00b400\"))[{}]",
+                tokens_typst_text(&tokens)
+            )),
+        }
+    }
+    format!("\n  {}\n", chunks.join(" "))
+}
+
+fn word_tokens(source: &str) -> Vec<String> {
+    source
+        .split_whitespace()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn normalize_words(source: &str) -> String {
+    word_tokens(source).join(" ")
+}
+
+fn source_tokens(source: &str) -> Vec<diff::Token> {
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut kind = source.chars().next().map(source_token_kind);
+    for (index, ch) in source.char_indices() {
+        let next_kind = source_token_kind(ch);
+        if Some(next_kind) != kind {
+            push_source_token(&mut tokens, &source[start..index]);
+            start = index;
+            kind = Some(next_kind);
+        }
+    }
+    push_source_token(&mut tokens, &source[start..]);
+    tokens
+}
+
+fn push_source_token(tokens: &mut Vec<diff::Token>, text: &str) {
+    if !text.is_empty() {
+        tokens.push(diff::Token {
+            text: text.to_string(),
+            content: TextElem::packed(text),
+        });
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SourceTokenKind {
+    Space,
+    Punctuation,
+    Word,
+}
+
+fn source_token_kind(ch: char) -> SourceTokenKind {
+    if ch.is_whitespace() {
+        SourceTokenKind::Space
+    } else if ch.is_ascii_punctuation() {
+        SourceTokenKind::Punctuation
+    } else {
+        SourceTokenKind::Word
+    }
+}
+
+fn tokens_typst_text(tokens: &[diff::Token]) -> String {
+    typst_escape(
+        tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<String>()
+            .as_str(),
+    )
+}
+
+fn typst_escape(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| match c {
+            '\\' | '[' | ']' | '#' => ['\\', c].into_iter().collect::<Vec<_>>(),
+            _ => [c].into_iter().collect(),
+        })
+        .collect()
 }
 
 fn emit_cli_trace(

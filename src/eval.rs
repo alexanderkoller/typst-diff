@@ -23,7 +23,7 @@ use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{Bytes, Content, Datetime, StyleChain, Target, TargetElem};
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PagebreakElem, PagedDocument};
-use typst::model::{DocumentInfo, FootnoteElem};
+use typst::model::{DocumentInfo, FigureCaption, FootnoteElem};
 use typst::routines::{Arenas, RealizationKind, Routines};
 use typst::syntax::{FileId, Source, VirtualPath};
 use typst::text::{Font, FontBook};
@@ -33,6 +33,7 @@ use typst_kit::fonts::{FontSearcher, FontSlot};
 
 use crate::diag::format_diagnostics;
 use crate::normalize::normalize_list_item_runs;
+use crate::patch_surface::PatchSurface;
 use crate::style_context;
 
 static DIFF_ROUTINES: LazyLock<Routines> = LazyLock::new(|| {
@@ -202,13 +203,70 @@ fn realize_and_annotate(
     pre_content: &Content,
 ) -> Result<crate::annotated::AnnotatedContent> {
     let introspector = layout_introspector(world, pre_content)?;
-    let realized_content = realize_to_content(world, pre_content, introspector)?;
+    let realized_content = realize_to_content(world, pre_content, introspector.clone())?;
     let mut annotated = crate::annotated::annotate_realized(pre_content, &realized_content);
+    annotate_figure_caption_displays(world, introspector, &mut annotated)?;
     crate::annotated::annotate_equation_origins(pre_content, &mut annotated);
     let footnotes = collect_footnotes(pre_content);
     let mut next = 0;
     crate::annotated::annotate_footnote_markers(&mut annotated, &footnotes, &mut next);
     Ok(annotated)
+}
+
+fn annotate_figure_caption_displays(
+    world: &dyn World,
+    introspector: Introspector,
+    annotated: &mut crate::annotated::AnnotatedContent,
+) -> Result<()> {
+    let library = world.library();
+    let target = TargetElem::target.set(Target::Paged).wrap();
+    let base = StyleChain::new(&library.styles);
+    let styles = base.chain(&target);
+
+    let traced = Traced::default();
+    let mut sink = Sink::new();
+    let mut engine = Engine {
+        routines: &DIFF_ROUTINES,
+        world: world.track(),
+        introspector: introspector.track(),
+        traced: traced.track(),
+        sink: sink.track_mut(),
+        route: Route::default(),
+    };
+
+    annotate_figure_caption_displays_with(&mut engine, styles, annotated).map_err(|errs| {
+        anyhow::anyhow!(
+            "figure caption display realization failed:\n{}",
+            format_diagnostics(world, &errs)
+        )
+    })?;
+
+    let delayed = sink.delayed();
+    if !delayed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "figure caption display realization errors:\n{}",
+            format_diagnostics(world, &delayed)
+        ));
+    }
+
+    Ok(())
+}
+
+fn annotate_figure_caption_displays_with(
+    engine: &mut Engine,
+    styles: StyleChain,
+    annotated: &mut crate::annotated::AnnotatedContent,
+) -> typst::diag::SourceResult<()> {
+    if let Some(caption) = annotated.realized.to_packed::<FigureCaption>() {
+        let display = caption.realize(engine, styles)?;
+        annotated.annotation.patch_surface = Some(PatchSurface::pre_container(display));
+    }
+
+    for child in &mut annotated.children {
+        annotate_figure_caption_displays_with(engine, styles, child)?;
+    }
+
+    Ok(())
 }
 
 /// Layout content to a finished paged document using Typst's normal convergence loop.

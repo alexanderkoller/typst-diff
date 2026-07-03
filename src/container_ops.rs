@@ -533,7 +533,7 @@ impl ContainerOps for FigureOps {
         if let Some(cap) = figure.caption.get_cloned(StyleChain::default()) {
             parts.push(SlotPart {
                 label: SlotStep::FigureCaption,
-                pre_content: cap.body.clone(),
+                pre_content: cap.pack(),
             });
         }
         Some(parts)
@@ -551,7 +551,12 @@ impl ContainerOps for FigureOps {
             return Some(());
         }
         if index == 1 {
-            figure.caption.as_option_mut().as_mut()?.as_mut()?.body = replacement;
+            if let Some(caption) = replacement.to_packed::<FigureCaption>() {
+                figure.caption.set(Some(caption.clone()));
+            } else {
+                figure.caption.as_option_mut().as_mut()?.as_mut()?.body =
+                    unwrap_figure_caption_payload(replacement);
+            }
             return Some(());
         }
         None
@@ -566,11 +571,11 @@ impl ContainerOps for FigureOps {
     ) -> Option<()> {
         let figure = content.to_packed_mut::<FigureElem>()?;
         if index == 0 && !before && figure.caption.get_cloned(StyleChain::default()).is_none() {
-            let insertion = unwrap_figure_caption_payload(insertion);
             if contains_strike(&insertion) {
                 figure.body = Content::sequence([figure.body.clone(), insertion]);
                 return Some(());
             }
+            let insertion = unwrap_figure_caption_payload(insertion);
             figure
                 .caption
                 .set(Some(Packed::new(FigureCaption::new(insertion))));
