@@ -59,7 +59,7 @@ When a code is instrumented, default CLI execution should warn unless
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/unique-wrapper-body-recovery`.
 - Tests: opaque wrapper, repeated wrapper, and show-wrapper context table integration tests.
-- Replacement abstraction: retained wrapper path provenance from annotated block extraction, deferred to Phase 8.
+- Replacement abstraction: retained wrapper path provenance from annotated block extraction, deferred to a later provenance cleanup.
 - Removal criteria: wrapper descendants carry retained body paths, or ambiguous wrapper bodies report unsupported structure without unique-wrapper recovery.
 
 ## FB-008 Unique Partial Item Container Mapping
@@ -72,7 +72,7 @@ When a code is instrumented, default CLI execution should warn unless
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/unique-partial-item-container-mapping`.
 - Tests: list, enum, terms, and nested-list slot-recursion integration tests.
-- Replacement abstraction: retained block-to-slot provenance from annotated block extraction, deferred to Phase 8.
+- Replacement abstraction: retained block-to-slot provenance from annotated block extraction, deferred to a later provenance cleanup.
 - Removal criteria: single realized item blocks carry retained slot identity, or the block boundary reports unsupported structure without visible-text recovery.
 
 ## FB-009 Anonymous Opaque Pre-Surface Grafting
@@ -85,20 +85,20 @@ When a code is instrumented, default CLI execution should warn unless
 - Runtime warning behavior: not yet instrumented.
 - Debug/debug-trace event names: planned `fallback/anonymous-opaque-pre-surface-grafting`.
 - Tests: list, nested-list, table, grid, boxed/shown table, and opaque-wrapper integration tests.
-- Replacement abstraction: retained block-to-slot and carrier provenance from annotated block extraction, deferred to Phase 8.
+- Replacement abstraction: retained block-to-slot and carrier provenance from annotated block extraction, deferred to a later provenance cleanup.
 - Removal criteria: container mappers receive proved patch-surface paths for single-block and opaque realized carriers, or report an explicit unsupported boundary.
 
 ## FB-010 Word-Diff-Or-Opaque Replacement Ladder
 
 - Warning code: `FB-010-word-diff-or-opaque-replacement-ladder`
 - Status: `partially-replaced`
-- Current source sites: `DiffSurfaceEdit` replacement selection in `src/diff.rs`.
-- Why this is a guess: the algorithm now records the selected surface kind, but unsupported-surface cases still use the legacy final word/opaque replacement warning after prior structural routes fail.
+- Current source sites: `DiffSelection` replacement selection in `src/diff.rs`.
+- Why this is a guess: the algorithm now records the selected area and surface kind, but unsupported-surface cases still use the legacy final word/opaque replacement warning after prior structural routes fail.
 - User-visible risk: structured changes can become misleading word edits or overly broad opaque frames.
 - Runtime warning behavior: emits by default when the final replacement ladder is selected; suppressed on stderr by `--quiet`.
 - Debug/debug-trace event names: `decision_event` with phase `diff/replace-block`.
 - Tests: low-similarity container, table/grid, raw block, and opaque visual tests; `cli_emits_fallback_warning_by_default_and_quiet_suppresses_stderr_only`; `cli_debug_trace_records_pipeline_events_without_frame_trace_for_normal_text`.
-- Replacement abstraction: `diff_surface` and `diff_area` with typed surface kinds and unsupported-surface diagnostics.
+- Replacement abstraction: `diff_surface::DiffSelection` and `diff_area` with typed surface kinds; unsupported-surface diagnostics are still pending.
 - Removal criteria: replacement kind is selected from an explicit diff surface and unsupported structured content is diagnosed without the legacy word-or-opaque fallback warning.
 
 ## FB-012 Footnote Marker Matching By Visible Number

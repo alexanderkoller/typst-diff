@@ -1,5 +1,71 @@
 # Technical Decisions
 
+## Lean Phase 8 Consolidates Diff Selection And Context Keys
+
+- Replacement-style decisions now use `diff_surface::DiffSelection<T>`, which
+  carries `DiffAreaKind`, `DiffSurfaceKind`, and the selected payload together.
+- Body-block replacements, equal-block presentation replacements,
+  semantic-page-region replacements, structured-container replacements, and
+  rendered-page-region word/segment diffs now share the same area+surface
+  vocabulary.
+- `diff.rs` no longer has the `word_or_opaque_replacement_edits` wrapper or
+  trace-only page-region `_area` locals. Callers consume `DiffSelection`
+  directly.
+- Block-context identity now lives in `content_key`: block context keys,
+  annotated block context keys, heading-context comparison, and block-context
+  classification moved out of `diff.rs`.
+- Raw-line, word-token, equation-token, non-token display, and opaque visual
+  behavior intentionally stayed unchanged in this phase.
+- `FB-010` is narrowed but not retired. The final body-block replacement ladder
+  still emits the warning after structural routes fail, but the chosen area and
+  surface are now explicit.
+
+Tradeoff: this phase is a boundary cleanup rather than a semantic cleanup. It
+adds a small amount of code in `diff_surface` and `content_key` while shrinking
+`diff.rs`; the larger deletion is deferred until unsupported replacement
+surfaces have a first-class diagnostic instead of the legacy word/opaque
+ladder.
+
+Deferred improvement: retire `FB-010` by splitting final replacement selection
+into explicit supported surfaces and explicit unsupported surfaces. Once all
+callers need area and surface together, `DiffSurfaceEdit<T>` can likely be
+folded into `DiffSelection<T>`.
+
+## Deferred FB-010 Retirement Requires A Policy Split
+
+- Retiring `FB-010` should be its own end-of-plan phase, not a hidden extension
+  of Phase 8. It is a user-visible semantic change because the current final
+  body-block replacement ladder still decides whether to produce broad word
+  edits, non-token display replacements, or opaque visual replacements after
+  structural routes fail.
+- Phase 8 made the prerequisite boundary clean: final replacement decisions now
+  have an explicit `DiffAreaKind` and `DiffSurfaceKind` through
+  `DiffSelection<T>`. That means future code can distinguish supported surfaces
+  from unsupported surfaces without reintroducing a monolithic
+  word-or-opaque wrapper.
+- The fallback remains real because selected surface does not itself answer the
+  policy question: if no trustworthy supported surface exists, should the diff
+  emit an unsupported diagnostic/no-op, or preserve the current broad visual/text
+  edit? That must be decided per surface family.
+- Supported surfaces should remain behavior-preserving unless tests prove they
+  are hacks: raw lines, word tokens, equation tokens, non-token display
+  containers, and proven opaque visual carriers all have existing corpus and
+  integration coverage.
+- Unsupported structured surfaces need a first-class diagnostic carrying the
+  area, surface/context, and old/new previews. Only after that exists should
+  `FallbackCode::WordDiffOrOpaqueReplacementLadder` and the `FB-010` ledger
+  entry be deleted.
+- `DiffSurfaceEdit<T>` is now only an implementation detail inside
+  `DiffSelection<T>`. Folding it away is attractive, but should wait until the
+  unsupported-surface result shape is known; otherwise we may churn the type
+  boundary twice.
+
+Tradeoff: postponing this phase leaves one active fallback warning in place, but
+keeps Phase 9 independent and avoids turning a boundary cleanup into a broad
+behavior change. The end-of-plan phase should produce the actual LOC reduction
+by deleting the warning code, the legacy final ladder behavior, and possibly the
+extra surface wrapper.
+
 ## Lean Phase 7 Moves Render Path Editing Into content_tree
 
 - Render-path replacement and insertion now delegate from `annotate.rs` to

@@ -56,7 +56,7 @@ use crate::content_key;
 use crate::content_tree;
 use crate::decision::{DecisionEvent, DecisionSink, FallbackCode, bounded_preview};
 use crate::diff_area::DiffAreaKind;
-use crate::diff_surface::{DiffSurfaceEdit, DiffSurfaceKind};
+use crate::diff_surface::{DiffSelection, DiffSurfaceKind};
 use crate::edit_script::{EditScriptMode, EditScriptOp, build_edit_script};
 use crate::style_context;
 use crate::trace::{
@@ -2626,7 +2626,8 @@ fn replace_block_edit(
         ));
     }
 
-    let surface = select_modified_fragment_surface(
+    let selection = select_modified_fragment(
+        DiffAreaKind::BodyBlock,
         &old_block.content,
         &new_block.content,
         old_ann,
@@ -2634,9 +2635,10 @@ fn replace_block_edit(
         old_equation_origins,
         new_equation_origins,
     );
-    let selected_surface_kind = surface.as_ref().map(|surface| surface.kind());
-    let edits = surface
-        .map(|surface| vec![RealizedEdit::WholeBlock(surface.into_content())])
+    let selected_area = selection.as_ref().map(|selection| selection.area());
+    let selected_surface_kind = selection.as_ref().map(|selection| selection.surface_kind());
+    let edits = selection
+        .map(|selection| vec![RealizedEdit::WholeBlock(selection.into_content())])
         .unwrap_or_default();
     let selected_edit_kind = edits.first().map(realized_edit_kind).unwrap_or("noop");
     emit_fallback_decision(
@@ -2657,7 +2659,9 @@ fn replace_block_edit(
         PipelineTraceEvent::new("diff/replace-block", "selected")
             .reason(format!(
                 "area={}; word diff or opaque fallback; surface={}",
-                DiffAreaKind::BodyBlock.trace_name(),
+                selected_area
+                    .map(DiffAreaKind::trace_name)
+                    .unwrap_or(DiffAreaKind::BodyBlock.trace_name()),
                 selected_surface_kind
                     .map(DiffSurfaceKind::trace_name)
                     .unwrap_or("unsupported")
@@ -2674,27 +2678,8 @@ fn replace_block_edit(
     })
 }
 
-fn word_or_opaque_replacement_edits(
-    old_block: &DiffBlock,
-    new_block: &DiffBlock,
-    old_ann: Option<&AnnotatedContent>,
-    new_ann: Option<&AnnotatedContent>,
-    old_equation_origins: &[Content],
-    new_equation_origins: &[Content],
-) -> Vec<RealizedEdit> {
-    select_modified_fragment_surface(
-        &old_block.content,
-        &new_block.content,
-        old_ann,
-        new_ann,
-        old_equation_origins,
-        new_equation_origins,
-    )
-    .map(|surface| vec![RealizedEdit::WholeBlock(surface.into_content())])
-    .unwrap_or_default()
-}
-
 fn modified_fragment_edit_content(
+    area: DiffAreaKind,
     old_content: &Content,
     new_content: &Content,
     old_ann: Option<&AnnotatedContent>,
@@ -2702,7 +2687,8 @@ fn modified_fragment_edit_content(
     old_equation_origins: &[Content],
     new_equation_origins: &[Content],
 ) -> Option<EditContent> {
-    select_modified_fragment_surface(
+    select_modified_fragment(
+        area,
         old_content,
         new_content,
         old_ann,
@@ -2710,19 +2696,20 @@ fn modified_fragment_edit_content(
         old_equation_origins,
         new_equation_origins,
     )
-    .map(DiffSurfaceEdit::into_content)
+    .map(DiffSelection::into_content)
 }
 
-fn select_modified_fragment_surface(
+fn select_modified_fragment(
+    area: DiffAreaKind,
     old_content: &Content,
     new_content: &Content,
     old_ann: Option<&AnnotatedContent>,
     new_ann: Option<&AnnotatedContent>,
     old_equation_origins: &[Content],
     new_equation_origins: &[Content],
-) -> Option<DiffSurfaceEdit<EditContent>> {
+) -> Option<DiffSelection<EditContent>> {
     if let Some(content) = raw_block_modified_content(old_content, new_content, old_ann, new_ann) {
-        return Some(DiffSurfaceEdit::new(DiffSurfaceKind::RawLines, content));
+        return Some(DiffSelection::new(area, DiffSurfaceKind::RawLines, content));
     }
 
     let (old_word_ann, new_word_ann) = balanced_word_annotations(old_ann, new_ann);
@@ -2756,7 +2743,8 @@ fn select_modified_fragment_surface(
             if contains_non_token_display_container_for(old_content, old_ann)
                 || contains_non_token_display_container_for(new_content, new_ann)
             {
-                DiffSurfaceEdit::new(
+                DiffSelection::new(
+                    area,
                     DiffSurfaceKind::NonTokenDisplay,
                     EditContent::OpaqueReplacement {
                         old: old_display_surface_for_annotated(old_content, old_ann),
@@ -2764,7 +2752,8 @@ fn select_modified_fragment_surface(
                     },
                 )
             } else {
-                DiffSurfaceEdit::new(
+                DiffSelection::new(
+                    area,
                     kind,
                     EditContent::Modified {
                         base: new_content.clone(),
@@ -2776,7 +2765,8 @@ fn select_modified_fragment_surface(
     }
 
     if opaque_visual_surface_changed(old_content, new_content, old_ann, new_ann) {
-        return Some(DiffSurfaceEdit::new(
+        return Some(DiffSelection::new(
+            area,
             DiffSurfaceKind::OpaqueVisual,
             EditContent::OpaqueReplacement {
                 old: old_opaque_display_surface(old_content, old_ann),
@@ -3094,8 +3084,8 @@ fn balanced_word_annotations<'a>(
     old_ann: Option<&'a AnnotatedContent>,
     new_ann: Option<&'a AnnotatedContent>,
 ) -> (Option<&'a AnnotatedContent>, Option<&'a AnnotatedContent>) {
-    let old_key = old_ann.and_then(|node| block_context_key(&node.realized));
-    let new_key = new_ann.and_then(|node| block_context_key(&node.realized));
+    let old_key = old_ann.and_then(|node| content_key::block_context_key(&node.realized));
+    let new_key = new_ann.and_then(|node| content_key::block_context_key(&node.realized));
     if old_ann.is_some() == new_ann.is_some() && old_key == new_key {
         (old_ann, new_ann)
     } else {
@@ -3316,111 +3306,16 @@ fn block_context_changed(
     new_ann: Option<&AnnotatedContent>,
 ) -> bool {
     match (
-        block_context_key_for(old, old_ann),
-        block_context_key_for(new, new_ann),
+        content_key::block_context_key_for(old, old_ann),
+        content_key::block_context_key_for(new, new_ann),
     ) {
         (Some(old_key), Some(new_key)) => old_key != new_key,
         _ => false,
     }
 }
 
-fn block_context_key_for(
-    content: &Content,
-    annotated: Option<&AnnotatedContent>,
-) -> Option<String> {
-    if annotated.is_some_and(|node| node.annotation.semantic_kind == Some(SemanticKind::Heading)) {
-        return Some(content_key::context_presentation_key(content).to_string());
-    }
-    annotated
-        .and_then(annotated_block_context_key)
-        .or_else(|| block_context_key(content))
-}
-
-fn annotated_block_context_key(node: &AnnotatedContent) -> Option<String> {
-    match node.annotation.semantic_kind {
-        Some(SemanticKind::Paragraph) => block_context_key(&node.realized),
-        Some(SemanticKind::Heading) => {
-            Some(content_key::context_presentation_key(&node.realized).to_string())
-        }
-        _ => None,
-    }
-}
-
-fn semantic_heading_context(
-    old_ann: Option<&AnnotatedContent>,
-    new_ann: Option<&AnnotatedContent>,
-) -> bool {
-    matches!(
-        (old_ann, new_ann),
-        (Some(old), Some(new))
-            if old.annotation.semantic_kind == Some(SemanticKind::Heading)
-                && new.annotation.semantic_kind == Some(SemanticKind::Heading)
-    )
-}
-
-fn block_context_key(content: &Content) -> Option<String> {
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return block_context_key(&styled.child);
-    }
-
-    if content.is::<ParElem>() {
-        return Some("par".to_string());
-    }
-
-    if let Some(heading) = content.to_packed::<HeadingElem>() {
-        return Some(format!(
-            "heading:level={:?}:depth={}:offset={}",
-            heading.level.get(StyleChain::default()),
-            heading.depth.get(StyleChain::default()).get(),
-            heading.offset.get(StyleChain::default())
-        ));
-    }
-
-    if let Some(block) = content.to_packed::<BlockElem>() {
-        return Some(format!(
-            "block:{:?}",
-            block
-                .body
-                .get_cloned(StyleChain::default())
-                .map(|body| match body {
-                    BlockBody::Content(_) => "content",
-                    _ => "other",
-                })
-        ));
-    }
-
-    if content.is::<TableElem>() {
-        return Some("table".to_string());
-    }
-
-    if content.is::<GridElem>() {
-        return Some("grid".to_string());
-    }
-
-    if content.is::<ListElem>() {
-        return Some("list".to_string());
-    }
-
-    if content.is::<EnumElem>() {
-        return Some("enum".to_string());
-    }
-
-    if content.is::<FigureElem>() {
-        return Some("figure".to_string());
-    }
-
-    None
-}
-
-fn is_block_context(content: &Content) -> bool {
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return is_block_context(&styled.child);
-    }
-    content.is::<BlockElem>()
-}
-
 fn is_empty_block_shell(content: &Content) -> bool {
-    content.plain_text().trim().is_empty() && is_block_context(content)
+    content.plain_text().trim().is_empty() && content_key::is_block_context(content)
 }
 
 fn presentation_changed(
@@ -3733,9 +3628,9 @@ fn diff_annotated_inner_with_events(
                         &new_block.content,
                         old_ann,
                         new_ann,
-                    ) || semantic_heading_context(old_ann, new_ann)
-                        || (is_block_context(&old_block.content)
-                            && is_block_context(&new_block.content)))
+                    ) || content_key::semantic_heading_context(old_ann, new_ann)
+                        || (content_key::is_block_context(&old_block.content)
+                            && content_key::is_block_context(&new_block.content)))
                         && replacement_has_word_change(
                             &old_block,
                             &new_block,
@@ -3764,19 +3659,31 @@ fn diff_annotated_inner_with_events(
                         ));
                         continue;
                     }
-                    let edits = word_or_opaque_replacement_edits(
-                        &old_block,
-                        &new_block,
+                    let selection = select_modified_fragment(
+                        DiffAreaKind::BodyBlock,
+                        &old_block.content,
+                        &new_block.content,
                         old_ann,
                         new_ann,
                         &old_eq_origins,
                         &new_eq_origins,
                     );
+                    let selected_surface_kind =
+                        selection.as_ref().map(|selection| selection.surface_kind());
+                    let edits = selection
+                        .map(|selection| vec![RealizedEdit::WholeBlock(selection.into_content())])
+                        .unwrap_or_default();
                     if !edits.is_empty() {
                         emit_pipeline_trace_event(
                             debug_events,
                             PipelineTraceEvent::new("diff/equal-block", "selected")
-                                .reason("presentation identity changed")
+                                .reason(format!(
+                                    "area={}; presentation identity changed; surface={}",
+                                    DiffAreaKind::BodyBlock.trace_name(),
+                                    selected_surface_kind
+                                        .map(DiffSurfaceKind::trace_name)
+                                        .unwrap_or("unsupported")
+                                ))
                                 .old_content(&old_block.content)
                                 .new_content(&new_block.content)
                                 .selected_edit_kind(
@@ -4291,7 +4198,6 @@ fn diff_page_region(
     old_content: Option<Content>,
     new_content: Option<Content>,
 ) -> Option<DiffRegionEdit> {
-    let _area = DiffAreaKind::SemanticPageRegion;
     match (old_content, new_content) {
         (None, None) => None,
         (None, Some(new_content)) => {
@@ -4339,6 +4245,7 @@ fn diff_region_edits(old: &AnnotatedContent, new: &AnnotatedContent) -> Vec<Real
     let old_effective = effective_text_content(old);
     let new_effective = effective_text_content(new);
     modified_fragment_edit_content(
+        DiffAreaKind::SemanticPageRegion,
         &old_effective,
         &new_effective,
         Some(old),
@@ -4443,7 +4350,6 @@ fn diff_rendered_region_texts(
     old_pages: &[RenderedRegionText],
     new_pages: &[RenderedRegionText],
 ) -> Option<RenderedRegionEdit> {
-    let _area = DiffAreaKind::RenderedPageRegion;
     let mut has_change = false;
     let pages = new_pages
         .iter()
@@ -4456,12 +4362,13 @@ fn diff_rendered_region_texts(
                 .unwrap_or_else(|| TextElem::packed(""));
             let old_tokens = extract_words(&old_content);
             let new_tokens = extract_words(&new_content);
-            let surface = DiffSurfaceEdit::new(
+            let selection = DiffSelection::new(
+                DiffAreaKind::RenderedPageRegion,
                 DiffSurfaceKind::RenderedRegionText,
                 diff_words(&old_tokens, &new_tokens),
             );
             let segments = diff_rendered_region_segments(old_page, new_page);
-            let word_ops = surface.into_content();
+            let word_ops = selection.into_content();
             let changed = old_pages.get(index).is_some() && has_textual_word_change(&word_ops);
             has_change |= changed;
             RenderedRegionPageEdit {
@@ -4502,13 +4409,14 @@ fn diff_rendered_region_segments(
         .map(|(old_cluster, new_cluster)| {
             let old_tokens = extract_words(&old_cluster.content);
             let new_tokens = extract_words(&new_cluster.content);
-            let surface = DiffSurfaceEdit::new(
+            let selection = DiffSelection::new(
+                DiffAreaKind::RenderedPageRegion,
                 DiffSurfaceKind::RenderedRegionSegment,
                 diff_words(&old_tokens, &new_tokens),
             );
             RenderedRegionSegmentEdit {
                 base: new_cluster.content.clone(),
-                word_ops: surface.into_content(),
+                word_ops: selection.into_content(),
             }
         })
         .collect()
@@ -5942,6 +5850,7 @@ fn owned_surface_modified_edit(
     }
 
     modified_fragment_edit_content(
+        DiffAreaKind::StructuredContainerRegion,
         &old_effective,
         &new_effective,
         Some(old_ann),
@@ -6215,6 +6124,7 @@ fn modified_edit_content(
     let old_effective = effective_text_content(old_child);
     let new_effective = effective_text_content(new_child);
     modified_fragment_edit_content(
+        DiffAreaKind::StructuredContainerRegion,
         &old_effective,
         &new_effective,
         Some(old_child),
@@ -6291,6 +6201,7 @@ fn footnote_visible_text_edits(
                     }
                     if let Some(path) = &new_unit.path {
                         if let Some(content) = modified_fragment_edit_content(
+                            DiffAreaKind::StructuredContainerRegion,
                             &old_unit.content,
                             &new_unit.content,
                             None,

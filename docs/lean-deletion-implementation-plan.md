@@ -773,51 +773,104 @@ Target design:
   keys.
 - Plain text remains a similarity input, not ownership identity.
 
+Progress:
+
+- Done: `diff_surface` now defines `DiffSelection<T>`, which carries
+  `DiffAreaKind`, `DiffSurfaceKind`, and the selected edit payload together.
+- Done: `select_modified_fragment_surface` was replaced by
+  `select_modified_fragment(area, ...)`, so body blocks, equal-block
+  presentation changes, semantic page-region replacements, slot/container
+  replacements, and rendered page-region word/segment diffs all use the same
+  area+surface vocabulary.
+- Done: `word_or_opaque_replacement_edits` was deleted. The two callers now
+  consume `DiffSelection<EditContent>` directly.
+- Done: local block-context key helpers moved into `content_key`:
+  `block_context_key_for`, `semantic_heading_context`, `block_context_key`, and
+  `is_block_context`. The private annotated-context helper lives there too.
+- Done: trace-only `_area` locals in semantic and rendered page-region code were
+  removed; area travels with the selection object instead.
+- Preserved: raw-line, word-token, equation-token, non-token display, and opaque
+  visual behavior was kept unchanged.
+- Verified: focused surface/key tests pass, `cargo check --all-targets` passes,
+  `cargo test --all-targets` passes, `tests/check_fallback_ledger.sh` passes,
+  and `tests/run_passing_corpus.sh` reports 99 passed and 0 failed.
+
 Implementation steps:
 
-1. Add `DiffSelection<T>` or extend `DiffSurfaceEdit<T>` to include
+1. Done: add `DiffSelection<T>` wrapping `DiffSurfaceEdit<T>` with
    `DiffAreaKind`.
-2. Replace `select_modified_fragment_surface` with a function that returns the
-   area+surface selection.
-3. Route these callers through the same selection function:
+2. Done: replace `select_modified_fragment_surface` with a function that
+   returns the area+surface selection.
+3. Done: route these callers through the same selection function:
    - block replacement fallback,
    - presentation-changed equal blocks,
    - `modified_fragment_edit_content`,
    - semantic page-region replacement,
    - rendered-region word/segment selection.
-4. Move local context-key helpers into `content_key`:
+4. Done: move local context-key helpers into `content_key`:
    - `block_context_key_for`
    - `annotated_block_context_key`
    - `semantic_heading_context` if it becomes key comparison
    - `block_context_key`
    - `is_block_context` if only used for context classification
-5. Delete:
+5. Done: delete:
    - `word_or_opaque_replacement_edits`
    - trace-only `_area` locals
    - duplicated wrapper functions that only unwrap `DiffSurfaceEdit`
    - remaining local context-key helpers after migration
-6. Keep the actual raw-line, word-token, equation-token, non-token display, and
+6. Done: keep the actual raw-line, word-token, equation-token, non-token display, and
    opaque visual behavior initially unchanged. This phase consolidates the
    decision boundary before changing semantics.
 
 Tests to add or update:
 
-- Same visible text with different presentation still selects the intended
+- Covered: same visible text with different presentation still selects the intended
   surface.
-- Raw block changes still select raw-line surface.
-- Equation-origin changes still select equation-token surface.
-- Semantic page-region text changes use the same selection path as body text.
-- Rendered-region segment changes record rendered-region surface kinds.
+- Covered: raw block changes still select raw-line surface.
+- Covered: equation-origin changes still select equation-token surface.
+- Covered: semantic page-region text changes use the same selection path as body
+  text.
+- Covered: rendered-region segment changes record rendered-region surface kinds.
 
 Exit criteria:
 
-- Replacement selection has one area+surface return path.
-- No production hits for `word_or_opaque_replacement_edits`.
-- Context-key logic lives in `content_key`.
-- `FB-010` is either retired or narrowed to explicit unsupported-surface cases.
-- Passing-corpus gate passes.
+- Met: replacement selection has one area+surface return path.
+- Met: no production hits for `word_or_opaque_replacement_edits`.
+- Met: context-key logic lives in `content_key`.
+- Partially met: `FB-010` is narrowed but not retired. The selected surface and
+  area are now explicit, but the final body-block replacement ladder still emits
+  the legacy warning when structural routes fail.
+- Met: passing-corpus gate passes.
 
-Estimated net production LOC: -150 to -300.
+Actual/estimated net production LOC: about +50 in touched production files.
+`diff.rs` shrank, but the new shared selection type and context-key home add
+code in `diff_surface.rs` and `content_key.rs`. The value of this phase is
+deleting a decision wrapper and consolidating the decision boundary; larger LOC
+reduction depends on a later phase retiring `FB-010` and its final replacement
+ladder.
+
+Improvements not made:
+
+- `FB-010` was not retired. Unsupported or low-confidence body-block
+  replacements still use the final word/opaque replacement ladder after
+  structural routes fail. Retiring it requires an explicit unsupported-surface
+  diagnostic and a policy for when not to produce an edit.
+- `DiffSurfaceEdit<T>` remains as the payload object inside `DiffSelection<T>`.
+  That keeps the patch small and avoids churn in tests and callers that only
+  care about surface payloads, but it means the old type name is still present
+  as an implementation detail.
+- Selection tracing for slot/container replacements is not yet as rich as
+  body-block tracing. The area is available on the selection object, but the
+  slot trace still reports the higher-level script decision rather than every
+  selected surface.
+
+Further improvement opportunity:
+
+- A future cleanup can split the final replacement ladder into explicit
+  supported surfaces and unsupported surfaces. That is the likely point where
+  `FB-010` can be retired instead of merely narrowed.
+- Once every selection consumer needs area+surface together, `DiffSurfaceEdit`
+  can probably be folded into `DiffSelection` to remove one more wrapper type.
 
 ## Phase 9: Delete Rendered-Region Source Parsing
 
@@ -913,6 +966,124 @@ Exit criteria:
 - Final production LOC is recorded.
 
 Estimated net production LOC: -150 to -250.
+
+## Phase 11: Retire FB-010 With Unsupported-Surface Diagnostics
+
+Clean abstractions to promote: `DiffSelection`, `DiffSurfaceKind`,
+`DiffAreaKind`, and explicit unsupported-surface diagnostics.
+
+Problem today: Phase 8 made final replacement selection area/surface typed, but
+the body-block fallback still uses the legacy word-or-opaque replacement ladder
+after structural routes fail. That means `FB-010` is narrowed but still active:
+the selected surface is explicit, but the policy for unsupported or
+low-confidence replacement surfaces is not.
+
+This phase is intentionally deferred until the end because it is a semantic
+policy change, not a mechanical follow-up to Phase 8. It can change user-visible
+diffs: some cases that currently get a broad word edit or opaque visual frame
+may need to become explicit unsupported/no-op diagnostics instead. It is not a
+dependency for rendered-region source parsing deletion in Phase 9.
+
+Technical notes from Phase 8:
+
+- `DiffSelection<T>` now gives every replacement-style decision a typed area and
+  surface. That removes the old excuse for a monolithic "word or opaque"
+  wrapper: callers can inspect the selected `DiffAreaKind` and
+  `DiffSurfaceKind` directly.
+- `FB-010` still fires only in the final body-block replacement path after
+  structural routes have failed. It is therefore narrower than before, but still
+  represents a real fallback.
+- The ladder still preserves important behavior for low-similarity container
+  replacements, opaque visuals, raw-line changes, equation-token changes, and
+  same-visible-text presentation changes. Do not delete it by returning no edits
+  globally.
+- Retiring `FB-010` requires a policy split:
+  - supported explicit surfaces keep producing edits,
+  - unsupported structured surfaces produce diagnostics or a deliberately
+    documented no-op boundary,
+  - opaque visual surfaces remain edits only when the old/new surfaces are
+    proven visual carriers or annotated owners known to be visual wrappers.
+- `DiffSurfaceEdit<T>` currently remains as an implementation detail inside
+  `DiffSelection<T>`. Once this phase makes all consumers area-aware, it may be
+  possible to fold `DiffSurfaceEdit<T>` into `DiffSelection<T>` and delete the
+  extra wrapper.
+- Slot/container selection already has an area on the selected value, but its
+  trace currently reports the higher-level script decision rather than every
+  selected surface. If unsupported-surface diagnostics apply inside slot
+  recursion, the trace should expose the exact area/surface there too.
+
+Target design:
+
+- Final replacement selection returns one of:
+  - a supported `DiffSelection<EditContent>`,
+  - an explicit unsupported-surface diagnostic carrying area, surface/context,
+    and old/new previews,
+  - no edit only when the no-op is intentional and documented.
+- `FB-010` warning code is removed from production code and the fallback ledger.
+- Broad word or opaque replacements are not used as a catch-all for structured
+  content whose surface is unknown.
+- Existing supported behavior remains covered:
+  - raw blocks select `RawLines`,
+  - equations select `EquationTokens`,
+  - ordinary text selects `WordTokens`,
+  - display/non-token containers select `NonTokenDisplay` when word tokens would
+    be misleading,
+  - proven visual carriers select `OpaqueVisual`.
+
+Implementation steps:
+
+1. Audit every current `FB-010`-triggering corpus or integration case and
+   classify it as supported surface vs. unsupported surface.
+2. Introduce an explicit unsupported replacement result, for example:
+
+   ```rust
+   enum ReplacementSelection<T> {
+       Supported(DiffSelection<T>),
+       Unsupported(UnsupportedSurface),
+       NoChange,
+   }
+   ```
+
+3. Move the final body-block replacement path from
+   `Option<DiffSelection<EditContent>>` to that explicit result.
+4. Keep supported raw-line, word-token, equation-token, non-token display, and
+   proven opaque visual edits behaviorally unchanged.
+5. For unsupported structured surfaces, emit a typed diagnostic/debug event
+   instead of falling through to a broad word/opaque replacement.
+6. Remove `FallbackCode::WordDiffOrOpaqueReplacementLadder`,
+   `FB-010-word-diff-or-opaque-replacement-ladder`, and its fallback-ledger
+   entry once no production path emits it.
+7. If all consumers now use area+surface together, fold `DiffSurfaceEdit<T>`
+   into `DiffSelection<T>` and delete the wrapper.
+
+Tests to add or update:
+
+- Low-similarity structured container replacement either remains a supported
+  explicit surface or produces an unsupported-surface diagnostic; it must not
+  silently become a misleading word edit.
+- Opaque graphic replacements still produce `OpaqueVisual` edits.
+- Raw block changes still produce raw-line edits.
+- Equation-token changes still produce equation-token edits.
+- Same-visible-text presentation changes still produce the intended explicit
+  surface.
+- Unsupported structured surfaces are observable in debug trace or diagnostics.
+- `cli_emits_fallback_warning_by_default_and_quiet_suppresses_stderr_only` and
+  related debug-trace tests are rewritten to assert the new diagnostic behavior,
+  not the retired warning code.
+
+Exit criteria:
+
+- No production hits for `WordDiffOrOpaqueReplacementLadder` or
+  `FB-010-word-diff-or-opaque-replacement-ladder`.
+- The fallback ledger no longer lists `FB-010`.
+- Unsupported replacement surfaces are explicit, tested, and documented.
+- Passing-corpus gate passes, with any intentional visual/log changes reviewed
+  as behavior changes rather than reference churn.
+- `TECHNICAL-DECISIONS.md` records the final supported/unsupported replacement
+  policy.
+
+Estimated net production LOC: -80 to -180 if `DiffSurfaceEdit<T>` can also be
+folded away; otherwise -40 to -100.
 
 ## Final Acceptance Gate
 

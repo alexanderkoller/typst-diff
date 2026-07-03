@@ -1,3 +1,5 @@
+use crate::diff_area::DiffAreaKind;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DiffSurfaceKind {
     WordTokens,
@@ -43,6 +45,33 @@ impl<T> DiffSurfaceEdit<T> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiffSelection<T> {
+    area: DiffAreaKind,
+    surface: DiffSurfaceEdit<T>,
+}
+
+impl<T> DiffSelection<T> {
+    pub(crate) fn new(area: DiffAreaKind, surface: DiffSurfaceKind, content: T) -> Self {
+        Self {
+            area,
+            surface: DiffSurfaceEdit::new(surface, content),
+        }
+    }
+
+    pub(crate) fn area(&self) -> DiffAreaKind {
+        self.area
+    }
+
+    pub(crate) fn surface_kind(&self) -> DiffSurfaceKind {
+        self.surface.kind()
+    }
+
+    pub(crate) fn into_content(self) -> T {
+        self.surface.into_content()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +84,18 @@ mod tests {
             DiffSurfaceKind::RenderedRegionSegment.trace_name(),
             "rendered_region_segment"
         );
+    }
+
+    #[test]
+    fn diff_selection_carries_area_and_surface() {
+        let selection = DiffSelection::new(
+            DiffAreaKind::BodyBlock,
+            DiffSurfaceKind::WordTokens,
+            "content",
+        );
+
+        assert_eq!(selection.area(), DiffAreaKind::BodyBlock);
+        assert_eq!(selection.surface_kind(), DiffSurfaceKind::WordTokens);
+        assert_eq!(selection.into_content(), "content");
     }
 }

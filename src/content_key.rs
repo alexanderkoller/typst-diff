@@ -1,15 +1,19 @@
 use std::hash::{Hash, Hasher};
 
 use typst::foundations::{Content, NativeElement, Repr, Style, StyleChain, StyledElem, Styles};
-use typst::layout::{BlockBody, BlockElem};
+use typst::layout::{BlockBody, BlockElem, GridElem};
 use typst::math::EquationElem;
-use typst::model::{EmphElem, HeadingElem, LinkElem, ParElem, StrongElem};
+use typst::model::{
+    EmphElem, EnumElem, FigureElem, HeadingElem, LinkElem, ListElem, ParElem, StrongElem, TableElem,
+};
 use typst::text::{
     HighlightElem, OverlineElem, RawElem, SpaceElem, StrikeElem, SubElem, SuperElem, TextElem,
     UnderlineElem,
 };
 
-use crate::annotated::{AnnotatedContent, effective_render_content, effective_text_content};
+use crate::annotated::{
+    AnnotatedContent, SemanticKind, effective_render_content, effective_text_content,
+};
 use crate::container_ops;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -39,6 +43,91 @@ pub(crate) fn context_presentation_key(content: &Content) -> ContentKey {
     ContentKey(out)
 }
 
+pub(crate) fn block_context_key_for(
+    content: &Content,
+    annotated: Option<&AnnotatedContent>,
+) -> Option<ContentKey> {
+    if annotated.is_some_and(|node| node.annotation.semantic_kind == Some(SemanticKind::Heading)) {
+        return Some(context_presentation_key(content));
+    }
+    annotated
+        .and_then(annotated_block_context_key)
+        .or_else(|| block_context_key(content))
+}
+
+pub(crate) fn semantic_heading_context(
+    old_ann: Option<&AnnotatedContent>,
+    new_ann: Option<&AnnotatedContent>,
+) -> bool {
+    matches!(
+        (old_ann, new_ann),
+        (Some(old), Some(new))
+            if old.annotation.semantic_kind == Some(SemanticKind::Heading)
+                && new.annotation.semantic_kind == Some(SemanticKind::Heading)
+    )
+}
+
+pub(crate) fn block_context_key(content: &Content) -> Option<ContentKey> {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return block_context_key(&styled.child);
+    }
+
+    if content.is::<ParElem>() {
+        return Some(ContentKey("par".to_string()));
+    }
+
+    if let Some(heading) = content.to_packed::<HeadingElem>() {
+        return Some(ContentKey(format!(
+            "heading:level={:?}:depth={}:offset={}",
+            heading.level.get(StyleChain::default()),
+            heading.depth.get(StyleChain::default()).get(),
+            heading.offset.get(StyleChain::default())
+        )));
+    }
+
+    if let Some(block) = content.to_packed::<BlockElem>() {
+        return Some(ContentKey(format!(
+            "block:{:?}",
+            block
+                .body
+                .get_cloned(StyleChain::default())
+                .map(|body| match body {
+                    BlockBody::Content(_) => "content",
+                    _ => "other",
+                })
+        )));
+    }
+
+    if content.is::<TableElem>() {
+        return Some(ContentKey("table".to_string()));
+    }
+
+    if content.is::<GridElem>() {
+        return Some(ContentKey("grid".to_string()));
+    }
+
+    if content.is::<ListElem>() {
+        return Some(ContentKey("list".to_string()));
+    }
+
+    if content.is::<EnumElem>() {
+        return Some(ContentKey("enum".to_string()));
+    }
+
+    if content.is::<FigureElem>() {
+        return Some(ContentKey("figure".to_string()));
+    }
+
+    None
+}
+
+pub(crate) fn is_block_context(content: &Content) -> bool {
+    if let Some(styled) = content.to_packed::<StyledElem>() {
+        return is_block_context(&styled.child);
+    }
+    content.is::<BlockElem>()
+}
+
 pub(crate) fn structural_child_key(child: &AnnotatedContent) -> ContentKey {
     ContentKey(format!(
         "{:?}:{}:{}",
@@ -58,6 +147,14 @@ pub(crate) fn slot_child_match_key(child: &AnnotatedContent) -> ContentKey {
 
 pub(crate) fn visible_unit_key(text: &str, content: &Content) -> ContentKey {
     ContentKey(format!("visible:{}:{}", text, presentation_key(content)))
+}
+
+fn annotated_block_context_key(node: &AnnotatedContent) -> Option<ContentKey> {
+    match node.annotation.semantic_kind {
+        Some(SemanticKind::Paragraph) => block_context_key(&node.realized),
+        Some(SemanticKind::Heading) => Some(context_presentation_key(&node.realized)),
+        _ => None,
+    }
 }
 
 pub(crate) fn normalized_visible_text_matches(left: &Content, right: &Content) -> bool {
