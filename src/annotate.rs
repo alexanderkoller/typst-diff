@@ -28,7 +28,6 @@ use typst::text::{LinebreakElem, RawLine, SpaceElem, StrikeElem, TextElem};
 use typst::visualize::{Color, Stroke};
 
 use crate::annotated::effective_render_content;
-use crate::container_ops;
 use crate::content_tree;
 #[cfg(test)]
 use crate::diff::BlockBaseProvenance;
@@ -537,7 +536,7 @@ fn build_annotated_content_from_tree_inner(
     )?;
 
     for (index, block) in result.blocks.iter().enumerate() {
-        let mut annotated_block = annotate_block_edit(block, compact_substitutions);
+        let mut annotated_block = annotate_block_edit(block, compact_substitutions, debug_events);
         apply_page_region_updates(
             &mut annotated_block.page_styles,
             &page_region_updates,
@@ -579,9 +578,13 @@ fn build_annotated_content_from_tree_inner(
     Ok(crate::normalize::normalize_list_item_runs(content))
 }
 
-fn annotate_block_edit(block: &DiffBlockEdit, compact: bool) -> DiffBlock {
+fn annotate_block_edit(
+    block: &DiffBlockEdit,
+    compact: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> DiffBlock {
     DiffBlock {
-        content: apply_edits_to_base(&block.base, &block.edits, compact),
+        content: apply_edits_to_base_inner(&block.base, &block.edits, compact, debug_events),
         page_styles: block.page_styles.clone(),
     }
 }
@@ -590,6 +593,16 @@ pub(crate) fn apply_edits_to_base(
     base: &crate::annotated::AnnotatedContent,
     edits: &[RealizedEdit],
     compact: bool,
+) -> Content {
+    let mut no_debug_events = None;
+    apply_edits_to_base_inner(base, edits, compact, &mut no_debug_events)
+}
+
+fn apply_edits_to_base_inner(
+    base: &crate::annotated::AnnotatedContent,
+    edits: &[RealizedEdit],
+    compact: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
 ) -> Content {
     let mut node = base.clone();
     let mut index = 0;
@@ -604,11 +617,11 @@ pub(crate) fn apply_edits_to_base(
                 end += 1;
             }
             for edit in edits[index..end].iter().rev() {
-                apply_realized_edit(&mut node, edit, compact);
+                apply_realized_edit(&mut node, edit, compact, debug_events);
             }
             index = end;
         } else {
-            apply_realized_edit(&mut node, &edits[index], compact);
+            apply_realized_edit(&mut node, &edits[index], compact, debug_events);
             index += 1;
         }
     }
@@ -853,25 +866,23 @@ fn insertion_anchor(edit: &RealizedEdit) -> Option<(bool, &[usize])> {
     }
 }
 
-enum PathEdit {
-    Replace(Content),
-    Insert { content: Content, before: bool },
-}
-
 fn apply_realized_edit(
     node: &mut crate::annotated::AnnotatedContent,
     edit: &RealizedEdit,
     compact: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
 ) {
     match edit {
         RealizedEdit::ReplaceAt { path, content } => {
-            let rendered = render_edit_content(content, compact);
+            let rendered = render_edit_content_inner(content, compact, debug_events);
             if let Some(patched) = replace_annotated_path_content(node, path, rendered.clone()) {
                 node.annotation.patch_surface = Some(if modified_is_pure_insert(content) {
                     PatchSurface::rendered_edit_surface(patched)
                 } else {
                     PatchSurface::rendered_edit_surface(strip_leading_parbreak(patched))
                 });
+            } else {
+                emit_path_edit_failure(debug_events, "replace", path);
             }
             if let Some(child) = node.get_path_mut(path) {
                 child.realized = rendered;
@@ -882,25 +893,29 @@ fn apply_realized_edit(
             if compact && is_deleted_edit_content(content) {
                 return;
             }
-            let rendered = render_edit_content(content, compact);
+            let rendered = render_edit_content_inner(content, compact, debug_events);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, true) {
                 node.annotation.patch_surface = Some(PatchSurface::rendered_edit_surface(patched));
+            } else {
+                emit_path_edit_failure(debug_events, "insert_before", anchor);
             }
         }
         RealizedEdit::InsertAfter { anchor, content } => {
             if compact && is_deleted_edit_content(content) {
                 return;
             }
-            let rendered = render_edit_content(content, compact);
+            let rendered = render_edit_content_inner(content, compact, debug_events);
             if let Some(patched) = insert_annotated_path_content(node, anchor, rendered, false) {
                 node.annotation.patch_surface = Some(PatchSurface::rendered_edit_surface(patched));
+            } else {
+                emit_path_edit_failure(debug_events, "insert_after", anchor);
             }
         }
         RealizedEdit::Append { content } => {
             if compact && is_deleted_edit_content(content) {
                 return;
             }
-            let rendered = render_edit_content(content, compact);
+            let rendered = render_edit_content_inner(content, compact, debug_events);
             let base = effective_render_content(node);
             node.annotation.patch_surface =
                 Some(PatchSurface::rendered_edit_surface(Content::sequence([
@@ -908,7 +923,7 @@ fn apply_realized_edit(
                 ])));
         }
         RealizedEdit::WholeBlock(content) => {
-            node.realized = render_edit_content(content, compact);
+            node.realized = render_edit_content_inner(content, compact, debug_events);
             node.annotation.patch_surface = None;
             node.children.clear();
         }
@@ -952,7 +967,11 @@ fn strip_leading_parbreak(content: Content) -> Content {
     content
 }
 
-fn render_edit_content(content: &EditContent, compact: bool) -> Content {
+fn render_edit_content_inner(
+    content: &EditContent,
+    compact: bool,
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> Content {
     match content {
         EditContent::Inserted(content) => {
             if content.plain_text().is_empty() {
@@ -977,9 +996,12 @@ fn render_edit_content(content: &EditContent, compact: bool) -> Content {
                 strip_page_styles(&rendered)
             }
         }
-        EditContent::Nested { base, edits } => {
-            strip_page_styles(&apply_edits_to_base(base, edits, compact))
-        }
+        EditContent::Nested { base, edits } => strip_page_styles(&apply_edits_to_base_inner(
+            base,
+            edits,
+            compact,
+            debug_events,
+        )),
     }
 }
 
@@ -1105,12 +1127,7 @@ fn replace_annotated_path_content(
     replacement: Content,
 ) -> Option<Content> {
     let path = patch_path_for_logical_path(node, path).unwrap_or_else(|| path.to_vec());
-    let path = path.as_slice();
-    let Some((index, _)) = path.split_first() else {
-        return apply_path_edit(render_surface(node), path, PathEdit::Replace(replacement));
-    };
-    let surface = patchable_surface_for_index(node, *index)?;
-    apply_path_edit(&surface, path, PathEdit::Replace(replacement))
+    content_tree::replace_realized_content_at_path(render_surface(node), &path, replacement)
 }
 
 fn patch_path_for_logical_path(
@@ -1130,38 +1147,7 @@ fn insert_annotated_path_content(
     insertion: Content,
     before: bool,
 ) -> Option<Content> {
-    apply_path_edit(
-        render_surface(node),
-        path,
-        PathEdit::Insert {
-            content: insertion,
-            before,
-        },
-    )
-}
-
-fn apply_path_edit(surface: &Content, path: &[usize], edit: PathEdit) -> Option<Content> {
-    let Some((index, rest)) = path.split_first() else {
-        return match edit {
-            PathEdit::Replace(content) => Some(content),
-            PathEdit::Insert { .. } => None,
-        };
-    };
-    if rest.is_empty() {
-        return match edit {
-            PathEdit::Replace(content) => {
-                container_ops::replace_realized_child(surface, *index, content)
-            }
-            PathEdit::Insert { content, before } => {
-                container_ops::insert_realized_child(surface, *index, content, before)
-            }
-        };
-    }
-    let surface_child = container_ops::realized_child_contents(surface)
-        .get(*index)
-        .cloned()?;
-    let patched_child = apply_path_edit(&surface_child, rest, edit)?;
-    container_ops::replace_realized_child(surface, *index, patched_child)
+    content_tree::insert_realized_content_at_path(render_surface(node), path, insertion, before)
 }
 
 fn render_surface(node: &crate::annotated::AnnotatedContent) -> &Content {
@@ -1172,25 +1158,25 @@ fn render_surface(node: &crate::annotated::AnnotatedContent) -> &Content {
         .unwrap_or(&node.realized)
 }
 
-fn patchable_surface_for_index(
-    node: &crate::annotated::AnnotatedContent,
-    index: usize,
-) -> Option<Content> {
-    let surface = render_surface(node);
-    if container_ops::realized_child_contents(surface)
-        .get(index)
-        .is_some()
-    {
-        return Some(surface.clone());
-    }
-    (index < node.children.len())
-        .then(|| Content::sequence(node.children.iter().map(effective_render_content)))
+fn emit_path_edit_failure(
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+    operation: &'static str,
+    path: &[usize],
+) {
+    let _ = emit_pipeline_trace_event(
+        debug_events,
+        PipelineTraceEvent::new("annotate/path-edit", "unresolved")
+            .reason(format!("operation={operation} path={path:?}"))
+            .selected_edit_kind(operation),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotated::{AnnotatedContent, Annotation, annotate_realized};
+    use crate::annotated::{
+        AnnotatedContent, Annotation, SemanticSlot, SlotStep, annotate_realized,
+    };
     use crate::diff::{
         DiffBlockEdit, DiffResult, EditContent, OldDisplaySurface, RealizedEdit, Token, WordOp,
     };
@@ -1324,30 +1310,51 @@ mod tests {
     }
 
     #[test]
-    fn apply_path_edit_replaces_and_inserts_list_children() {
-        let list = Content::new(ListElem::new(vec![
-            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
-            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
-        ]));
-
-        let replaced =
-            apply_path_edit(&list, &[1], PathEdit::Replace(TextElem::packed("Beta"))).unwrap();
-        let replaced_list = replaced.to_packed::<ListElem>().unwrap();
-        assert_eq!(replaced_list.children[1].body.plain_text(), "Beta");
-
-        let inserted = apply_path_edit(
-            &list,
-            &[1],
-            PathEdit::Insert {
-                content: TextElem::packed("Beta"),
-                before: true,
+    fn replace_at_uses_patch_path_surface() {
+        let base = AnnotatedContent {
+            realized: Content::sequence([TextElem::packed("Realized")]),
+            annotation: Annotation {
+                patch_surface: Some(PatchSurface::rendered_edit_surface(Content::sequence([
+                    TextElem::packed("Alpha "),
+                    TextElem::packed("Gamma"),
+                ]))),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::WrapperBody,
+                    path: vec![0],
+                    patch_path: Some(vec![1]),
+                }],
+                ..Annotation::default()
             },
-        )
-        .unwrap();
-        let inserted_list = inserted.to_packed::<ListElem>().unwrap();
-        assert_eq!(inserted_list.children.len(), 3);
-        assert_eq!(inserted_list.children[1].body.plain_text(), "Beta");
-        assert_eq!(inserted_list.children[2].body.plain_text(), "Gamma");
+            children: vec![annotated(TextElem::packed("Realized"))],
+        };
+
+        let rendered = apply_edits_to_base(
+            &base,
+            &replace_at(vec![0], EditContent::Inserted(TextElem::packed("Beta"))),
+            false,
+        );
+
+        assert_eq!(rendered.plain_text(), "Alpha Beta");
+    }
+
+    #[test]
+    fn missing_path_does_not_synthesize_child_sequence_surface() {
+        let base = AnnotatedContent {
+            realized: TextElem::packed("Surface"),
+            annotation: Annotation::default(),
+            children: vec![annotated(TextElem::packed("Child"))],
+        };
+
+        let rendered = apply_edits_to_base(
+            &base,
+            &replace_at(
+                vec![0],
+                EditContent::Inserted(TextElem::packed("Replacement")),
+            ),
+            false,
+        );
+
+        assert_eq!(rendered.plain_text(), "Surface");
     }
 
     #[test]

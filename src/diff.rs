@@ -45,7 +45,8 @@ use typst::visualize::{CircleElem, EllipseElem, RectElem};
 
 use crate::annotated::{
     AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind, annotate_realized,
-    effective_render_content, effective_text_content,
+    effective_render_content, effective_text_content, is_realized_equation_carrier,
+    realized_equation_carrier_count,
 };
 use crate::attributed_block_stream::{
     AttributedBlock, AttributedBlockClaim, AttributedBlockStream,
@@ -608,10 +609,6 @@ fn collect_tokens_with_equation_origins<'a>(
     } else {
         collect_tokens(content, out);
     }
-}
-
-fn is_realized_equation_carrier(content: &Content) -> bool {
-    content.is::<EquationElem>() || matches!(content.func().name(), "inline" | "display")
 }
 
 fn collect_semantic_child_tokens(content: &Content, out: &mut Vec<Token>) -> bool {
@@ -2332,9 +2329,8 @@ fn attributed_block_claims<'a>(
     let mut effective_owner_claims = Vec::new();
     collect_effective_table_owner_blocks(root, &mut effective_owner_claims);
     attach_semantic_owner_keys(&mut effective_owner_claims);
-
     let mut equation_claims = Vec::new();
-    collect_equation_attributed_blocks(root, &mut equation_claims);
+    collect_retained_equation_attributed_blocks(root, &mut equation_claims);
 
     let mut owner_index = 0;
     let mut equation_index = 0;
@@ -2357,11 +2353,15 @@ fn attributed_block_claims<'a>(
                 owner: owner_claim.owner,
                 fallback_owner: None,
                 owner_key: owner_claim.key,
-                equation_origins: take_equation_origin_claim(
-                    &equation_claims,
-                    &mut equation_index,
-                    &block.content,
-                ),
+                equation_origins: if owner_claim.equation_origins.is_empty() {
+                    take_retained_equation_origin_claim(
+                        &equation_claims,
+                        &mut equation_index,
+                        &block.content,
+                    )
+                } else {
+                    owner_claim.equation_origins
+                },
             }
         })
         .collect()
@@ -2382,6 +2382,7 @@ fn attributed_owner_match<'a>(
     BlockOwnerMatch {
         owner: block.owner(),
         key: block.cloned_owner_key(),
+        equation_origins: block.equation_origins().to_vec(),
     }
 }
 
@@ -3928,10 +3929,10 @@ fn diff_annotated_inner_with_events(
                 let new_attr = indexed_attributed_block(&new_stream, new_index);
                 let mut old_eq_origins = old_attr.equation_origins().to_vec();
                 let mut new_eq_origins = new_attr.equation_origins().to_vec();
-                if realized_equation_carrier_count_for_diff(&old_block.content) > 0 {
+                if realized_equation_carrier_count(&old_block.content) > 0 {
                     old_eq_origins.append(&mut deferred_old_equation_origins);
                 }
-                if realized_equation_carrier_count_for_diff(&new_block.content) > 0 {
+                if realized_equation_carrier_count(&new_block.content) > 0 {
                     new_eq_origins.append(&mut deferred_new_equation_origins);
                 }
                 let mut old_claim = attributed_owner_match(old_attr);
@@ -5318,6 +5319,7 @@ impl<'a> LayoutCursor<'a> {
 struct BlockOwnerMatch<'a> {
     owner: Option<&'a AnnotatedContent>,
     key: Option<SemanticOwnerKey>,
+    equation_origins: Vec<Content>,
 }
 
 fn take_block_owner_claim<'a>(
@@ -5331,6 +5333,7 @@ fn take_block_owner_claim<'a>(
             return BlockOwnerMatch {
                 owner: claim.claim.owner,
                 key: claim.claim.owner_key.clone(),
+                equation_origins: claim.claim.equation_origins.clone(),
             };
         }
         if claim.claim.owner.is_some_and(is_display_equation_owner) {
@@ -5344,10 +5347,24 @@ fn take_block_owner_claim<'a>(
     BlockOwnerMatch {
         owner: None,
         key: None,
+        equation_origins: Vec::new(),
     }
 }
 
-fn take_equation_origin_claim(
+fn retained_equation_origins(root: &AnnotatedContent) -> Vec<Content> {
+    fn collect(node: &AnnotatedContent, out: &mut Vec<Content>) {
+        out.extend(node.annotation.equation_origins.iter().cloned());
+        for child in &node.children {
+            collect(child, out);
+        }
+    }
+
+    let mut origins = Vec::new();
+    collect(root, &mut origins);
+    origins
+}
+
+fn take_retained_equation_origin_claim(
     claims: &[AttributedDiffBlock<'_>],
     index: &mut usize,
     target: &Content,
@@ -5367,84 +5384,57 @@ fn take_equation_origin_claim(
     Vec::new()
 }
 
-fn collect_equation_attributed_blocks(
+fn collect_retained_equation_attributed_blocks(
     node: &AnnotatedContent,
     out: &mut Vec<AttributedDiffBlock<'_>>,
 ) {
-    let subtree_origins = annotated_equation_origins(node);
-    if !subtree_origins.is_empty() {
+    let origins = retained_equation_origins(node);
+    if !origins.is_empty() {
         let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
-        if blocks.len() == 1 {
-            out.push(attributed_diff_block(
-                blocks[0].clone(),
-                None,
-                subtree_origins,
-            ));
-            return;
-        }
-
-        if node.children.is_empty() {
-            let mut origins = subtree_origins
-                .into_iter()
-                .collect::<std::collections::VecDeque<_>>();
-            for block in blocks {
-                let count =
-                    realized_equation_carrier_count_for_diff(&block.content).min(origins.len());
-                let block_origins = (0..count)
-                    .filter_map(|_| origins.pop_front())
-                    .collect::<Vec<_>>();
-                if !block_origins.is_empty() {
-                    out.push(attributed_diff_block(block, None, block_origins));
-                }
-            }
+        let origin_claims = equation_origin_claims_for_blocks(node, &blocks);
+        let claimed_any = origin_claims.iter().any(|claim| !claim.is_empty());
+        if claimed_any {
+            out.extend(
+                blocks
+                    .into_iter()
+                    .zip(origin_claims)
+                    .filter(|(_, origins)| !origins.is_empty())
+                    .map(|(block, origins)| attributed_diff_block(block, None, origins)),
+            );
             return;
         }
     }
 
     for child in &node.children {
-        collect_equation_attributed_blocks(child, out);
+        collect_retained_equation_attributed_blocks(child, out);
     }
 }
 
-fn annotated_equation_origins(root: &AnnotatedContent) -> Vec<Content> {
-    let mut origins = Vec::new();
-    collect_annotated_equation_origins(root, &mut origins);
-    origins
-}
-
-fn collect_annotated_equation_origins(node: &AnnotatedContent, out: &mut Vec<Content>) {
-    out.extend(node.annotation.equation_origins.iter().cloned());
-    for child in &node.children {
-        collect_annotated_equation_origins(child, out);
+fn equation_origin_claims_for_blocks(
+    node: &AnnotatedContent,
+    blocks: &[DiffBlock],
+) -> Vec<Vec<Content>> {
+    let origins = retained_equation_origins(node);
+    let block_count = blocks.len();
+    let mut claims = vec![Vec::new(); block_count];
+    if origins.is_empty() || block_count == 0 {
+        return claims;
     }
-}
-
-fn realized_equation_carrier_count_for_diff(content: &Content) -> usize {
-    if is_realized_equation_carrier(content) {
-        return 1;
+    if block_count == 1 {
+        claims[0] = origins;
+        return claims;
     }
-    if let Some(seq) = content.to_packed::<SequenceElem>() {
-        return seq
-            .children
-            .iter()
-            .map(realized_equation_carrier_count_for_diff)
-            .sum();
+    let mut origins = origins
+        .into_iter()
+        .collect::<std::collections::VecDeque<_>>();
+    for (claim, block) in claims.iter_mut().zip(blocks) {
+        let count = realized_equation_carrier_count(&block.content).min(origins.len());
+        claim.extend((0..count).filter_map(|_| origins.pop_front()));
+        if origins.is_empty() {
+            break;
+        }
     }
-    if let Some(styled) = content.to_packed::<StyledElem>() {
-        return realized_equation_carrier_count_for_diff(&styled.child);
-    }
-    if let Some(par) = content.to_packed::<ParElem>() {
-        return realized_equation_carrier_count_for_diff(&par.body);
-    }
-    if let Some(heading) = content.to_packed::<HeadingElem>() {
-        return realized_equation_carrier_count_for_diff(&heading.body);
-    }
-    if let Some(block) = content.to_packed::<BlockElem>()
-        && let Some(BlockBody::Content(body)) = block.body.get_cloned(StyleChain::default())
-    {
-        return realized_equation_carrier_count_for_diff(&body);
-    }
-    0
+    claims
 }
 
 fn attach_semantic_owner_keys(claims: &mut [AttributedDiffBlock<'_>]) {
@@ -5472,11 +5462,16 @@ fn collect_owner_attributed_blocks<'a>(
     out: &mut Vec<AttributedDiffBlock<'a>>,
 ) {
     let blocks = owner_block_units(node);
+    let equation_origins = equation_origin_claims_for_blocks(node, &blocks);
     if node.annotation.semantic_kind == Some(SemanticKind::Quote)
         && !node.annotation.slots.is_empty()
         && let Some(block) = blocks.first()
     {
-        out.push(attributed_diff_block(block.clone(), Some(node), Vec::new()));
+        out.push(attributed_diff_block(
+            block.clone(),
+            Some(node),
+            equation_origins.first().cloned().unwrap_or_default(),
+        ));
         return;
     }
     if let Some(owner) = direct_block_owner(node)
@@ -5485,7 +5480,8 @@ fn collect_owner_attributed_blocks<'a>(
         out.extend(
             blocks
                 .into_iter()
-                .map(|block| attributed_diff_block(block, Some(owner), Vec::new())),
+                .zip(equation_origins)
+                .map(|(block, origins)| attributed_diff_block(block, Some(owner), origins)),
         );
         return;
     }
@@ -5493,7 +5489,11 @@ fn collect_owner_attributed_blocks<'a>(
     if blocks.len() == 1 {
         let owner = unique_enclosed_diff_region_owner(node);
         if owner.is_some() || node.children.is_empty() {
-            out.push(attributed_diff_block(blocks[0].clone(), owner, Vec::new()));
+            out.push(attributed_diff_block(
+                blocks[0].clone(),
+                owner,
+                equation_origins.into_iter().next().unwrap_or_default(),
+            ));
             return;
         }
     }
@@ -5502,7 +5502,8 @@ fn collect_owner_attributed_blocks<'a>(
         out.extend(
             blocks
                 .into_iter()
-                .map(|block| attributed_diff_block(block, None, Vec::new())),
+                .zip(equation_origins)
+                .map(|(block, origins)| attributed_diff_block(block, None, origins)),
         );
     } else {
         for child in &node.children {
@@ -5594,6 +5595,7 @@ fn take_effective_owner_claim<'a>(
     Some(BlockOwnerMatch {
         owner: claim.claim.owner,
         key: claim.claim.owner_key.clone(),
+        equation_origins: claim.claim.equation_origins.clone(),
     })
 }
 

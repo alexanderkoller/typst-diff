@@ -19,7 +19,8 @@ use typst::layout::{
 };
 use typst::model::{
     EnumElem, EnumItem, FigureCaption, FigureElem, FootnoteBody, FootnoteElem, ListElem, ListItem,
-    ParElem, ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermsElem,
+    ParElem, ParbreakElem, QuoteElem, TableCell, TableChild, TableElem, TableItem, TermItem,
+    TermsElem,
 };
 use typst::text::StrikeElem;
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
@@ -184,6 +185,10 @@ impl ContainerOps for ListOps {
         index: usize,
         replacement: Content,
     ) -> Option<()> {
+        let replacement = replacement
+            .to_packed::<ListItem>()
+            .map(|item| item.body.clone())
+            .unwrap_or(replacement);
         content
             .to_packed_mut::<ListElem>()?
             .children
@@ -250,6 +255,10 @@ impl ContainerOps for EnumOps {
         index: usize,
         replacement: Content,
     ) -> Option<()> {
+        let replacement = replacement
+            .to_packed::<EnumItem>()
+            .map(|item| item.body.clone())
+            .unwrap_or(replacement);
         content
             .to_packed_mut::<EnumElem>()?
             .children
@@ -860,6 +869,15 @@ pub(crate) fn realized_child_contents(content: &Content) -> Vec<Content> {
     realized_child_contents_with_styles(content, &Styles::new())
 }
 
+fn transparent_body_child_contents(body: &Content, styles: &Styles) -> Vec<Content> {
+    let children = realized_child_contents_with_styles(body, styles);
+    if children.is_empty() {
+        vec![body.clone()]
+    } else {
+        children
+    }
+}
+
 fn realized_child_contents_with_styles(content: &Content, styles: &Styles) -> Vec<Content> {
     if let Some(seq) = content.to_packed::<SequenceElem>() {
         return seq.children.clone();
@@ -883,6 +901,15 @@ fn realized_child_contents_with_styles(content: &Content, styles: &Styles) -> Ve
         && let FootnoteBody::Content(body) = &footnote.body
     {
         return vec![body.clone()];
+    }
+    if let Some(item) = content.to_packed::<ListItem>() {
+        return transparent_body_child_contents(&item.body, styles);
+    }
+    if let Some(item) = content.to_packed::<EnumItem>() {
+        return transparent_body_child_contents(&item.body, styles);
+    }
+    if let Some(item) = content.to_packed::<TermItem>() {
+        return vec![item.term.clone(), item.description.clone()];
     }
     if let Some(body) = wrapper_body_of_with_styles(content, styles) {
         return vec![body];
@@ -1057,12 +1084,47 @@ pub(crate) fn replace_realized_child(
         return None;
     }
 
+    if let Some(item) = result.to_packed_mut::<ListItem>() {
+        item.body = replace_transparent_body_child(&item.body, index, replacement)?;
+        return Some(result);
+    }
+
+    if let Some(item) = result.to_packed_mut::<EnumItem>() {
+        item.body = replace_transparent_body_child(&item.body, index, replacement)?;
+        return Some(result);
+    }
+
+    if let Some(item) = result.to_packed_mut::<TermItem>() {
+        match index {
+            0 => {
+                item.term = replacement;
+                return Some(result);
+            }
+            1 => {
+                item.description = replacement;
+                return Some(result);
+            }
+            _ => return None,
+        }
+    }
+
     if let Some(ops) = ops_for(&result) {
         ops.replace_child(&mut result, index, replacement)?;
         return Some(result);
     }
 
     None
+}
+
+fn replace_transparent_body_child(
+    body: &Content,
+    index: usize,
+    replacement: Content,
+) -> Option<Content> {
+    if realized_child_contents(body).is_empty() {
+        return (index == 0).then_some(replacement);
+    }
+    replace_realized_child(body, index, replacement)
 }
 
 pub(crate) fn insert_realized_child(

@@ -45,6 +45,25 @@ pub(crate) fn replace_realized_content_at_path(
     container_ops::replace_realized_child(content, *index, patched_child)
 }
 
+pub(crate) fn insert_realized_content_at_path(
+    content: &Content,
+    path: &[usize],
+    insertion: Content,
+    before: bool,
+) -> Option<Content> {
+    let Some((index, rest)) = path.split_first() else {
+        return None;
+    };
+    if rest.is_empty() {
+        return container_ops::insert_realized_child(content, *index, insertion, before);
+    }
+    let child = container_ops::realized_child_contents(content)
+        .get(*index)?
+        .clone();
+    let patched_child = insert_realized_content_at_path(&child, rest, insertion, before)?;
+    container_ops::replace_realized_child(content, *index, patched_child)
+}
+
 pub(crate) fn map_realized_children(
     content: &Content,
     mut map_child: impl FnMut(&Content) -> Content,
@@ -247,4 +266,43 @@ pub(crate) fn map_transparent_children(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typst::foundations::Packed;
+    use typst::model::{ListElem, ListItem};
+    use typst::text::TextElem;
+
+    #[test]
+    fn path_edit_replaces_and_inserts_list_children() {
+        let list = Content::new(ListElem::new(vec![
+            Packed::new(ListItem::new(TextElem::packed("Alpha"))),
+            Packed::new(ListItem::new(TextElem::packed("Gamma"))),
+        ]));
+
+        let replaced =
+            replace_realized_content_at_path(&list, &[1], TextElem::packed("Beta")).unwrap();
+        let replaced_list = replaced.to_packed::<ListElem>().unwrap();
+        assert_eq!(replaced_list.children[1].body.plain_text(), "Beta");
+
+        let inserted =
+            insert_realized_content_at_path(&list, &[1], TextElem::packed("Beta"), true).unwrap();
+        let inserted_list = inserted.to_packed::<ListElem>().unwrap();
+        assert_eq!(inserted_list.children.len(), 3);
+        assert_eq!(inserted_list.children[1].body.plain_text(), "Beta");
+        assert_eq!(inserted_list.children[2].body.plain_text(), "Gamma");
+    }
+
+    #[test]
+    fn path_edit_replaces_list_item_body() {
+        let item = Content::new(ListItem::new(TextElem::packed("Alpha")));
+
+        let replaced =
+            replace_realized_content_at_path(&item, &[0], TextElem::packed("Beta")).unwrap();
+        let replaced_item = replaced.to_packed::<ListItem>().unwrap();
+
+        assert_eq!(replaced_item.body.plain_text(), "Beta");
+    }
 }

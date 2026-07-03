@@ -1,5 +1,81 @@
 # Technical Decisions
 
+## Lean Phase 7 Moves Render Path Editing Into content_tree
+
+- Render-path replacement and insertion now delegate from `annotate.rs` to
+  `content_tree`; annotation no longer carries its own local `PathEdit` or
+  recursive path editor.
+- The renderer-side synthetic child-sequence fallback was removed. If the
+  declared patch surface does not contain the requested path, annotation emits
+  an `annotate/path-edit` unresolved trace event when a debug sink is available
+  instead of inventing a patch surface from annotated children.
+- `SemanticSlot.patch_path` remains the only logical-to-patch path translation.
+  Missing path metadata is treated as an unsupported path edit rather than a
+  reason to recover structure by post-hoc child inspection.
+- Shared path mechanics in `container_ops` now treat `ListItem` and `EnumItem`
+  as transparent body wrappers and expose `TermItem` term/description children.
+  This fixes nested list item body edits through the same structural editor used
+  by `content_tree`, without reintroducing annotation-local fallback logic.
+- Because `ListElem` and `EnumElem` expose item bodies as their realized
+  children, their replacement operations normalize patched `ListItem` and
+  `EnumItem` values back to bodies at the container boundary. This prevents a
+  recursive transparent-body edit from nesting an item marker inside another
+  item body.
+- The `20-nested-list-changed` corpus case is the regression guard for this
+  boundary: the edit must preserve the normal phylum and class text positions,
+  not merely keep some nested list structure alive. The passing corpus is green
+  without reference updates.
+
+Tradeoff: path-edit failures are currently observable through debug traces, not
+through a typed public result from annotation. That preserves the existing
+rendering API for this deletion phase, while leaving a future diagnostics phase
+free to make unsupported path edits explicit to non-debug callers.
+
+Deferred improvement: if annotated extraction later records transparent wrapper
+path semantics directly, `container_ops` may be able to shrink back toward a
+pure structural editor while annotation owns more of the logical-to-rendered
+path contract.
+
+## Phase 6 Centralizes Equation Carrier Provenance
+
+- Equation-origin assignment remains owned by `annotated.rs`. The realized
+  equation carrier predicate and counter are now shared from that module rather
+  than duplicated in `diff.rs`.
+- `diff.rs` no longer has the duplicate
+  `realized_equation_carrier_count_for_diff` or
+  `collect_annotated_equation_origins` helper names.
+- Attributed extraction still builds retained equation-origin block claims, but
+  it represents them as `AttributedDiffBlock` values rather than reintroducing a
+  dedicated block-level equation claim struct.
+- Inline equations can realize as adjacent empty equation-carrier blocks while
+  the changed paragraph text is matched as a separate block. The replace path
+  therefore still defers origins from invisible equation owners onto the next
+  block whose centralized carrier count proves it contains realized equation
+  carriers.
+- `annotate_footnote_markers` still matches visible marker numbers because the
+  realized tree does not currently expose a stronger marker ID at that boundary.
+  This stays as explicit `FB-012` debt, covered by visible-number and
+  nearby-footnote regression tests.
+
+Tradeoff: Phase 6 removes duplicate equation carrier logic and old claim-type
+debt, but it does not pretend footnote marker matching is solved. The remaining
+equation alignment is retained provenance plumbing, not a broad empty-block
+guess: carrier detection is centralized in annotation and empty structural
+blocks are tested not to consume equation origins.
+
+Deferred improvement: attributed block extraction could become richer by
+carrying embedded token-level provenance for inline semantic children inside a
+paragraph block. If that exists, inline equation origins should attach directly
+to the paragraph block that gets word-diffed, and the retained equation
+alignment path can be deleted. This should be a dedicated future phase only if
+it generalizes beyond equations; as an equation-only change it would add risk
+without much simplification.
+
+Phase closeout rule: every future phase must report improvements that were not
+made, explain why they were deferred or rejected, and identify cleaner
+generalizations that remain available. Architectural deferrals belong in this
+file; phase-local opportunities belong in the implementation plan.
+
 ## Attributed Block Extraction Foundation Is Phase 3
 
 - Phase 1 is complete only to the safe indexed-stream boundary: production block

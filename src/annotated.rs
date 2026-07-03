@@ -1106,7 +1106,7 @@ fn assign_equation_origins(node: &mut AnnotatedContent, equations: &mut VecDeque
     }
 }
 
-fn realized_equation_carrier_count(content: &Content) -> usize {
+pub(crate) fn realized_equation_carrier_count(content: &Content) -> usize {
     if is_realized_equation_carrier(content) {
         return 1;
     }
@@ -1134,7 +1134,7 @@ fn realized_equation_carrier_count(content: &Content) -> usize {
     0
 }
 
-fn is_realized_equation_carrier(content: &Content) -> bool {
+pub(crate) fn is_realized_equation_carrier(content: &Content) -> bool {
     content.is::<EquationElem>() || matches!(content.func().name(), "inline" | "display")
 }
 

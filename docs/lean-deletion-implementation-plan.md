@@ -31,6 +31,10 @@ Rules for every phase:
   Check for every function whether it is useful after the refactor; if not,
   delete it alongside tests that only protect the obsolete private behavior.
 - After every major implementation phase, update `TECHNICAL-DECISIONS.md`.
+- At the end of every phase, report honestly on improvements that were not
+  made and why, and point out opportunities for further improvements or cleaner
+  generalizations. Record those deferred or rejected improvements in this plan
+  and, when they affect architecture, in `TECHNICAL-DECISIONS.md`.
 
 ## Phase 0: Baseline And Deletion Inventory
 
@@ -541,6 +545,24 @@ carrier recovery remains until Phase 5 finishes retained owner extraction.
 Footnote marker matching still uses the visible marker number when no stronger
 marker provenance exists.
 
+Progress:
+
+- Done: equation-origin stream construction now uses retained annotated
+  equation provenance carried on `AttributedDiffBlock`; the old dedicated
+  block-level equation claim structs remain deleted.
+- Done: removed the duplicate `diff.rs` equation carrier counter and predicate.
+  Diff-side code now imports the centralized `annotated.rs`
+  `realized_equation_carrier_count` / `is_realized_equation_carrier` helpers.
+- Done: removed the duplicate `collect_annotated_equation_origins` traversal
+  name. The remaining retained-origin traversal is local to attributed
+  extraction and produces `AttributedDiffBlock` claims.
+- Done: audited `annotate_footnote_markers`. No stronger Typst marker
+  provenance is currently available at that boundary, so visible-number marker
+  matching remains as the explicit `FB-012` debt. The visible `1` regression and
+  nearby-footnote tests keep the fallback narrow.
+- Done: the equation and footnote focused tests, full Rust suite, fallback
+  ledger check, and passing corpus gate pass.
+
 Target design:
 
 - Equation origins are assigned once during annotation/extraction and consumed
@@ -552,26 +574,29 @@ Target design:
 
 Implementation steps:
 
-1. Verify every equation-origin consumer reads from attributed extraction output
-   or annotation directly.
-2. Delete any duplicate equation-origin helpers left in `diff.rs`.
-3. Deduplicate equation carrier predicates between `annotated.rs` and `diff.rs`
-   if both remain.
-4. Audit `annotate_footnote_markers` for possible retained marker provenance.
+1. Done: verify every equation-origin consumer reads from attributed extraction
+   output or annotation directly.
+2. Done: delete duplicate equation-origin helpers left in `diff.rs`.
+3. Done: deduplicate equation carrier predicates between `annotated.rs` and
+   `diff.rs`.
+4. Done: audit `annotate_footnote_markers` for possible retained marker
+   provenance.
    If no cleaner source exists, keep it but make the fallback boundary explicit
    and ensure the ledger describes it as the last footnote marker debt.
-5. Delete or narrow:
-   - duplicate `realized_equation_carrier_count_for_diff`
-   - duplicate `collect_annotated_equation_origins`
-   - any block-level equation claim structs left after Phase 5
+5. Done: delete or narrow:
+   - Done: duplicate `realized_equation_carrier_count_for_diff`
+   - Done: duplicate `collect_annotated_equation_origins`
+   - Done: any block-level equation claim structs left after Phase 5
 
 Tests to add or update:
 
-- Empty block adjacent to display equation does not take equation provenance.
-- Multiple equations in one paragraph keep the correct token order.
-- A visible `1` before a footnote marker does not take the footnote body if a
-  stronger marker signal is available. If no stronger signal exists, keep this
-  as a documented failing/unsupported probe rather than guessing more broadly.
+- Covered: empty block adjacent to display equation does not take equation
+  provenance.
+- Covered: multiple equations in one paragraph keep the correct token order.
+- Covered: a visible `1` before a footnote marker does not take the footnote
+  body if a stronger marker signal is available. If no stronger signal exists,
+  keep this as a documented failing/unsupported probe rather than guessing more
+  broadly.
 
 Exit criteria:
 
@@ -579,7 +604,33 @@ Exit criteria:
 - Remaining footnote marker debt is explicit and tested.
 - Passing-corpus gate passes.
 
-Estimated net production LOC: -120 to -220.
+Actual net production LOC: roughly neutral. The phase deleted duplicate
+equation-carrier logic, but retained a small attributed-block alignment path so
+inline equations split into adjacent empty carriers still feed the paragraph
+word diff.
+
+Not done:
+
+- Did not make attributed extraction rich enough to merge inline equation
+  origins directly into the paragraph block that later gets word-diffed. That
+  would require changing the block extraction/provenance boundary so text blocks
+  can carry embedded child-origin metadata, not just one owner/origin claim for
+  the block as a whole.
+- Did not remove retained equation alignment. Removing it now regresses inline
+  equation tokenization because Typst can realize inline math as adjacent empty
+  equation-carrier blocks while the changed text paragraph is matched as a
+  separate block.
+
+Further improvement opportunity:
+
+- A later, dedicated attributed-block richness phase could make block units
+  carry embedded token-level provenance for inline semantic children. If that
+  exists, paragraph word diffs would receive equation origins directly from the
+  block unit and the retained equation alignment path should be deleted.
+- This is worth doing only if it also simplifies other embedded-inline
+  provenance cases. It is not worth doing as a narrow equation-only refactor,
+  because the current retained alignment is small, tested, and uses centralized
+  carrier detection rather than a broad post-hoc guess.
 
 ## Phase 7: Promote content_tree For Render Path Editing
 
@@ -598,41 +649,101 @@ Target design:
 - If a path does not resolve on the patch surface, the edit is unsupported or
   skipped with diagnostics. It must not synthesize a new surface from children.
 
+Progress:
+
+- Done: `content_tree::insert_realized_content_at_path` now owns recursive
+  insertion beside the existing realized-content replacement helper.
+- Done: `annotate.rs` delegates replace and insert render-path edits to
+  `content_tree` instead of carrying a local recursive path editor.
+- Done: the local `PathEdit`, local `apply_path_edit`,
+  `patchable_surface_for_index`, and the child-sequence fallback that synthesized
+  a surface from annotated children were deleted.
+- Done: failed replace/insert path application is observable in debug traces as
+  `annotate/path-edit` with operation and path details.
+- Done: shared path mechanics in `container_ops` now understand item-level
+  realized children: list and enum items are transparent body wrappers, and term
+  items expose term and description children. This fixed nested-list path editing
+  without reintroducing the renderer-side synthetic surface fallback.
+- Done: list and enum container replacement now normalizes patched `ListItem`
+  and `EnumItem` values back to item bodies at the container boundary. This keeps
+  recursive item-body path edits from nesting a list item marker inside another
+  list item body.
+- Verified: focused path and nested-list tests pass, `cargo check
+  --all-targets` passes, `cargo test --all-targets` passes, and
+  `tests/check_fallback_ledger.sh` passes.
+- Verified: `tests/run_passing_corpus.sh` reports 99 passed and 0 failed. No
+  corpus references were updated.
+
 Implementation steps:
 
-1. Add `content_tree::insert_realized_content_at_path`.
-2. Move the generic path edit logic currently in `annotate.rs` into
+1. Done: add `content_tree::insert_realized_content_at_path`.
+2. Done: move the generic path edit logic formerly in `annotate.rs` into
    `content_tree`, or replace it with calls to:
    - `realized_content_at_path`
    - `replace_realized_content_at_path`
    - `insert_realized_content_at_path`
-3. Keep `patch_path_for_logical_path`, but make it the only patch-path
+3. Done: keep `patch_path_for_logical_path`, but make it the only patch-path
    translation.
-4. Delete:
+4. Done: delete:
    - local `PathEdit`
    - local `apply_path_edit`
    - `patchable_surface_for_index`
    - the child-sequence fallback that creates
      `Content::sequence(node.children.iter().map(effective_render_content))`
-5. Add a diagnostic or trace event when a render edit path fails to resolve.
+5. Done: add a trace event when a render edit path fails to resolve.
    Do not silently invent a surface.
 
 Tests to add or update:
 
-- A valid `ReplaceAt` with a `patch_path` applies to the patch surface.
-- A missing patch path does not create a synthetic child-sequence surface.
-- Insert-before and insert-after still work for sequence/list/enum direct paths.
-- Failed path application is observable in debug trace or explicit test return
-  behavior.
+- Covered: a valid `ReplaceAt` with a `patch_path` applies to the patch surface.
+- Covered: a missing patch path does not create a synthetic child-sequence
+  surface.
+- Covered: insert-before and insert-after still work for direct list paths
+  through `content_tree`.
+- Covered indirectly: nested list item body replacement uses shared
+  list/enum-item transparent body path mechanics instead of a local annotation
+  fallback.
+- Covered: nested list item edits preserve the normal rendered text positions
+  for the phylum and class items, catching accidental nested marker insertion.
+- Covered by behavior: missing path application leaves the patch surface
+  unchanged instead of synthesizing a child sequence; the implementation also
+  emits debug-trace diagnostics for unresolved paths.
 
 Exit criteria:
 
-- No production hits for `patchable_surface_for_index` or local
+- Met: no production hits for `patchable_surface_for_index` or local
   `apply_path_edit`.
-- Path editing code lives in `content_tree` or delegates directly to it.
-- Passing-corpus gate passes.
+- Met: path editing code lives in `content_tree` or delegates directly to it,
+  with container-specific child replacement handled by `container_ops`.
+- Met: passing-corpus gate passes.
 
-Estimated net production LOC: -50 to -100.
+Actual/estimated net production LOC: roughly neutral to slightly positive in
+this phase. The local annotation fallback was removed, but the shared
+`content_tree` insertion helper, observable path-failure trace, and explicit
+item-level child semantics add a little code. The payoff is that later path
+editing now has one reusable route instead of a private annotation copy.
+
+Improvements not made:
+
+- The public render-annotation API still returns rendered content rather than a
+  structured diagnostics object. Failed path edits are trace-visible when debug
+  tracing is enabled, but callers without a debug sink still observe a skipped
+  patch rather than a typed failure. This was deferred to avoid changing the
+  public annotation contract inside a deletion phase.
+- List and enum item body transparency is centralized in `container_ops`, not
+  yet recorded as explicit annotated path metadata. That is clean enough to
+  remove the renderer-side fallback now, but a future richer-provenance phase
+  could make the path convention visible earlier in annotation.
+
+Further improvement opportunity:
+
+- A later diagnostics cleanup could make path-edit failure a typed result that
+  flows out of `build_annotated_content_from_tree` instead of relying on debug
+  traces.
+- A later provenance cleanup could encode list/enum transparent body path
+  semantics in annotated path metadata. If that generalizes across wrappers, it
+  may let `container_ops` become a pure structural editor while annotation owns
+  the logical-to-rendered path contract.
 
 ## Phase 8: Promote content_key And Diff Surface Selection
 

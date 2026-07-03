@@ -2789,6 +2789,10 @@ fn nested_list_item_change_preserves_nested_list_layout() {
         .realized;
     let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
     let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let normal_phylum = normal_runs
+        .iter()
+        .find(|run| run.text.contains("Phylum: Chordata"))
+        .expect("normal Phylum item should render");
     let normal_class = normal_runs
         .iter()
         .find(|run| run.text.contains("Class: Mammalia"))
@@ -2800,6 +2804,14 @@ fn nested_list_item_change_preserves_nested_list_layout() {
     let annotated_gap = arthropoda.y - class.y;
     let normal_gap = normal_arthropoda.y - normal_class.y;
 
+    assert!(
+        (phylum.x - normal_phylum.x).abs() <= 0.5,
+        "modified Phylum item should keep normal list-item text position; phylum={phylum:?}, normal_phylum={normal_phylum:?}"
+    );
+    assert!(
+        (class.x - normal_class.x).abs() <= 0.5,
+        "modified Class item should keep normal list-item text position; class={class:?}, normal_class={normal_class:?}"
+    );
     assert!(
         annotated_gap <= normal_gap + 0.5,
         "modified class item should keep tight nested-list spacing; annotated_gap={annotated_gap}, normal_gap={normal_gap}, class={class:?}, arthropoda={arthropoda:?}, normal_class={normal_class:?}, normal_arthropoda={normal_arthropoda:?}"
