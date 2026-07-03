@@ -741,6 +741,14 @@ pub enum BlockOp {
     Replace(DiffBlock, DiffBlock),
 }
 
+#[derive(Clone)]
+enum IndexedBlockOp {
+    Equal(usize, usize),
+    Delete(usize),
+    Insert(usize),
+    Replace(usize, usize),
+}
+
 /// Diff two flat block slices with Myers LCS, returning `Equal / Delete / Insert` ops.
 ///
 /// This is the public entry point for tests. Production code calls the internal
@@ -766,6 +774,13 @@ pub fn diff_blocks_raw(old: &[Content], new: &[Content]) -> Vec<BlockOp> {
 }
 
 fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
+    diff_block_units_raw_indexed(old, new)
+        .iter()
+        .map(|op| block_op_from_indexed(op, old, new))
+        .collect()
+}
+
+fn diff_block_units_raw_indexed(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<IndexedBlockOp> {
     let old_h: Vec<content_key::BlockEqualityKey> = old
         .iter()
         .map(|block| content_key::BlockEqualityKey::new(block.content.clone()))
@@ -784,24 +799,21 @@ fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
                 len,
             } => {
                 for i in 0..len {
-                    result.push(BlockOp::Equal(
-                        old[old_index + i].clone(),
-                        new[new_index + i].clone(),
-                    ));
+                    result.push(IndexedBlockOp::Equal(old_index + i, new_index + i));
                 }
             }
             DiffOp::Delete {
                 old_index, old_len, ..
             } => {
                 for i in 0..old_len {
-                    result.push(BlockOp::Delete(old[old_index + i].clone()));
+                    result.push(IndexedBlockOp::Delete(old_index + i));
                 }
             }
             DiffOp::Insert {
                 new_index, new_len, ..
             } => {
                 for i in 0..new_len {
-                    result.push(BlockOp::Insert(new[new_index + i].clone()));
+                    result.push(IndexedBlockOp::Insert(new_index + i));
                 }
             }
             DiffOp::Replace {
@@ -811,15 +823,86 @@ fn diff_block_units_raw(old: &[DiffBlock], new: &[DiffBlock]) -> Vec<BlockOp> {
                 new_len,
             } => {
                 for i in 0..old_len {
-                    result.push(BlockOp::Delete(old[old_index + i].clone()));
+                    result.push(IndexedBlockOp::Delete(old_index + i));
                 }
                 for i in 0..new_len {
-                    result.push(BlockOp::Insert(new[new_index + i].clone()));
+                    result.push(IndexedBlockOp::Insert(new_index + i));
                 }
             }
         }
     }
     result
+}
+
+fn block_op_from_indexed(op: &IndexedBlockOp, old: &[DiffBlock], new: &[DiffBlock]) -> BlockOp {
+    match *op {
+        IndexedBlockOp::Equal(old_index, new_index) => {
+            BlockOp::Equal(old[old_index].clone(), new[new_index].clone())
+        }
+        IndexedBlockOp::Delete(old_index) => BlockOp::Delete(old[old_index].clone()),
+        IndexedBlockOp::Insert(new_index) => BlockOp::Insert(new[new_index].clone()),
+        IndexedBlockOp::Replace(old_index, new_index) => {
+            BlockOp::Replace(old[old_index].clone(), new[new_index].clone())
+        }
+    }
+}
+
+struct IndexedBlockOps {
+    old: Vec<DiffBlock>,
+    new: Vec<DiffBlock>,
+    ops: Vec<IndexedBlockOp>,
+}
+
+fn index_block_ops(ops: Vec<BlockOp>) -> IndexedBlockOps {
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    let mut indexed_ops = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        match op {
+            BlockOp::Equal(old_block, new_block) => {
+                let old_index = old.len();
+                let new_index = new.len();
+                old.push(old_block);
+                new.push(new_block);
+                indexed_ops.push(IndexedBlockOp::Equal(old_index, new_index));
+            }
+            BlockOp::Delete(old_block) => {
+                let old_index = old.len();
+                old.push(old_block);
+                indexed_ops.push(IndexedBlockOp::Delete(old_index));
+            }
+            BlockOp::Insert(new_block) => {
+                let new_index = new.len();
+                new.push(new_block);
+                indexed_ops.push(IndexedBlockOp::Insert(new_index));
+            }
+            BlockOp::Replace(old_block, new_block) => {
+                let old_index = old.len();
+                let new_index = new.len();
+                old.push(old_block);
+                new.push(new_block);
+                indexed_ops.push(IndexedBlockOp::Replace(old_index, new_index));
+            }
+        }
+    }
+
+    IndexedBlockOps {
+        old,
+        new,
+        ops: indexed_ops,
+    }
+}
+
+fn block_ops_from_indexed(
+    indexed: Vec<IndexedBlockOp>,
+    old: &[DiffBlock],
+    new: &[DiffBlock],
+) -> Vec<BlockOp> {
+    indexed
+        .iter()
+        .map(|op| block_op_from_indexed(op, old, new))
+        .collect()
 }
 
 fn block_op_trace_event(
@@ -841,6 +924,18 @@ fn block_op_trace_event(
             .new_content(&new.content)
             .selected_edit_kind("replace"),
     }
+}
+
+fn indexed_block_op_trace_event(
+    stage: &'static str,
+    event: &'static str,
+    index: usize,
+    op: &IndexedBlockOp,
+    old: &[DiffBlock],
+    new: &[DiffBlock],
+) -> PipelineTraceEvent {
+    let op = block_op_from_indexed(op, old, new);
+    block_op_trace_event(stage, event, index, &op)
 }
 
 fn emit_fallback_decision(
@@ -880,36 +975,62 @@ fn match_edit_zones_inner(
     ops: Vec<BlockOp>,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
 ) -> anyhow::Result<Vec<BlockOp>> {
-    let mut result: Vec<BlockOp> = Vec::new();
+    let indexed = index_block_ops(ops);
+    let matched =
+        match_indexed_edit_zones_inner(indexed.ops, &indexed.old, &indexed.new, debug_events)?;
+    Ok(block_ops_from_indexed(matched, &indexed.old, &indexed.new))
+}
+
+fn match_indexed_edit_zones(
+    ops: Vec<IndexedBlockOp>,
+    old: &[DiffBlock],
+    new: &[DiffBlock],
+) -> Vec<IndexedBlockOp> {
+    let mut no_debug_events = None;
+    match_indexed_edit_zones_inner(ops, old, new, &mut no_debug_events)
+        .expect("matching without trace cannot fail")
+}
+
+fn match_indexed_edit_zones_inner(
+    ops: Vec<IndexedBlockOp>,
+    old: &[DiffBlock],
+    new: &[DiffBlock],
+    debug_events: &mut Option<&mut dyn DebugEventSink>,
+) -> anyhow::Result<Vec<IndexedBlockOp>> {
+    let mut result = Vec::new();
     let mut i = 0;
     let n = ops.len();
 
     while i < n {
         match &ops[i] {
-            BlockOp::Equal(_, _) | BlockOp::Replace(_, _) => {
+            IndexedBlockOp::Equal(_, _) | IndexedBlockOp::Replace(_, _) => {
                 result.push(ops[i].clone());
                 i += 1;
             }
-            BlockOp::Delete(_) | BlockOp::Insert(_) => {
-                // Collect the entire contiguous Delete/Insert zone regardless of ordering.
+            IndexedBlockOp::Delete(_) | IndexedBlockOp::Insert(_) => {
                 let start = i;
-                while i < n && matches!(&ops[i], BlockOp::Delete(_) | BlockOp::Insert(_)) {
+                while i < n
+                    && matches!(
+                        &ops[i],
+                        IndexedBlockOp::Delete(_) | IndexedBlockOp::Insert(_)
+                    )
+                {
                     i += 1;
                 }
-                let deletes: Vec<DiffBlock> = ops[start..i]
+                let deletes = ops[start..i]
                     .iter()
                     .filter_map(|op| match op {
-                        BlockOp::Delete(c) => Some(c.clone()),
+                        IndexedBlockOp::Delete(index) => Some(*index),
                         _ => None,
                     })
-                    .collect();
-                let inserts: Vec<DiffBlock> = ops[start..i]
+                    .collect::<Vec<_>>();
+                let inserts = ops[start..i]
                     .iter()
                     .filter_map(|op| match op {
-                        BlockOp::Insert(c) => Some(c.clone()),
+                        IndexedBlockOp::Insert(index) => Some(*index),
                         _ => None,
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
                 emit_pipeline_trace_event(
                     debug_events,
                     PipelineTraceEvent::new("diff/edit-zone", "zone").reason(format!(
@@ -918,17 +1039,19 @@ fn match_edit_zones_inner(
                         inserts.len()
                     )),
                 )?;
-                pair_edit_zone(deletes, inserts, &mut result, debug_events)?;
+                pair_indexed_edit_zone(deletes, inserts, old, new, &mut result, debug_events)?;
             }
         }
     }
     Ok(result)
 }
 
-fn pair_edit_zone(
-    deletes: Vec<DiffBlock>,
-    inserts: Vec<DiffBlock>,
-    out: &mut Vec<BlockOp>,
+fn pair_indexed_edit_zone(
+    deletes: Vec<usize>,
+    inserts: Vec<usize>,
+    old: &[DiffBlock],
+    new: &[DiffBlock],
+    out: &mut Vec<IndexedBlockOp>,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
 ) -> anyhow::Result<()> {
     if deletes.is_empty() {
@@ -938,12 +1061,12 @@ fn pair_edit_zone(
                     debug_events,
                     PipelineTraceEvent::new("diff/edit-zone", "unmatched_insert")
                         .new_block_index(index)
-                        .new_content(&insert.content)
+                        .new_content(&new[*insert].content)
                         .selected_edit_kind("insert"),
                 )?;
             }
         }
-        out.extend(inserts.into_iter().map(BlockOp::Insert));
+        out.extend(inserts.into_iter().map(IndexedBlockOp::Insert));
         return Ok(());
     }
     if inserts.is_empty() {
@@ -953,48 +1076,52 @@ fn pair_edit_zone(
                     debug_events,
                     PipelineTraceEvent::new("diff/edit-zone", "unmatched_delete")
                         .old_block_index(index)
-                        .old_content(&delete.content)
+                        .old_content(&old[*delete].content)
                         .selected_edit_kind("delete"),
                 )?;
             }
         }
-        out.extend(deletes.into_iter().map(BlockOp::Delete));
+        out.extend(deletes.into_iter().map(IndexedBlockOp::Delete));
         return Ok(());
     }
 
-    // Match each delete to its best insert (greedy, in delete order).
     let mut used_inserts = vec![false; inserts.len()];
-    // paired_insert_idx[i] = Some(j) if deletes[i] is paired with inserts[j]
-    let mut paired_insert_idx: Vec<Option<usize>> = Vec::with_capacity(deletes.len());
+    let mut paired_insert_idx = Vec::with_capacity(deletes.len());
 
-    for del in &deletes {
-        let del_text = del.content.plain_text();
+    for delete_index in &deletes {
+        let del_text = old[*delete_index].content.plain_text();
         let best = inserts
             .iter()
             .enumerate()
             .filter(|(j, _)| !used_inserts[*j])
-            .map(|(j, ins)| {
+            .map(|(j, insert_index)| {
                 (
                     j,
-                    similarity(del_text.as_str(), ins.content.plain_text().as_str()),
+                    similarity(
+                        del_text.as_str(),
+                        new[*insert_index].content.plain_text().as_str(),
+                    ),
                 )
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         if debug_events.is_some() {
-            for (j, ins) in inserts
+            for (j, insert_index) in inserts
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| !used_inserts[*j])
             {
-                let sim = similarity(del_text.as_str(), ins.content.plain_text().as_str());
+                let sim = similarity(
+                    del_text.as_str(),
+                    new[*insert_index].content.plain_text().as_str(),
+                );
                 emit_pipeline_trace_event(
                     debug_events,
                     PipelineTraceEvent::new("diff/edit-zone", "similarity_candidate")
                         .old_block_index(paired_insert_idx.len())
                         .new_block_index(j)
-                        .old_content(&del.content)
-                        .new_content(&ins.content)
+                        .old_content(&old[*delete_index].content)
+                        .new_content(&new[*insert_index].content)
                         .similarity(sim)
                         .threshold(0.3),
                 )?;
@@ -1039,25 +1166,22 @@ fn pair_edit_zone(
         }
     }
 
-    // Emit deletes (as Delete or Replace) in their original order.
-    for (i, del) in deletes.into_iter().enumerate() {
+    for (i, delete_index) in deletes.into_iter().enumerate() {
         match paired_insert_idx[i] {
-            Some(j) => out.push(BlockOp::Replace(del, inserts[j].clone())),
-            None => out.push(BlockOp::Delete(del)),
+            Some(j) => out.push(IndexedBlockOp::Replace(delete_index, inserts[j])),
+            None => out.push(IndexedBlockOp::Delete(delete_index)),
         }
     }
-
-    // Emit unpaired inserts after all deletes (in original insert order).
-    for (j, ins) in inserts.into_iter().enumerate() {
+    for (j, insert_index) in inserts.into_iter().enumerate() {
         if !used_inserts[j] {
             emit_pipeline_trace_event(
                 debug_events,
                 PipelineTraceEvent::new("diff/edit-zone", "unmatched_insert")
                     .new_block_index(j)
-                    .new_content(&ins.content)
+                    .new_content(&new[insert_index].content)
                     .selected_edit_kind("insert"),
             )?;
-            out.push(BlockOp::Insert(ins));
+            out.push(IndexedBlockOp::Insert(insert_index));
         }
     }
     Ok(())
@@ -1520,7 +1644,7 @@ struct PreparedDiffInputs {
     new_layout_blocks: Vec<DiffBlock>,
     old_realized_blocks: Vec<DiffBlock>,
     new_realized_blocks: Vec<DiffBlock>,
-    matched_ops: Vec<BlockOp>,
+    matched_ops: Vec<IndexedBlockOp>,
     debug: Option<DiffBlockDebug>,
 }
 
@@ -2119,26 +2243,43 @@ fn prepare_diff_inputs(
             new_layout_blocks.len()
         )),
     )?;
-    let raw = diff_block_units_raw(&old_blocks, &new_blocks);
+    let raw = diff_block_units_raw_indexed(&old_blocks, &new_blocks);
     if debug_events.is_some() {
         for (index, op) in raw.iter().enumerate() {
             emit_pipeline_trace_event(
                 debug_events,
-                block_op_trace_event("diff/block-myers", "raw_op", index, op),
+                indexed_block_op_trace_event(
+                    "diff/block-myers",
+                    "raw_op",
+                    index,
+                    op,
+                    &old_blocks,
+                    &new_blocks,
+                ),
             )?;
         }
     }
     let (matched, debug) = if capture_debug {
-        let matched = match_edit_zones_inner(raw.clone(), debug_events)?;
+        let matched =
+            match_indexed_edit_zones_inner(raw.clone(), &old_blocks, &new_blocks, debug_events)?;
         let debug = DiffBlockDebug {
+            raw_ops: raw
+                .iter()
+                .map(|op| block_op_from_indexed(op, &old_blocks, &new_blocks))
+                .collect(),
+            matched_ops: matched
+                .iter()
+                .map(|op| block_op_from_indexed(op, &old_blocks, &new_blocks))
+                .collect(),
             old_blocks,
             new_blocks,
-            raw_ops: raw,
-            matched_ops: matched.clone(),
         };
         (matched, Some(debug))
     } else {
-        (match_edit_zones(raw), None)
+        (
+            match_indexed_edit_zones(raw, &old_blocks, &new_blocks),
+            None,
+        )
     };
     Ok(PreparedDiffInputs {
         new_layout_blocks,
@@ -2153,58 +2294,42 @@ fn attributed_block_stream<'a>(
     root: &'a AnnotatedContent,
     blocks: &[DiffBlock],
 ) -> AttributedBlockStream<'a, SemanticOwnerKey> {
-    let mut owners = BlockOwnerCursor::new(root);
-    let mut equation_origins = EquationOriginBlockCursor::new(root);
+    let mut owner_claims = Vec::new();
+    collect_block_owner_claims(root, &mut owner_claims);
+    attach_semantic_owner_keys(&mut owner_claims);
+
+    let mut equation_claims = Vec::new();
+    collect_equation_origin_block_claims(root, &mut equation_claims);
+
+    let mut owner_index = 0;
+    let mut equation_index = 0;
     AttributedBlockStream::from_claims(blocks.iter().map(|block| {
-        let owner_claim = owners.take_claim_for(&block.content);
+        let owner_claim = take_block_owner_claim(&owner_claims, &mut owner_index, &block.content);
         let fallback_owner = owner_claim
             .owner
             .is_none()
             .then(|| find_annotated_block_owner(root, &block.content))
             .flatten();
         AttributedBlockClaim {
-            realized: block.content.clone(),
             owner: owner_claim.owner,
             fallback_owner,
             owner_key: owner_claim.key,
-            owner_path: None,
-            equation_origins: equation_origins.take_for(&block.content),
+            equation_origins: take_equation_origin_claim(
+                &equation_claims,
+                &mut equation_index,
+                &block.content,
+            ),
         }
     }))
 }
 
-fn take_attributed_block<'a>(
+fn indexed_attributed_block<'a>(
     stream: &'a AttributedBlockStream<'a, SemanticOwnerKey>,
-    consumed: &mut [bool],
-    target: &Content,
+    index: usize,
 ) -> &'a AttributedBlock<'a, SemanticOwnerKey> {
-    let index = attributed_block_index(stream, consumed, target)
-        .expect("block op consumed a block that is missing from attributed stream");
-    consumed[index] = true;
-    stream.get(index).expect("attributed index was just found")
-}
-
-fn peek_attributed_block<'a>(
-    stream: &'a AttributedBlockStream<'a, SemanticOwnerKey>,
-    consumed: &[bool],
-    target: &Content,
-) -> &'a AttributedBlock<'a, SemanticOwnerKey> {
-    let index = attributed_block_index(stream, consumed, target)
-        .expect("block op peeked a block that is missing from attributed stream");
-    stream.get(index).expect("attributed index was just found")
-}
-
-fn attributed_block_index(
-    stream: &AttributedBlockStream<'_, SemanticOwnerKey>,
-    consumed: &[bool],
-    target: &Content,
-) -> Option<usize> {
-    (0..stream.len()).find(|index| {
-        !consumed.get(*index).copied().unwrap_or(true)
-            && stream
-                .get(*index)
-                .is_some_and(|item| item.realized() == target)
-    })
+    stream
+        .get(index)
+        .expect("indexed block op references a missing attributed stream item")
 }
 
 fn attributed_owner_match<'a>(
@@ -2224,12 +2349,8 @@ fn attributed_owner_trace(block: &AttributedBlock<'_, SemanticOwnerKey>) -> Stri
         .owner_semantic_kind()
         .map(|kind| format!("{kind:?}"))
         .unwrap_or_else(|| "anonymous".to_string());
-    let path = block
-        .owner_path()
-        .map(|path| path.len().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
     format!(
-        "kind={kind} key={} fallback={} path_depth={path} slots={} footnote={} patch_surface={}",
+        "kind={kind} key={} fallback={} slots={} footnote={} patch_surface={}",
         block.owner_key().is_some(),
         block.owner().is_none() && block.fallback_owner().is_some(),
         block.owner_slot_labels().len(),
@@ -3372,8 +3493,6 @@ fn diff_annotated_inner_with_events(
     let new_stream = attributed_block_stream(new, &new_match_blocks);
     debug_assert_eq!(old_stream.len(), old_match_blocks.len());
     debug_assert_eq!(new_stream.len(), new_match_blocks.len());
-    let mut old_stream_consumed = vec![false; old_stream.len()];
-    let mut new_stream_consumed = vec![false; new_stream.len()];
     let mut blocks = Vec::new();
     let mut recursed_equal_semantic_nodes = HashSet::new();
     let mut recursed_display_surfaces = Vec::new();
@@ -3388,18 +3507,12 @@ fn diff_annotated_inner_with_events(
         let op = matched_ops[op_index].clone();
         op_index += 1;
         match op {
-            BlockOp::Equal(old_block, new_block) => {
+            IndexedBlockOp::Equal(old_index, new_index) => {
+                let old_block = &old_match_blocks[old_index];
+                let new_block = &new_match_blocks[new_index];
                 let page_styles = new_block.page_styles.clone();
-                let old_attr = take_attributed_block(
-                    &old_stream,
-                    &mut old_stream_consumed,
-                    &old_block.content,
-                );
-                let new_attr = take_attributed_block(
-                    &new_stream,
-                    &mut new_stream_consumed,
-                    &new_block.content,
-                );
+                let old_attr = indexed_attributed_block(&old_stream, old_index);
+                let new_attr = indexed_attributed_block(&new_stream, new_index);
                 let old_claim = attributed_owner_match(old_attr);
                 let new_claim = attributed_owner_match(new_attr);
                 let new_claim_key = new_claim.key.clone();
@@ -3638,23 +3751,18 @@ fn diff_annotated_inner_with_events(
                     base: annotated_block_from(&new_block.content, None),
                     base_provenance: BlockBaseProvenance::LiveNew,
                     edits: vec![],
-                    page_styles: new_block.page_styles,
+                    page_styles: new_block.page_styles.clone(),
                 });
             }
-            BlockOp::Delete(old_block) => {
-                let old_attr = take_attributed_block(
-                    &old_stream,
-                    &mut old_stream_consumed,
-                    &old_block.content,
-                );
+            IndexedBlockOp::Delete(old_index) => {
+                let old_block = &old_match_blocks[old_index];
+                let old_attr = indexed_attributed_block(&old_stream, old_index);
                 let old_eq_origins = old_attr.equation_origins().to_vec();
                 let old_claim = attributed_owner_match(old_attr);
-                if let Some(BlockOp::Insert(new_block)) = matched_ops.get(op_index).cloned() {
-                    let new_attr = peek_attributed_block(
-                        &new_stream,
-                        &new_stream_consumed,
-                        &new_block.content,
-                    );
+                if let Some(IndexedBlockOp::Insert(new_index)) = matched_ops.get(op_index).cloned()
+                {
+                    let new_block = &new_match_blocks[new_index];
+                    let new_attr = indexed_attributed_block(&new_stream, new_index);
                     let new_claim = attributed_owner_match(new_attr);
                     if semantic_owner_claims_match(&old_claim, &new_claim) {
                         emit_pipeline_trace_event(
@@ -3665,11 +3773,7 @@ fn diff_annotated_inner_with_events(
                                 .new_content(&new_block.content)
                                 .selected_edit_kind("replace"),
                         )?;
-                        let new_attr = take_attributed_block(
-                            &new_stream,
-                            &mut new_stream_consumed,
-                            &new_block.content,
-                        );
+                        let new_attr = indexed_attributed_block(&new_stream, new_index);
                         let new_claim = attributed_owner_match(new_attr);
                         let new_eq_origins = new_attr.equation_origins().to_vec();
                         if owner_already_recursed(&recursed_equal_semantic_nodes, &new_claim.key) {
@@ -3726,11 +3830,6 @@ fn diff_annotated_inner_with_events(
                                 .selected_edit_kind("noop"),
                         )?;
                         blocks.extend(layout.take_before(&new_block.content));
-                        take_attributed_block(
-                            &new_stream,
-                            &mut new_stream_consumed,
-                            &new_block.content,
-                        );
                         op_index += 1;
                         continue;
                     }
@@ -3749,12 +3848,9 @@ fn diff_annotated_inner_with_events(
                     page_styles: current_annotated_page_styles(&blocks),
                 });
             }
-            BlockOp::Insert(new_block) => {
-                let new_attr = take_attributed_block(
-                    &new_stream,
-                    &mut new_stream_consumed,
-                    &new_block.content,
-                );
+            IndexedBlockOp::Insert(new_index) => {
+                let new_block = &new_match_blocks[new_index];
+                let new_attr = indexed_attributed_block(&new_stream, new_index);
                 let new_eq_origins = new_attr.equation_origins().to_vec();
                 let new_ann = new_attr.owner().or_else(|| new_attr.fallback_owner());
                 blocks.extend(layout.take_before(&new_block.content));
@@ -3778,20 +3874,14 @@ fn diff_annotated_inner_with_events(
                             &new_eq_origins,
                         ))]
                     },
-                    page_styles: new_block.page_styles,
+                    page_styles: new_block.page_styles.clone(),
                 });
             }
-            BlockOp::Replace(old_block, new_block) => {
-                let old_attr = take_attributed_block(
-                    &old_stream,
-                    &mut old_stream_consumed,
-                    &old_block.content,
-                );
-                let new_attr = take_attributed_block(
-                    &new_stream,
-                    &mut new_stream_consumed,
-                    &new_block.content,
-                );
+            IndexedBlockOp::Replace(old_index, new_index) => {
+                let old_block = &old_match_blocks[old_index];
+                let new_block = &new_match_blocks[new_index];
+                let old_attr = indexed_attributed_block(&old_stream, old_index);
+                let new_attr = indexed_attributed_block(&new_stream, new_index);
                 let mut old_eq_origins = old_attr.equation_origins().to_vec();
                 let mut new_eq_origins = new_attr.equation_origins().to_vec();
                 if realized_equation_carrier_count_for_diff(&old_block.content) > 0 {
@@ -5192,75 +5282,54 @@ struct BlockOwnerMatch<'a> {
     key: Option<SemanticOwnerKey>,
 }
 
-struct BlockOwnerCursor<'a> {
-    claims: Vec<BlockOwnerClaim<'a>>,
-    index: usize,
-}
-
-impl<'a> BlockOwnerCursor<'a> {
-    fn new(root: &'a AnnotatedContent) -> Self {
-        let mut claims = Vec::new();
-        collect_block_owner_claims(root, &mut claims);
-        attach_semantic_owner_keys(&mut claims);
-        Self { claims, index: 0 }
-    }
-
-    fn take_claim_for(&mut self, target: &Content) -> BlockOwnerMatch<'a> {
-        while let Some(claim) = self.claims.get(self.index) {
-            if owned_block_matches(&claim.content, target) {
-                self.index += 1;
-                return BlockOwnerMatch {
-                    owner: claim.owner,
-                    key: claim.key.clone(),
-                };
-            }
-            if claim.owner.is_some_and(is_display_equation_owner) {
-                break;
-            }
-            if !claim.content.plain_text().trim().is_empty() {
-                break;
-            }
-            self.index += 1;
-        }
-        BlockOwnerMatch {
-            owner: None,
-            key: None,
-        }
-    }
-}
-
 struct EquationOriginBlockClaim {
     content: Content,
     origins: Vec<Content>,
 }
 
-struct EquationOriginBlockCursor {
-    claims: Vec<EquationOriginBlockClaim>,
-    index: usize,
+fn take_block_owner_claim<'a>(
+    claims: &[BlockOwnerClaim<'a>],
+    index: &mut usize,
+    target: &Content,
+) -> BlockOwnerMatch<'a> {
+    while let Some(claim) = claims.get(*index) {
+        if owned_block_matches(&claim.content, target) {
+            *index += 1;
+            return BlockOwnerMatch {
+                owner: claim.owner,
+                key: claim.key.clone(),
+            };
+        }
+        if claim.owner.is_some_and(is_display_equation_owner) {
+            break;
+        }
+        if !claim.content.plain_text().trim().is_empty() {
+            break;
+        }
+        *index += 1;
+    }
+    BlockOwnerMatch {
+        owner: None,
+        key: None,
+    }
 }
 
-impl EquationOriginBlockCursor {
-    fn new(root: &AnnotatedContent) -> Self {
-        let mut claims = Vec::new();
-        collect_equation_origin_block_claims(root, &mut claims);
-        Self { claims, index: 0 }
-    }
-
-    fn take_for(&mut self, target: &Content) -> Vec<Content> {
-        while let Some(claim) = self.claims.get(self.index) {
-            if claim.content == *target {
-                self.index += 1;
-                return claim.origins.clone();
-            }
-            if !claim.content.plain_text().trim().is_empty()
-                || !target.plain_text().trim().is_empty()
-            {
-                break;
-            }
-            self.index += 1;
+fn take_equation_origin_claim(
+    claims: &[EquationOriginBlockClaim],
+    index: &mut usize,
+    target: &Content,
+) -> Vec<Content> {
+    while let Some(claim) = claims.get(*index) {
+        if claim.content == *target {
+            *index += 1;
+            return claim.origins.clone();
         }
-        Vec::new()
+        if !claim.content.plain_text().trim().is_empty() || !target.plain_text().trim().is_empty() {
+            break;
+        }
+        *index += 1;
     }
+    Vec::new()
 }
 
 fn collect_equation_origin_block_claims(

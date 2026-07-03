@@ -10,21 +10,17 @@ use typst::model::{FootnoteBody, FootnoteElem};
 
 #[derive(Clone)]
 pub(crate) struct AttributedBlockClaim<'a, K> {
-    pub(crate) realized: Content,
     pub(crate) owner: Option<&'a AnnotatedContent>,
     pub(crate) fallback_owner: Option<&'a AnnotatedContent>,
     pub(crate) owner_key: Option<K>,
-    pub(crate) owner_path: Option<Vec<usize>>,
     pub(crate) equation_origins: Vec<Content>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AttributedBlock<'a, K> {
-    realized: Content,
     owner: Option<&'a AnnotatedContent>,
     fallback_owner: Option<&'a AnnotatedContent>,
     owner_key: Option<K>,
-    owner_path: Option<Vec<usize>>,
     owner_semantic_kind: Option<SemanticKind>,
     owner_slot_labels: Vec<SlotStep>,
     owner_has_footnote: bool,
@@ -58,11 +54,9 @@ impl<'a, K> AttributedBlock<'a, K> {
             .map(footnote_body_contents)
             .unwrap_or_default();
         Self {
-            realized: claim.realized,
             owner: claim.owner,
             fallback_owner: claim.fallback_owner,
             owner_key: claim.owner_key,
-            owner_path: claim.owner_path,
             owner_semantic_kind,
             owner_slot_labels,
             owner_has_footnote,
@@ -70,10 +64,6 @@ impl<'a, K> AttributedBlock<'a, K> {
             footnote_bodies,
             equation_origins: claim.equation_origins,
         }
-    }
-
-    pub(crate) fn realized(&self) -> &Content {
-        &self.realized
     }
 
     pub(crate) fn owner(&self) -> Option<&'a AnnotatedContent> {
@@ -93,10 +83,6 @@ impl<'a, K> AttributedBlock<'a, K> {
         K: Clone,
     {
         self.owner_key.clone()
-    }
-
-    pub(crate) fn owner_path(&self) -> Option<&[usize]> {
-        self.owner_path.as_deref()
     }
 
     pub(crate) fn owner_semantic_kind(&self) -> Option<&SemanticKind> {

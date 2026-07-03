@@ -1,5 +1,39 @@
 # Technical Decisions
 
+## Block Ops Consume Attributed Streams By Index
+
+- The lean deletion pass begins by promoting indexed block attribution inside
+  the production diff pipeline.
+- Internal block matching now carries old/new block indices through Myers and
+  edit-zone replacement selection, while the existing public/debug `BlockOp`
+  view remains content-rich for tests and diagnostics.
+- Public `match_edit_zones` now converts `BlockOp` values to indexed ops, runs
+  the same indexed matcher as production, and materializes `BlockOp` values only
+  on return.
+- The old content-rich `pair_edit_zone` implementation was deleted, so edit-zone
+  replacement selection has one implementation rather than parallel production
+  and compatibility paths.
+- The main block-op loop reads `AttributedBlockStream` entries by block index
+  instead of searching for an unconsumed stream item with matching realized
+  content.
+- `BlockOwnerCursor` and `EquationOriginBlockCursor` were removed. Stream
+  attribution now builds owner and equation claim vectors locally and consumes
+  them while constructing `AttributedBlockStream`.
+- The unused `owner_path` field was removed from attributed stream items because
+  no production code populated it yet; keeping an always-unknown debug field
+  made the provenance boundary look stronger than it was.
+- `AttributedBlock` no longer stores a duplicate realized block payload solely
+  for content-equality lookup.
+- `cargo check --all-targets`, `cargo test --all-targets`,
+  `tests/check_fallback_ledger.sh`, and `tests/run_passing_corpus.sh` pass after
+  the change.
+
+Tradeoff: this removes the cursor objects and the block-op content-search
+bridge, but not the underlying owner discovery debt. `collect_block_owner_claims`,
+`collect_equation_origin_block_claims`, and `find_annotated_block_owner` still
+recover attribution from realized content until annotation or block extraction
+can retain owner/path provenance directly.
+
 ## Legacy Cleanup Keeps Only Proven Bridges
 
 - Phase 11 records the current production Rust line count at 19,010 lines after the deep-cut refactor phases.
@@ -7,7 +41,7 @@
 - The technical reference module list now includes the refactor boundary modules: `content_tree`, `content_key`, `patch_surface`, `diff_surface`, `diff_area`, `edit_script`, `style_context`, and `attributed_block_stream`.
 - The older invariant cleanup plan is marked historical so it remains useful design background without competing with the current deep-cut phase plan.
 - The fallback ledger remains synchronized with active warning codes. `FB-013` stays active because opaque contextual page-region wrappers still need source-span `align(...)` parsing until context output carries wrapper provenance.
-- `BlockOwnerCursor` and `EquationOriginBlockCursor` remain in production only inside attributed stream construction. They are no longer used at block-op decision points, but deleting them requires retained owner/path IDs from annotation and block extraction rather than a mechanical rename.
+- `BlockOwnerCursor` and `EquationOriginBlockCursor` have now been deleted. The remaining owner/equation claim collectors still live inside attributed stream construction until retained owner/path IDs can replace realized-content recovery.
 
 Tradeoff: this phase trims stale documentation and records the current architecture without pretending every bridge is gone. The remaining cursor bridge and visible-text/source-string debts are intentionally left explicit and ledgered instead of hidden behind a superficial cleanup.
 
