@@ -7,6 +7,10 @@ long because compatibility bridges keep older decision paths alive.
 The implementation goal is not to add another abstraction layer. The goal is to
 make the clean abstractions authoritative and delete the old code they replace.
 
+The phase order is dependency-first. We are deliberately not optimizing for
+early quick wins; each phase should disentangle one dependency layer so later
+deletions are safe, mechanical, and smaller in scope.
+
 Current measured baseline:
 
 - Production Rust excluding embedded unit-test modules: about 15,212 lines.
@@ -80,7 +84,7 @@ Progress:
 - Done: `BlockOwnerCursor`, `EquationOriginBlockCursor`, content-search
   attributed block lookup, duplicate realized stream payloads, and the duplicate
   content-rich edit-zone matcher have been removed.
-- Deferred to Phase 8: `collect_block_owner_claims`,
+- Deferred to Phases 3 and 4: `collect_block_owner_claims`,
   `collect_equation_origin_block_claims`, and `find_annotated_block_owner` still
   recover attribution from realized content inside stream construction.
   Replacing those requires retained owner/path provenance from annotation or
@@ -128,9 +132,10 @@ Implementation steps:
 5. Change the block-op loop to read `old_stream[old_index]` and
    `new_stream[new_index]` directly.
 6. Keep owner/equation claim construction inside `AttributedBlockStream`
-   construction until Phase 8 introduces attributed block extraction. The old
-   cursor objects should be gone, but the remaining claim helpers are deferred
-   debt rather than local Phase 1 deletions.
+   construction until Phase 3 builds attributed block extraction and Phase 4
+   switches production stream construction to it. The old cursor objects should
+   be gone, but the remaining claim helpers are deferred debt rather than local
+   Phase 1 deletions.
 7. Delete:
    - `BlockOwnerCursor`
    - `BlockOwnerMatch` if no longer needed outside temporary transition code
@@ -153,7 +158,7 @@ Exit criteria:
 - No production `rg` hits for the deleted owner/equation cursor symbols.
 - Stream items are consumed by index only.
 - Remaining realized-content owner/equation claim helpers are documented as
-  Phase 8 debt.
+  Phase 4 debt.
 - Passing-corpus gate passes.
 - `TECHNICAL-DECISIONS.md` records that block attribution is indexed and no
   longer recovered by content matching.
@@ -186,10 +191,10 @@ Progress:
   container-owned helper names. Tests showed these are still required when block
   extraction presents a single realized item, a text-empty wrapper carrier, or
   fewer realized leaf paths than source slots. Removing them cleanly requires
-  the retained block/slot/wrapper provenance deferred to Phase 8.
+  the retained block/slot/wrapper provenance deferred to Phases 3 and 4.
 - Actual LOC result for this phase is not a reduction: the old global code was
   deleted, but the behavior-preserving container-owned routes and ledger updates
-  are net-positive. The later reduction now depends more heavily on Phase 8
+  are net-positive. The later reduction now depends more heavily on Phase 4
   replacing the narrowed FB-007/008/009 bridges with retained provenance.
 
 Target design:
@@ -262,7 +267,194 @@ Exit criteria:
 
 Estimated net production LOC: -250 to -450.
 
-## Phase 3: Promote content_tree For Render Path Editing
+## Phase 3: Build Attributed Block Extraction Foundation
+
+Clean abstraction to promote: annotated block extraction as the producer of
+block payloads and attribution claims.
+
+Purpose: disentangle the dependency that blocked Phase 2 without doing a risky
+production switch. This phase builds and tests the new extractor beside the old
+stream-construction bridge.
+
+Problem today: Phase 1 made production block ops indexed and removed the owner
+and equation cursor objects, but stream construction still recovers ownership
+after block extraction by matching realized content. Phase 2 showed that this
+same missing provenance keeps FB-007, FB-008, and FB-009 alive.
+
+The active bridge is:
+
+- `collect_block_owner_claims`
+- `collect_equation_origin_block_claims`
+- `find_annotated_block_owner`
+- `find_single_block_semantic_owner`
+- `collect_single_block_semantic_owners`
+- `owned_block_matches`
+- `BlockOwnerClaim`
+- `EquationOriginBlockClaim`
+
+Important technical note:
+
+- A local deletion attempt that walked the annotated tree directly and emitted
+  attribution claims separately from block extraction broke owner placement for
+  tables, grids, figures, footnotes, display equations, and opaque wrappers.
+- The failures were not random. They showed that stream cardinality and owner
+  placement must be determined by the same logic that creates block boundaries.
+- Padding missing stream items with ownerless defaults restores cardinality but
+  does not preserve semantic ownership. It can shift table/figure/footnote owner
+  claims onto the wrong realized block or duplicate opaque-wrapper edits.
+- Therefore the correct replacement is not another post-hoc attribution walk.
+  It is an `extract_annotated_block_units`-style primitive that emits each
+  realized block together with its retained owner/equation/footnote provenance
+  in one pass.
+- Tests alone are not a reason to keep the current helper functions. They remain
+  only because they are active production helpers. Once attributed block
+  extraction replaces them, delete those helpers and any tests that only protect
+  their private legacy behavior.
+
+Target design:
+
+- Introduce an internal attributed block extraction API, for example:
+
+  ```rust
+  struct AttributedDiffBlock<'a> {
+      block: DiffBlock,
+      claim: AttributedBlockClaim<'a, SemanticOwnerKey>,
+  }
+  ```
+
+- The attributed extractor must preserve the exact block sequence currently
+  produced by `extract_block_units` / `non_parbreak_blocks`.
+- Owner, equation-origin, footnote-body, patch-surface, and semantic-key
+  metadata must be attached at the same moment the block boundary is emitted.
+- Empty carrier blocks must be represented only when they are real extracted
+  blocks, not invented or skipped by a later attribution pass.
+- Table/grid effective-render blocks, figure body/caption carriers, footnote
+  marker/body carriers, display-equation shells, opaque wrapper surfaces, quote
+  carriers, and page-style propagation must all keep their current tested
+  behavior.
+
+Implementation steps:
+
+1. Add focused tests around attributed block extraction cardinality and owner
+   placement for:
+   - plain paragraphs with inline styling,
+   - list/enum/terms single-item carriers,
+   - table/grid cells,
+   - figures with body and caption edits,
+   - footnotes near unchanged visible text,
+   - display equations adjacent to empty blocks,
+   - quotes with text-empty realized carriers,
+   - opaque visual wrappers.
+2. Build `extract_annotated_block_units` alongside `extract_block_units`.
+3. Assert in tests that the emitted block payload sequence is identical to
+   `extract_block_units(&root.realized)` after non-parbreak filtering.
+4. Attach owner/equation/footnote provenance in the new extractor, but keep
+   production stream construction unchanged in this phase.
+5. Add debug-only or test-only comparison utilities that report mismatches
+   between old claim recovery and new attributed extraction.
+
+Exit criteria:
+
+- Attributed extraction exists behind tests without changing production output.
+- Parity tests prove exact block payload sequence equality for representative
+  semantic owners and corpus-shaped fixtures.
+- Owner/equation/footnote attribution mismatches are visible in focused tests,
+  not hidden behind broad integration failures.
+- Passing-corpus gate passes.
+
+Estimated net production LOC: +50 to +150.
+
+## Phase 4: Switch Streams To Attributed Extraction
+
+Purpose: make retained attributed extraction authoritative, then delete the old
+realized-content recovery bridge.
+
+Implementation steps:
+
+1. Change `prepare_diff_inputs` / stream construction to use attributed block
+   vectors as the source of both block matching and `AttributedBlockStream`.
+2. Keep a short transition assertion in tests that attributed block payloads
+   still match the legacy extraction payloads.
+3. Delete the old realized-content recovery bridge:
+   - `collect_block_owner_claims`
+   - `collect_equation_origin_block_claims`
+   - `find_annotated_block_owner`
+   - `find_single_block_semantic_owner`
+   - `collect_single_block_semantic_owners`
+   - `owned_block_matches`
+   - `BlockOwnerClaim`
+   - `EquationOriginBlockClaim`
+4. Delete tests that only cover those private recovery helpers, after replacing
+   them with attributed-extraction behavior tests.
+5. Retire or narrow FB-007, FB-008, and FB-009. These codes should disappear if
+   retained block/slot/wrapper provenance fully replaces their container-owned
+   bridges; otherwise each survivor must point to a precise unsupported
+   boundary.
+6. Update `TECHNICAL-DECISIONS.md` and any docs that still describe block
+   attribution as recovered by content matching.
+
+Exit criteria:
+
+- No production hits for the deleted owner/equation claim recovery symbols.
+- `AttributedBlockStream` is built from retained attributed extraction output,
+  not by re-scanning the annotated tree for matching realized content.
+- Existing table, figure, footnote, equation, quote, opaque-wrapper, and
+  repeated-block integration tests pass.
+- Passing corpus passes.
+
+Estimated net production LOC: -300 to -650.
+
+## Phase 5: Tighten Equation And Footnote Provenance
+
+Clean abstraction to promote: provenance carried by annotation and attributed
+block extraction.
+
+Problem today: equation provenance was improved, but duplicate block-level
+carrier recovery remains until Phase 4 removes old claim construction. Footnote
+marker matching still uses the visible marker number when no stronger marker
+provenance exists.
+
+Target design:
+
+- Equation origins are assigned once during annotation/extraction and consumed
+  through attributed stream items.
+- Diff construction does not re-scan annotated trees for equation-origin block
+  claims.
+- Footnote marker matching remains only if no Typst provenance is available,
+  and it is narrow, ledgered, and tested.
+
+Implementation steps:
+
+1. Verify every equation-origin consumer reads from attributed extraction output
+   or annotation directly.
+2. Delete any duplicate equation-origin helpers left in `diff.rs`.
+3. Deduplicate equation carrier predicates between `annotated.rs` and `diff.rs`
+   if both remain.
+4. Audit `annotate_footnote_markers` for possible retained marker provenance.
+   If no cleaner source exists, keep it but make the fallback boundary explicit
+   and ensure the ledger describes it as the last footnote marker debt.
+5. Delete or narrow:
+   - duplicate `realized_equation_carrier_count_for_diff`
+   - duplicate `collect_annotated_equation_origins`
+   - any block-level equation claim structs left after Phase 4
+
+Tests to add or update:
+
+- Empty block adjacent to display equation does not take equation provenance.
+- Multiple equations in one paragraph keep the correct token order.
+- A visible `1` before a footnote marker does not take the footnote body if a
+  stronger marker signal is available. If no stronger signal exists, keep this
+  as a documented failing/unsupported probe rather than guessing more broadly.
+
+Exit criteria:
+
+- Equation origins have one assignment/consumption path.
+- Remaining footnote marker debt is explicit and tested.
+- Passing-corpus gate passes.
+
+Estimated net production LOC: -120 to -220.
+
+## Phase 6: Promote content_tree For Render Path Editing
 
 Clean abstraction to promote: `content_tree`.
 
@@ -315,7 +507,7 @@ Exit criteria:
 
 Estimated net production LOC: -50 to -100.
 
-## Phase 4: Promote content_key And Diff Surface Selection
+## Phase 7: Promote content_key And Diff Surface Selection
 
 Clean abstractions to promote: `content_key`, `DiffSurfaceEdit`, and
 `DiffAreaKind`.
@@ -389,7 +581,7 @@ Exit criteria:
 
 Estimated net production LOC: -150 to -300.
 
-## Phase 5: Delete Rendered-Region Source Parsing
+## Phase 8: Delete Rendered-Region Source Parsing
 
 Clean abstractions to promote: `context_recording`, structural content-tree
 inspection, `DiffAreaKind::RenderedPageRegion`, and rendered-region surfaces.
@@ -441,56 +633,7 @@ Exit criteria:
 
 Estimated net production LOC: -40 to -90.
 
-## Phase 6: Tighten Equation And Footnote Provenance
-
-Clean abstraction to promote: provenance carried by annotation and indexed
-attributed streams.
-
-Problem today: equation provenance was improved, but duplicate block-level
-carrier recovery remains in `diff.rs`. Footnote marker matching still uses the
-visible marker number when no stronger marker provenance exists.
-
-Target design:
-
-- Equation origins are assigned once during annotation and consumed through the
-  attributed stream.
-- Diff construction does not re-scan annotated trees for equation-origin block
-  claims.
-- Footnote marker matching remains only if no Typst provenance is available,
-  and it is narrow, ledgered, and tested.
-
-Implementation steps:
-
-1. After Phase 1 indexed streams, verify every equation-origin consumer reads
-   from stream items or annotation directly.
-2. Delete any remaining duplicate equation-origin helpers in `diff.rs`.
-3. Deduplicate equation carrier predicates between `annotated.rs` and `diff.rs`
-   if both remain.
-4. Audit `annotate_footnote_markers` for possible retained marker provenance.
-   If no cleaner source exists, keep it but make the fallback boundary explicit
-   and ensure the ledger describes it as the last footnote marker debt.
-5. Delete or narrow:
-   - duplicate `realized_equation_carrier_count_for_diff`
-   - duplicate `collect_annotated_equation_origins`
-   - any block-level equation claim structs left after Phase 1
-
-Tests to add or update:
-
-- Empty block adjacent to display equation does not take equation provenance.
-- Multiple equations in one paragraph keep the correct token order.
-- A visible `1` before a footnote marker does not take the footnote body if a
-  stronger marker signal is available. If no stronger signal exists, keep this
-  as a documented failing/unsupported probe rather than guessing more broadly.
-
-Exit criteria:
-
-- Equation origins have one assignment/consumption path.
-- Remaining footnote marker debt is explicit and tested.
-- Passing-corpus gate passes.
-
-Estimated net production LOC: -120 to -220.
-
-## Phase 7: Prune Debug, Ledger, And Docs
+## Phase 9: Prune Debug, Ledger, And Docs
 
 Purpose: remove documentation and diagnostics that only exist for deleted
 legacy paths.
@@ -506,7 +649,7 @@ Steps:
    fallback paths or duplicate-pruning concepts.
 4. Update `docs/technical.md` and `docs/system-walkthrough-annotated-tree.md`
    to describe:
-   - indexed attributed block streams,
+   - attributed block extraction,
    - container-owned slot paths,
    - unified area+surface selection,
    - the remaining unsupported boundaries.
@@ -519,6 +662,7 @@ Steps:
 
    ```bash
    rg "BlockOwnerCursor|EquationOriginBlockCursor|find_annotated_block_owner" src docs tests
+   rg "collect_block_owner_claims|collect_equation_origin_block_claims|BlockOwnerClaim|EquationOriginBlockClaim" src docs tests
    rg "map_slot_parts|map_unique_partial_item_container|opaque_pre_surface" src docs tests
    rg "rendered_region_source_wrapper|authored_align_wrapper|parse_align_call_alignment" src docs tests
    rg "word_or_opaque_replacement_edits|patchable_surface_for_index" src docs tests
@@ -531,108 +675,6 @@ Exit criteria:
 - Final production LOC is recorded.
 
 Estimated net production LOC: -150 to -250.
-
-## Phase 8: Extract Annotated Blocks With Retained Provenance
-
-Clean abstraction to promote: annotated block extraction as the producer of
-both `DiffBlock` payloads and `AttributedBlockStream` claims.
-
-Problem today: Phase 1 made production block ops indexed and removed the owner
-and equation cursor objects, but stream construction still recovers ownership
-after block extraction by matching realized content. The remaining bridge is:
-
-- `collect_block_owner_claims`
-- `collect_equation_origin_block_claims`
-- `find_annotated_block_owner`
-- `find_single_block_semantic_owner`
-- `collect_single_block_semantic_owners`
-- `owned_block_matches`
-- `BlockOwnerClaim`
-- `EquationOriginBlockClaim`
-
-Important technical note:
-
-- A local deletion attempt that walked the annotated tree directly and emitted
-  attribution claims separately from block extraction broke owner placement for
-  tables, grids, figures, footnotes, display equations, and opaque wrappers.
-- The failures were not random. They showed that stream cardinality and owner
-  placement must be determined by the same logic that creates block boundaries.
-- Padding missing stream items with ownerless defaults restores cardinality but
-  does not preserve semantic ownership. It can shift table/figure/footnote owner
-  claims onto the wrong realized block or duplicate opaque-wrapper edits.
-- Therefore the correct replacement is not another post-hoc attribution walk.
-  It is an `extract_annotated_block_units`-style primitive that emits each
-  realized block together with its retained owner/equation/footnote provenance
-  in one pass.
-- Tests alone are not a reason to keep the current helper functions. They remain
-  only because they are active production helpers. Once attributed block
-  extraction replaces them, delete those helpers and any tests that only protect
-  their private legacy behavior.
-
-Target design:
-
-- Introduce an internal attributed block extraction API, for example:
-
-  ```rust
-  struct AttributedDiffBlock<'a> {
-      block: DiffBlock,
-      claim: AttributedBlockClaim<'a, SemanticOwnerKey>,
-  }
-  ```
-
-- The attributed extractor must preserve the exact block sequence currently
-  produced by `extract_block_units` / `non_parbreak_blocks`.
-- Owner, equation-origin, footnote-body, patch-surface, and semantic-key
-  metadata must be attached at the same moment the block boundary is emitted.
-- Empty carrier blocks must be represented only when they are real extracted
-  blocks, not invented or skipped by a later attribution pass.
-- Table/grid effective-render blocks, figure body/caption carriers, footnote
-  marker/body carriers, display-equation shells, opaque wrapper surfaces, and
-  page-style propagation must all keep their current tested behavior.
-- `AttributedBlockStream` should be constructed from attributed block claims
-  without any realized-content owner lookup.
-
-Implementation steps:
-
-1. Add focused tests around attributed block extraction cardinality and owner
-   placement for:
-   - plain paragraphs with inline styling,
-   - table/grid cells,
-   - figures with body and caption edits,
-   - footnotes near unchanged visible text,
-   - display equations adjacent to empty blocks,
-   - opaque visual wrappers.
-2. Build `extract_annotated_block_units` alongside `extract_block_units` and
-   assert in tests that the emitted block payload sequence is identical to
-   `extract_block_units(&root.realized)` after non-parbreak filtering.
-3. Move semantic owner and equation origin attachment into the extractor at the
-   point where each block is emitted.
-4. Change `prepare_diff_inputs` / stream construction to use attributed block
-   vectors as the source of both block matching and `AttributedBlockStream`.
-5. Delete the old realized-content recovery bridge:
-   - `collect_block_owner_claims`
-   - `collect_equation_origin_block_claims`
-   - `find_annotated_block_owner`
-   - `find_single_block_semantic_owner`
-   - `collect_single_block_semantic_owners`
-   - `owned_block_matches`
-   - `BlockOwnerClaim`
-   - `EquationOriginBlockClaim`
-6. Delete tests that only cover those private recovery helpers, after replacing
-   them with attributed-extraction behavior tests.
-7. Update `TECHNICAL-DECISIONS.md` and any docs that still describe block
-   attribution as recovered by content matching.
-
-Exit criteria:
-
-- No production hits for the deleted owner/equation claim recovery symbols.
-- `AttributedBlockStream` is built from retained attributed extraction output,
-  not by re-scanning the annotated tree for matching realized content.
-- Existing table, figure, footnote, equation, opaque-wrapper, and repeated-block
-  integration tests pass.
-- Passing corpus passes.
-
-Estimated net production LOC: -250 to -500.
 
 ## Final Acceptance Gate
 
