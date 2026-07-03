@@ -1,6 +1,6 @@
 # Technical Decisions
 
-## Annotated Block Extraction Is Deferred Phase 8
+## Attributed Block Extraction Foundation Is Phase 3
 
 - Phase 1 is complete only to the safe indexed-stream boundary: production block
   ops are indexed, block-op consumption reads attributed streams by index, and
@@ -9,21 +9,26 @@
   `collect_block_owner_claims`, `collect_equation_origin_block_claims`, and
   `find_annotated_block_owner` preserve table, figure, footnote, equation, and
   opaque-wrapper owner placement during stream construction.
+- Phase 3 introduced a test-only `extract_annotated_block_units` foundation that
+  emits attributed block units beside the production path and proves exact
+  non-parbreak payload parity with `extract_block_units`.
+- The focused parity tests cover inline-styled paragraphs, single-item list
+  owners, table-cell owners, footnote-owned carriers, display equation origins,
+  and quote empty carriers.
 - A direct replacement attempt that walked the annotated tree and emitted stream
   claims separately from block extraction broke integration tests by shifting
   owner placement. The failures clustered around table/grid recursion, figure
   body/caption ownership, footnote body recovery, display equation tokenization,
   and opaque wrapper deduplication.
-- The correct follow-up is a new `extract_annotated_block_units`-style primitive
-  that emits each `DiffBlock` together with its attribution in the same pass that
-  decides block boundaries.
+- The production follow-up is Phase 4: make attributed extraction authoritative
+  for stream construction, then delete the old realized-content recovery bridge.
 - Do not keep private helpers merely because they have direct tests or might be
   useful. If a helper stops serving production behavior after a refactor, delete
   it and delete or rewrite tests that only protect the obsolete private behavior.
 
-Tradeoff: deferring attributed block extraction keeps later deletion phases
-unblocked while avoiding a brittle half-step that loses provenance. The debt is
-explicitly moved to Phase 8 rather than being treated as completed Phase 1 work.
+Tradeoff: Phase 3 intentionally does not switch production behavior. It gives
+Phase 4 a narrow, test-pinned boundary for the risky dependency inversion while
+keeping the existing bridge honest and visible until it can be deleted.
 
 ## Block Ops Consume Attributed Streams By Index
 
@@ -387,6 +392,6 @@ Tradeoff: CeTZ changes are currently represented as whole opaque old/new visual 
 
 Tradeoff: this phase improves ownership boundaries but does not yet deliver the
 intended LOC reduction. The remaining FB-007/008/009 bridges are behaviorally
-required until Phase 8 retains block/slot/wrapper provenance during extraction,
+required until Phase 4 retains block/slot/wrapper provenance during extraction,
 at which point these container-owned debt paths should be deleted rather than
 kept for their tests.

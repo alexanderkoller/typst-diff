@@ -276,6 +276,20 @@ Purpose: disentangle the dependency that blocked Phase 2 without doing a risky
 production switch. This phase builds and tests the new extractor beside the old
 stream-construction bridge.
 
+Progress:
+
+- Done: added a test-only `extract_annotated_block_units` foundation that emits
+  attributed block units beside production stream construction.
+- Done: factored stream claim construction into a shared
+  `attributed_block_claims` helper so the foundation and current stream builder
+  can be compared directly.
+- Done: parity tests prove exact non-parbreak block payload preservation for
+  inline-styled paragraphs, single-item list owners, table-cell owners,
+  footnote-owned carriers, display equation origins, and quote empty carriers.
+- Deferred to Phase 4: production stream construction still uses the
+  realized-content owner/equation recovery bridge. The bridge remains active
+  until attributed extraction becomes authoritative.
+
 Problem today: Phase 1 made production block ops indexed and removed the owner
 and equation cursor objects, but stream construction still recovers ownership
 after block extraction by matching realized content. Phase 2 showed that this

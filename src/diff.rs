@@ -74,6 +74,13 @@ pub struct DiffBlock {
     pub page_styles: Styles,
 }
 
+#[derive(Clone)]
+#[cfg(test)]
+struct AttributedDiffBlock<'a> {
+    block: DiffBlock,
+    claim: AttributedBlockClaim<'a, SemanticOwnerKey>,
+}
+
 /// Stable semantic identity for pairing authored owners before text similarity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SemanticOwnerKey {
@@ -97,6 +104,17 @@ fn extract_block_units(content: &Content) -> Vec<DiffBlock> {
     let mut blocks = extract_block_units_with_styles(content, Styles::new());
     make_page_styles_sticky(&mut blocks);
     blocks
+}
+
+#[cfg(test)]
+fn extract_annotated_block_units(root: &AnnotatedContent) -> Vec<AttributedDiffBlock<'_>> {
+    let blocks = non_parbreak_blocks(&extract_block_units(&root.realized));
+    let claims = attributed_block_claims(root, &blocks);
+    blocks
+        .into_iter()
+        .zip(claims)
+        .map(|(block, claim)| AttributedDiffBlock { block, claim })
+        .collect()
 }
 
 /// Propagate page styles forward so every block has the most-recently-set page context.
@@ -2294,6 +2312,13 @@ fn attributed_block_stream<'a>(
     root: &'a AnnotatedContent,
     blocks: &[DiffBlock],
 ) -> AttributedBlockStream<'a, SemanticOwnerKey> {
+    AttributedBlockStream::from_claims(attributed_block_claims(root, blocks))
+}
+
+fn attributed_block_claims<'a>(
+    root: &'a AnnotatedContent,
+    blocks: &[DiffBlock],
+) -> Vec<AttributedBlockClaim<'a, SemanticOwnerKey>> {
     let mut owner_claims = Vec::new();
     collect_block_owner_claims(root, &mut owner_claims);
     attach_semantic_owner_keys(&mut owner_claims);
@@ -2303,24 +2328,28 @@ fn attributed_block_stream<'a>(
 
     let mut owner_index = 0;
     let mut equation_index = 0;
-    AttributedBlockStream::from_claims(blocks.iter().map(|block| {
-        let owner_claim = take_block_owner_claim(&owner_claims, &mut owner_index, &block.content);
-        let fallback_owner = owner_claim
-            .owner
-            .is_none()
-            .then(|| find_annotated_block_owner(root, &block.content))
-            .flatten();
-        AttributedBlockClaim {
-            owner: owner_claim.owner,
-            fallback_owner,
-            owner_key: owner_claim.key,
-            equation_origins: take_equation_origin_claim(
-                &equation_claims,
-                &mut equation_index,
-                &block.content,
-            ),
-        }
-    }))
+    blocks
+        .iter()
+        .map(|block| {
+            let owner_claim =
+                take_block_owner_claim(&owner_claims, &mut owner_index, &block.content);
+            let fallback_owner = owner_claim
+                .owner
+                .is_none()
+                .then(|| find_annotated_block_owner(root, &block.content))
+                .flatten();
+            AttributedBlockClaim {
+                owner: owner_claim.owner,
+                fallback_owner,
+                owner_key: owner_claim.key,
+                equation_origins: take_equation_origin_claim(
+                    &equation_claims,
+                    &mut equation_index,
+                    &block.content,
+                ),
+            }
+        })
+        .collect()
 }
 
 fn indexed_attributed_block<'a>(
@@ -6696,6 +6725,7 @@ fn deleted_edit_for_annotated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotated::{Annotation, FootnoteInfo};
     use typst::foundations::NativeElement;
     use typst::model::HeadingElem;
     use typst::text::TextElem;
@@ -6706,6 +6736,69 @@ mod tests {
 
     fn annotated(content: &Content) -> AnnotatedContent {
         crate::annotated::annotate_realized(content, content)
+    }
+
+    fn annotated_leaf(content: Content) -> AnnotatedContent {
+        AnnotatedContent {
+            realized: content,
+            annotation: Annotation::default(),
+            children: vec![],
+        }
+    }
+
+    fn semantic_owner(
+        kind: SemanticKind,
+        realized: Content,
+        slots: Vec<SemanticSlot>,
+        children: Vec<AnnotatedContent>,
+    ) -> AnnotatedContent {
+        AnnotatedContent {
+            realized,
+            annotation: Annotation {
+                semantic_kind: Some(kind),
+                slots,
+                ..Annotation::default()
+            },
+            children,
+        }
+    }
+
+    fn assert_attributed_block_payloads_match(
+        root: &AnnotatedContent,
+    ) -> Vec<AttributedDiffBlock<'_>> {
+        let expected = non_parbreak_blocks(&extract_block_units(&root.realized));
+        let units = extract_annotated_block_units(root);
+        assert_eq!(
+            units.len(),
+            expected.len(),
+            "attributed extraction must preserve non-parbreak block cardinality"
+        );
+        for (unit, expected) in units.iter().zip(&expected) {
+            assert_eq!(unit.block.content, expected.content);
+            assert_eq!(unit.block.page_styles, expected.page_styles);
+        }
+        units
+    }
+
+    fn claim_owner_kind(
+        claim: &AttributedBlockClaim<'_, SemanticOwnerKey>,
+    ) -> Option<SemanticKind> {
+        claim
+            .owner
+            .or(claim.fallback_owner)
+            .and_then(|owner| owner.annotation.semantic_kind.clone())
+    }
+
+    fn assert_attributed_claims_match_stream_builder(root: &AnnotatedContent) {
+        let blocks = non_parbreak_blocks(&extract_block_units(&root.realized));
+        let expected = attributed_block_claims(root, &blocks);
+        let units = extract_annotated_block_units(root);
+        assert_eq!(units.len(), expected.len());
+        for (unit, claim) in units.iter().zip(&expected) {
+            assert_eq!(claim_owner_kind(&unit.claim), claim_owner_kind(claim));
+            assert_eq!(unit.claim.owner_key, claim.owner_key);
+            assert_eq!(unit.claim.equation_origins, claim.equation_origins);
+        }
     }
 
     fn contains_style_for<T: NativeElement>(content: &Content) -> bool {
@@ -7579,6 +7672,153 @@ mod tests {
         assert!(text.contains("The species is known as"), "{text}");
         assert!(text.contains("Felis domesticus"), "{text}");
         assert!(text.contains("in older literature"), "{text}");
+    }
+
+    #[test]
+    fn attributed_block_extraction_matches_plain_and_inline_styled_blocks() {
+        use typst::visualize::Color;
+
+        let content = seq([
+            TextElem::packed("The species is known as "),
+            TextElem::packed("Felis domesticus")
+                .styled(TextElem::fill.set(Color::from_u8(1, 2, 3, 255).into())),
+            TextElem::packed(" in older literature."),
+        ]);
+        let root = annotated(&content);
+
+        let units = assert_attributed_block_payloads_match(&root);
+
+        assert_eq!(units.len(), 1);
+        assert!(units[0].claim.owner.is_none());
+        assert_attributed_claims_match_stream_builder(&root);
+    }
+
+    #[test]
+    fn attributed_block_extraction_claims_single_item_list_owner() {
+        let item = annotated_leaf(TextElem::packed("Only item"));
+        let root = semantic_owner(
+            SemanticKind::List,
+            TextElem::packed("Only item"),
+            vec![SemanticSlot {
+                label: SlotStep::ListItem(0),
+                path: vec![0],
+                patch_path: None,
+            }],
+            vec![item],
+        );
+
+        let units = assert_attributed_block_payloads_match(&root);
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(claim_owner_kind(&units[0].claim), Some(SemanticKind::List));
+        assert_eq!(
+            units[0]
+                .claim
+                .owner_key
+                .as_ref()
+                .map(|key| key.slot_labels.clone()),
+            Some(vec![SlotStep::ListItem(0)])
+        );
+        assert_attributed_claims_match_stream_builder(&root);
+    }
+
+    #[test]
+    fn attributed_block_extraction_claims_table_cell_owner() {
+        let cell = annotated_leaf(TextElem::packed("Cell text"));
+        let root = semantic_owner(
+            SemanticKind::Table,
+            TextElem::packed("Cell text"),
+            vec![SemanticSlot {
+                label: SlotStep::TableCell(0),
+                path: vec![0],
+                patch_path: None,
+            }],
+            vec![cell],
+        );
+
+        let units = assert_attributed_block_payloads_match(&root);
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(claim_owner_kind(&units[0].claim), Some(SemanticKind::Table));
+        assert_eq!(
+            units[0]
+                .claim
+                .owner_key
+                .as_ref()
+                .map(|key| key.slot_labels.clone()),
+            Some(vec![SlotStep::TableCell(0)])
+        );
+        assert_attributed_claims_match_stream_builder(&root);
+    }
+
+    #[test]
+    fn attributed_block_extraction_keeps_footnote_owner_reachable() {
+        let body = TextElem::packed("Footnote body");
+        let root = AnnotatedContent {
+            realized: TextElem::packed("1"),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Paragraph),
+                footnote: Some(FootnoteInfo { body: body.clone() }),
+                slots: vec![SemanticSlot {
+                    label: SlotStep::FootnoteBody,
+                    path: vec![0],
+                    patch_path: None,
+                }],
+                ..Annotation::default()
+            },
+            children: vec![annotated_leaf(body)],
+        };
+
+        let units = assert_attributed_block_payloads_match(&root);
+
+        assert_eq!(units.len(), 1);
+        let owner = units[0].claim.owner.expect("expected footnote owner claim");
+        assert!(owner.annotation.footnote.is_some());
+        assert_attributed_claims_match_stream_builder(&root);
+    }
+
+    #[test]
+    fn attributed_block_extraction_keeps_display_equation_origin_claim() {
+        let origin = Content::new(EquationElem::new(TextElem::packed("x")).with_block(true));
+        let root = AnnotatedContent {
+            realized: origin.clone(),
+            annotation: Annotation {
+                semantic_kind: Some(SemanticKind::Equation),
+                equation_origins: vec![origin.clone()],
+                ..Annotation::default()
+            },
+            children: vec![],
+        };
+
+        let units = assert_attributed_block_payloads_match(&root);
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            claim_owner_kind(&units[0].claim),
+            Some(SemanticKind::Equation)
+        );
+        assert_eq!(units[0].claim.equation_origins, vec![origin]);
+        assert_attributed_claims_match_stream_builder(&root);
+    }
+
+    #[test]
+    fn attributed_block_extraction_claims_quote_empty_carrier() {
+        let root = semantic_owner(
+            SemanticKind::Quote,
+            TextElem::packed(""),
+            vec![SemanticSlot {
+                label: SlotStep::QuoteBody,
+                path: vec![0],
+                patch_path: None,
+            }],
+            vec![annotated_leaf(TextElem::packed("Quoted text"))],
+        );
+
+        let units = assert_attributed_block_payloads_match(&root);
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(claim_owner_kind(&units[0].claim), Some(SemanticKind::Quote));
+        assert_attributed_claims_match_stream_builder(&root);
     }
 
     #[test]
