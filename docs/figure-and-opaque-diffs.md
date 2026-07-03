@@ -1,8 +1,13 @@
 # Figure and Opaque Diffs
 
-This note explains the figure/caption regression cluster: corpus `34`, `71`,
-`72`, `73`, `90`, `91`, and `92`. The fix is not figure-specific. Figures are
-the clearest instance of a broader rule:
+This note explains the historical figure/caption regression cluster: corpus
+`34`, `71`, `72`, `73`, `90`, `91`, and `92`. These cases are not all current
+failures. In the maintained 99-case corpus gate, the figure/caption cases are
+green: corpus 72 was fixed by retaining the realized `FigureCaption` display
+surface, and the current 71/73 outputs were accepted as better references.
+
+The fix is not figure-specific. Figures are the clearest instance of a broader
+rule:
 
 > Authored semantic structure owns the diff; realized layout structure is only a
 > rendering surface.

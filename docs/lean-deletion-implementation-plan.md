@@ -1110,10 +1110,9 @@ Exit criteria:
   `FB-014-rendered-region-layout-alignment-fallback`.
 - Phase-specific corpus gates pass for `41-running-header-query` and
   `42-page-x-of-y`.
-- Full passing-corpus gate is not green in the current workspace: it still has
-  visual failures in `45-package-showybox` and `72-figure-caption-deleted`.
-  These failures are outside rendered-region wrapper selection and were not
-  fixed in this phase.
+- The maintained 99-case passing-corpus gate is green. Corpus 45 remains
+  outside that gate; a temporary source-level `showybox` prototype demonstrated
+  a possible future route but was removed because it was package-specific.
 - `TECHNICAL-DECISIONS.md` records the retained wrapper provenance model and any
   explicit unsupported boundary.
 
@@ -1128,8 +1127,9 @@ Honest report of improvements not made:
   hides context closure bodies behind private `Func` internals. If Typst exposes
   closure bodies publicly, replace the syntax-span bridge with direct closure
   provenance.
-- This phase did not fix the existing non-rendered-region visual corpus
-  failures in `45-package-showybox` and `72-figure-caption-deleted`.
+- This phase did not make corpus 45 part of the general diff architecture.
+  The findings are recorded in `docs/showybox-source-diff-findings.md`; the
+  temporary package-specific prototype was removed.
 
 Estimated net production LOC: -70 to -160, depending on how much wrapper
 metadata is needed in `context_recording`.
@@ -1138,6 +1138,12 @@ metadata is needed in `context_recording`.
 
 Purpose: remove documentation and diagnostics that only exist for deleted
 legacy paths.
+
+Progress:
+
+- Done before the main Phase 11 sweep: documented the temporary
+  `showybox` source-level prototype in `docs/showybox-source-diff-findings.md`
+  and removed the package-specific early exit from production code.
 
 Steps:
 

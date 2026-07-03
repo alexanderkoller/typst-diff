@@ -208,6 +208,11 @@ notes reflect the follow-up work in this session.
    `72-figure-caption-deleted`, `73-figure-body-changed-caption-added`, and
    `89-show-figure-caption-template-changed`.
 
+   Current status: the maintained 99-case corpus gate is green for 71, 72, and
+   73. Corpus 72 was fixed by retaining the realized `FigureCaption` display
+   surface for deleted captions. The current outputs for 71 and 73 were accepted
+   as better references rather than treated as remaining code failures.
+
 5. `50-footnote-changed`
 
    Symptom: the actual output drops the body text before the footnote marker and

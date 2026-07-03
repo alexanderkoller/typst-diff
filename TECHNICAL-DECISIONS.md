@@ -1,5 +1,24 @@
 # Technical Decisions
 
+## Removed Temporary Showybox Source-Level Prototype
+
+- A temporary source-level `showybox` prototype proved that corpus 45 can be
+  rendered usefully by rewriting the authored `#showybox(...)[...]` body in the
+  new source with inline diff markup, then rendering the patched source.
+- The prototype was deliberately removed from production code because it was a
+  package-name special case, paired calls by source order, recognized only one
+  literal source shape, and bypassed the normal evaluated-content diff,
+  decision, annotation, debug, and fallback machinery.
+- The finding is recorded in `docs/showybox-source-diff-findings.md` as seed
+  material for a future general feature: source-body diffing for opaque package
+  or function expansions whose authored body is provably available in source but
+  lost during package expansion.
+
+Tradeoff: removing the prototype gives up the current corpus-45 visual
+improvement, but keeps the codebase aligned with the no package-specific
+fallback rule. A future solution should be syntax/provenance-driven and should
+enter the normal diff pipeline as an explicit supported surface.
+
 ## Corpus 72 Fixed By Retaining Figure Caption Display Surface
 
 - Deleted figure captions now retain the full `FigureCaption` slot surface
@@ -13,6 +32,9 @@
   patch surface produced through Typst's own caption realization while the
   converged introspector is available. This keeps counter/supplement text as
   retained provenance instead of reconstructing labels later.
+- The adjacent figure-caption cases 71 and 73 are not current code failures.
+  Their new outputs were reviewed and accepted as better references, so the
+  maintained 99-case corpus gate is green for 71, 72, and 73.
 
 Tradeoff: caption display realization now runs as a small post-annotation
 provenance pass. It uses Typst's existing `FigureCaption::realize` API and does
