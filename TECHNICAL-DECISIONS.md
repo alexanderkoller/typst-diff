@@ -1,5 +1,30 @@
 # Technical Decisions
 
+## Annotated Block Extraction Is Deferred Phase 8
+
+- Phase 1 is complete only to the safe indexed-stream boundary: production block
+  ops are indexed, block-op consumption reads attributed streams by index, and
+  the owner/equation cursor objects are gone.
+- The remaining owner/equation claim helpers are still production-useful:
+  `collect_block_owner_claims`, `collect_equation_origin_block_claims`, and
+  `find_annotated_block_owner` preserve table, figure, footnote, equation, and
+  opaque-wrapper owner placement during stream construction.
+- A direct replacement attempt that walked the annotated tree and emitted stream
+  claims separately from block extraction broke integration tests by shifting
+  owner placement. The failures clustered around table/grid recursion, figure
+  body/caption ownership, footnote body recovery, display equation tokenization,
+  and opaque wrapper deduplication.
+- The correct follow-up is a new `extract_annotated_block_units`-style primitive
+  that emits each `DiffBlock` together with its attribution in the same pass that
+  decides block boundaries.
+- Do not keep private helpers merely because they have direct tests or might be
+  useful. If a helper stops serving production behavior after a refactor, delete
+  it and delete or rewrite tests that only protect the obsolete private behavior.
+
+Tradeoff: deferring attributed block extraction keeps later deletion phases
+unblocked while avoiding a brittle half-step that loses provenance. The debt is
+explicitly moved to Phase 8 rather than being treated as completed Phase 1 work.
+
 ## Block Ops Consume Attributed Streams By Index
 
 - The lean deletion pass begins by promoting indexed block attribution inside
