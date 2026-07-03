@@ -5,13 +5,19 @@
 - Phase 1 is complete only to the safe indexed-stream boundary: production block
   ops are indexed, block-op consumption reads attributed streams by index, and
   the owner/equation cursor objects are gone.
-- The remaining owner/equation claim helpers are still production-useful:
-  `collect_block_owner_claims`, `collect_equation_origin_block_claims`, and
-  `find_annotated_block_owner` preserve table, figure, footnote, equation, and
-  opaque-wrapper owner placement during stream construction.
+- Phase 5 removed the remaining realized-content owner scan:
+  `find_annotated_block_owner`, `find_single_block_semantic_owner`, and
+  `collect_single_block_semantic_owners` are gone from production code.
 - Phase 3 introduced a test-only `extract_annotated_block_units` foundation that
   emits attributed block units beside the production path and proves exact
   non-parbreak payload parity with `extract_block_units`.
+- Phase 4 made attributed block units the source for block matching and
+  `AttributedBlockStream` construction. `PreparedDiffInputs` now carries
+  attributed old/new block vectors, and the stream is built from the retained
+  claims on those units instead of rebuilding claims in the main diff loop.
+- The old `BlockOwnerClaim` and `EquationOriginBlockClaim` structs and their
+  collector functions were removed; temporary owner/equation outputs now use
+  `AttributedDiffBlock` directly.
 - The focused parity tests cover inline-styled paragraphs, single-item list
   owners, table-cell owners, footnote-owned carriers, display equation origins,
   and quote empty carriers.
@@ -20,15 +26,28 @@
   owner placement. The failures clustered around table/grid recursion, figure
   body/caption ownership, footnote body recovery, display equation tokenization,
   and opaque wrapper deduplication.
-- The production follow-up is Phase 4: make attributed extraction authoritative
-  for stream construction, then delete the old realized-content recovery bridge.
+- A Phase 4 deletion probe showed that removing `find_annotated_block_owner`
+  before retaining more owner provenance regressed real table/grid/raw behavior:
+  deleted table/grid structure, repeated same-text table cells, reused named
+  tables, generated table wrappers, and raw table cells stopped recursing through
+  their semantic owners.
+- Phase 5 fixes that by allowing table/grid direct owners to make
+  variable-number block claims over the realized carriers they emit, while other
+  owners keep fixed single-carrier direct claims to avoid stealing
+  figure/equation/opaque/repeated-container edits.
+- Generated table/grid wrappers can still surface an effective table block whose
+  structure differs from the retained table surface. For that narrow case,
+  attributed extraction collects table/grid effective-owner blocks and consumes
+  them by exact non-empty rendered text, in extraction order, only when the
+  normal realized-carrier claim is ownerless.
 - Do not keep private helpers merely because they have direct tests or might be
   useful. If a helper stops serving production behavior after a refactor, delete
   it and delete or rewrite tests that only protect the obsolete private behavior.
 
-Tradeoff: Phase 3 intentionally does not switch production behavior. It gives
-Phase 4 a narrow, test-pinned boundary for the risky dependency inversion while
-keeping the existing bridge honest and visible until it can be deleted.
+Tradeoff: this removes the tree-wide owner scan without broad normalized-visible
+owner recovery. The remaining exact rendered-text match is scoped to retained
+table/grid effective owners because Typst can produce generated wrapper carrier
+content with the same rendered table text but a different internal structure.
 
 ## Block Ops Consume Attributed Streams By Index
 
@@ -59,10 +78,8 @@ keeping the existing bridge honest and visible until it can be deleted.
   the change.
 
 Tradeoff: this removes the cursor objects and the block-op content-search
-bridge, but not the underlying owner discovery debt. `collect_block_owner_claims`,
-`collect_equation_origin_block_claims`, and `find_annotated_block_owner` still
-recover attribution from realized content until annotation or block extraction
-can retain owner/path provenance directly.
+bridge. Phase 5 then removes the remaining tree-wide owner scan by retaining
+table/grid/raw ownership during attributed extraction.
 
 ## Legacy Cleanup Keeps Only Proven Bridges
 

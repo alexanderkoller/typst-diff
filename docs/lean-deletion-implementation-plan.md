@@ -73,7 +73,7 @@ Clean abstraction to promote: `AttributedBlockStream`.
 Problem today: the block diff works on cloned `Content` values. Later, the
 stream has to recover ownership by searching for matching realized content,
 which keeps `BlockOwnerCursor`, `EquationOriginBlockCursor`, and
-`find_annotated_block_owner` alive.
+the later owner-scan bridge alive.
 
 Progress:
 
@@ -84,11 +84,10 @@ Progress:
 - Done: `BlockOwnerCursor`, `EquationOriginBlockCursor`, content-search
   attributed block lookup, duplicate realized stream payloads, and the duplicate
   content-rich edit-zone matcher have been removed.
-- Deferred to Phases 3 and 4: `collect_block_owner_claims`,
-  `collect_equation_origin_block_claims`, and `find_annotated_block_owner` still
-  recover attribution from realized content inside stream construction.
-  Replacing those requires retained owner/path provenance from annotation or
-  block extraction.
+- Deferred beyond this phase: the later owner-scan bridge still recovered some
+  attribution from realized content inside attributed block construction. Phase
+  5 deletes that bridge after retaining table/grid/raw ownership during
+  extraction.
 
 Target design:
 
@@ -295,7 +294,7 @@ and equation cursor objects, but stream construction still recovers ownership
 after block extraction by matching realized content. Phase 2 showed that this
 same missing provenance keeps FB-007, FB-008, and FB-009 alive.
 
-The active bridge is:
+The pre-Phase-4 bridge was:
 
 - `collect_block_owner_claims`
 - `collect_equation_origin_block_claims`
@@ -305,6 +304,10 @@ The active bridge is:
 - `owned_block_matches`
 - `BlockOwnerClaim`
 - `EquationOriginBlockClaim`
+
+After the Phase 4 slice, only `find_annotated_block_owner`,
+`find_single_block_semantic_owner`, and `collect_single_block_semantic_owners`
+remain active from this list.
 
 Important technical note:
 
@@ -383,21 +386,42 @@ Estimated net production LOC: +50 to +150.
 Purpose: make retained attributed extraction authoritative, then delete the old
 realized-content recovery bridge.
 
+Progress:
+
+- Done: `prepare_diff_inputs` now builds old/new attributed block vectors and
+  uses their `DiffBlock` payloads for indexed block matching.
+- Done: `AttributedBlockStream` is now constructed from retained claims on
+  attributed block units, not by rebuilding stream claims in the main diff loop.
+- Done: removed the old `BlockOwnerClaim` and `EquationOriginBlockClaim`
+  structs, their collector names, and `owned_block_matches`; temporary
+  owner/equation outputs now use `AttributedDiffBlock` directly.
+- Done: deleted direct tests for the removed private `find_annotated_child`
+  helper rather than keeping obsolete helper tests alive.
+- Resolved by Phase 5: `find_annotated_block_owner`,
+  `find_single_block_semantic_owner`, and
+  `collect_single_block_semantic_owners` remained active after this phase
+  because a deletion probe caused
+  regressions in deleted table/grid structure, raw block line diffs, repeated
+  same-text table cells, reused named tables, generated wrapper tables, and raw
+  table cells. Phase 5 deletes them after retaining the missing table/grid/raw
+  owner provenance directly.
+
 Implementation steps:
 
 1. Change `prepare_diff_inputs` / stream construction to use attributed block
    vectors as the source of both block matching and `AttributedBlockStream`.
 2. Keep a short transition assertion in tests that attributed block payloads
    still match the legacy extraction payloads.
-3. Delete the old realized-content recovery bridge:
-   - `collect_block_owner_claims`
-   - `collect_equation_origin_block_claims`
-   - `find_annotated_block_owner`
-   - `find_single_block_semantic_owner`
-   - `collect_single_block_semantic_owners`
-   - `owned_block_matches`
-   - `BlockOwnerClaim`
-   - `EquationOriginBlockClaim`
+3. Delete the old realized-content recovery bridge where behavior proves it is
+   obsolete:
+   - Done: `collect_block_owner_claims`
+   - Done: `collect_equation_origin_block_claims`
+   - Done in Phase 5: `find_annotated_block_owner`
+   - Done in Phase 5: `find_single_block_semantic_owner`
+   - Done in Phase 5: `collect_single_block_semantic_owners`
+   - Done: `owned_block_matches`
+   - Done: `BlockOwnerClaim`
+   - Done: `EquationOriginBlockClaim`
 4. Delete tests that only cover those private recovery helpers, after replacing
    them with attributed-extraction behavior tests.
 5. Retire or narrow FB-007, FB-008, and FB-009. These codes should disappear if
@@ -418,15 +442,104 @@ Exit criteria:
 
 Estimated net production LOC: -300 to -650.
 
-## Phase 5: Tighten Equation And Footnote Provenance
+## Phase 5: Finish Owner-Retained Attributed Extraction
+
+Clean abstraction to promote: attributed block extraction as the direct owner
+of table/grid/raw/container block provenance.
+
+Purpose: delete the remaining owner scan without weakening table/grid/raw
+behavior. Phase 4 made attributed block units authoritative for block matching
+and stream construction, but still needed a post-hoc owner scan when extraction
+lost table/grid/raw provenance.
+
+Progress:
+
+- Done: table/grid owners may make variable-number direct block claims over the
+  realized carrier blocks they emit, so deleted table/grid structures and
+  repeated same-text table cells keep their semantic owner without a tree-wide
+  owner scan.
+- Done: raw blocks are direct block owners, so raw line diffs keep authored raw
+  provenance through attributed extraction.
+- Done: generated table/grid wrappers use a narrow retained effective-owner side
+  channel: table/grid effective blocks are consumed by exact non-empty rendered
+  text, in extraction order, only when the realized-carrier claim is ownerless.
+- Done: variable-number direct block claims are limited to table/grid. Figures,
+  equations, opaque wrappers, and repeated macro containers keep fixed
+  single-carrier direct claims.
+- Done: deleted `find_annotated_block_owner`,
+  `find_single_block_semantic_owner`, and
+  `collect_single_block_semantic_owners`.
+
+Pre-Phase-5 bridge:
+
+- `find_annotated_block_owner`
+- `find_single_block_semantic_owner`
+- `collect_single_block_semantic_owners`
+
+A Phase 4 deletion probe showed that these helpers are still behaviorally
+required for:
+
+- deleted table and grid structure,
+- raw block line diffs,
+- repeated same-text table cells,
+- reused named tables,
+- generated wrapper tables,
+- raw table cells,
+- inserted and deleted table rows.
+
+Target design:
+
+- Attributed extraction emits the semantic owner at the same time it emits the
+  block payload.
+- Table/grid realized carriers keep their table/grid owner directly, even when
+  their visible text is empty and their effective render content is used later
+  for slot recursion.
+- Raw block owners are retained directly through extraction, so raw line diffs
+  do not depend on a later exact-content search.
+- Repeated same-text owners are disambiguated by extraction order and semantic
+  owner keys, not by normalized visible-text recovery.
+
+Implementation steps:
+
+1. Add focused regression coverage for the failed deletion probe if any case is
+   not already directly covered by integration tests.
+2. Teach owner claim extraction to claim realized table/grid/raw/container
+   carriers directly when those carriers are the blocks used by indexed block
+   matching.
+3. Keep effective-render table/grid content available for slot recursion, but
+   do not use it as a replacement for the stream block owner claim when it
+   would misalign with the production block payload.
+4. Delete:
+   - `find_annotated_block_owner`
+   - `find_single_block_semantic_owner`
+   - `collect_single_block_semantic_owners`
+5. Delete tests that only protect the private owner scan. Keep or add behavior
+   tests that prove table/grid/raw ownership survives without it.
+6. Retire or narrow any FB-007, FB-008, or FB-009 debt that becomes obsolete.
+7. Update `TECHNICAL-DECISIONS.md` with the retained-owner extraction decision
+   and the deletion probe result.
+
+Exit criteria:
+
+- No production hits for `find_annotated_block_owner`,
+  `find_single_block_semantic_owner`, or
+  `collect_single_block_semantic_owners`.
+- Table/grid/raw probe regressions from Phase 4 still pass.
+- `AttributedBlockStream` owner claims are sourced from attributed extraction,
+  not from a post-hoc annotated tree scan.
+- Passing-corpus gate passes.
+
+Estimated net production LOC: -80 to -180.
+
+## Phase 6: Tighten Equation And Footnote Provenance
 
 Clean abstraction to promote: provenance carried by annotation and attributed
 block extraction.
 
 Problem today: equation provenance was improved, but duplicate block-level
-carrier recovery remains until Phase 4 removes old claim construction. Footnote
-marker matching still uses the visible marker number when no stronger marker
-provenance exists.
+carrier recovery remains until Phase 5 finishes retained owner extraction.
+Footnote marker matching still uses the visible marker number when no stronger
+marker provenance exists.
 
 Target design:
 
@@ -450,7 +563,7 @@ Implementation steps:
 5. Delete or narrow:
    - duplicate `realized_equation_carrier_count_for_diff`
    - duplicate `collect_annotated_equation_origins`
-   - any block-level equation claim structs left after Phase 4
+   - any block-level equation claim structs left after Phase 5
 
 Tests to add or update:
 
@@ -468,7 +581,7 @@ Exit criteria:
 
 Estimated net production LOC: -120 to -220.
 
-## Phase 6: Promote content_tree For Render Path Editing
+## Phase 7: Promote content_tree For Render Path Editing
 
 Clean abstraction to promote: `content_tree`.
 
@@ -521,7 +634,7 @@ Exit criteria:
 
 Estimated net production LOC: -50 to -100.
 
-## Phase 7: Promote content_key And Diff Surface Selection
+## Phase 8: Promote content_key And Diff Surface Selection
 
 Clean abstractions to promote: `content_key`, `DiffSurfaceEdit`, and
 `DiffAreaKind`.
@@ -595,7 +708,7 @@ Exit criteria:
 
 Estimated net production LOC: -150 to -300.
 
-## Phase 8: Delete Rendered-Region Source Parsing
+## Phase 9: Delete Rendered-Region Source Parsing
 
 Clean abstractions to promote: `context_recording`, structural content-tree
 inspection, `DiffAreaKind::RenderedPageRegion`, and rendered-region surfaces.
@@ -647,7 +760,7 @@ Exit criteria:
 
 Estimated net production LOC: -40 to -90.
 
-## Phase 9: Prune Debug, Ledger, And Docs
+## Phase 10: Prune Debug, Ledger, And Docs
 
 Purpose: remove documentation and diagnostics that only exist for deleted
 legacy paths.

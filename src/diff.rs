@@ -75,7 +75,6 @@ pub struct DiffBlock {
 }
 
 #[derive(Clone)]
-#[cfg(test)]
 struct AttributedDiffBlock<'a> {
     block: DiffBlock,
     claim: AttributedBlockClaim<'a, SemanticOwnerKey>,
@@ -106,7 +105,6 @@ fn extract_block_units(content: &Content) -> Vec<DiffBlock> {
     blocks
 }
 
-#[cfg(test)]
 fn extract_annotated_block_units(root: &AnnotatedContent) -> Vec<AttributedDiffBlock<'_>> {
     let blocks = non_parbreak_blocks(&extract_block_units(&root.realized));
     let claims = attributed_block_claims(root, &blocks);
@@ -1658,10 +1656,12 @@ pub struct DiffBlockDebug {
     pub matched_ops: Vec<BlockOp>,
 }
 
-struct PreparedDiffInputs {
+struct PreparedDiffInputs<'a> {
     new_layout_blocks: Vec<DiffBlock>,
     old_realized_blocks: Vec<DiffBlock>,
     new_realized_blocks: Vec<DiffBlock>,
+    old_attributed_blocks: Vec<AttributedDiffBlock<'a>>,
+    new_attributed_blocks: Vec<AttributedDiffBlock<'a>>,
     matched_ops: Vec<IndexedBlockOp>,
     debug: Option<DiffBlockDebug>,
 }
@@ -2240,18 +2240,20 @@ fn modified_block_log_text(base: &Content, word_ops: &[WordOp]) -> String {
     content_log_text(base)
 }
 
-fn prepare_diff_inputs(
-    old: &AnnotatedContent,
-    new: &AnnotatedContent,
+fn prepare_diff_inputs<'a>(
+    old: &'a AnnotatedContent,
+    new: &'a AnnotatedContent,
     capture_debug: bool,
     debug_events: &mut Option<&mut dyn DebugEventSink>,
-) -> anyhow::Result<PreparedDiffInputs> {
+) -> anyhow::Result<PreparedDiffInputs<'a>> {
     let new_surface = effective_text_content(new);
     let new_layout_blocks = extract_block_units(&new_surface);
     let old_realized_blocks = extract_block_units(&old.realized);
     let new_realized_blocks = extract_block_units(&new.realized);
-    let old_blocks = non_parbreak_blocks(&old_realized_blocks);
-    let new_blocks = non_parbreak_blocks(&new_realized_blocks);
+    let old_attributed_blocks = extract_annotated_block_units(old);
+    let new_attributed_blocks = extract_annotated_block_units(new);
+    let old_blocks = attributed_diff_blocks(&old_attributed_blocks);
+    let new_blocks = attributed_diff_blocks(&new_attributed_blocks);
     emit_pipeline_trace_event(
         debug_events,
         PipelineTraceEvent::new("diff/block-extraction", "complete").reason(format!(
@@ -2303,16 +2305,21 @@ fn prepare_diff_inputs(
         new_layout_blocks,
         old_realized_blocks,
         new_realized_blocks,
+        old_attributed_blocks,
+        new_attributed_blocks,
         matched_ops: matched,
         debug,
     })
 }
 
+fn attributed_diff_blocks(blocks: &[AttributedDiffBlock<'_>]) -> Vec<DiffBlock> {
+    blocks.iter().map(|unit| unit.block.clone()).collect()
+}
+
 fn attributed_block_stream<'a>(
-    root: &'a AnnotatedContent,
-    blocks: &[DiffBlock],
+    blocks: &[AttributedDiffBlock<'a>],
 ) -> AttributedBlockStream<'a, SemanticOwnerKey> {
-    AttributedBlockStream::from_claims(attributed_block_claims(root, blocks))
+    AttributedBlockStream::from_claims(blocks.iter().map(|unit| unit.claim.clone()))
 }
 
 fn attributed_block_claims<'a>(
@@ -2320,27 +2327,35 @@ fn attributed_block_claims<'a>(
     blocks: &[DiffBlock],
 ) -> Vec<AttributedBlockClaim<'a, SemanticOwnerKey>> {
     let mut owner_claims = Vec::new();
-    collect_block_owner_claims(root, &mut owner_claims);
+    collect_owner_attributed_blocks(root, &mut owner_claims);
     attach_semantic_owner_keys(&mut owner_claims);
+    let mut effective_owner_claims = Vec::new();
+    collect_effective_table_owner_blocks(root, &mut effective_owner_claims);
+    attach_semantic_owner_keys(&mut effective_owner_claims);
 
     let mut equation_claims = Vec::new();
-    collect_equation_origin_block_claims(root, &mut equation_claims);
+    collect_equation_attributed_blocks(root, &mut equation_claims);
 
     let mut owner_index = 0;
     let mut equation_index = 0;
+    let mut effective_owner_claimed = vec![false; effective_owner_claims.len()];
     blocks
         .iter()
         .map(|block| {
-            let owner_claim =
+            let mut owner_claim =
                 take_block_owner_claim(&owner_claims, &mut owner_index, &block.content);
-            let fallback_owner = owner_claim
-                .owner
-                .is_none()
-                .then(|| find_annotated_block_owner(root, &block.content))
-                .flatten();
+            if owner_claim.owner.is_none()
+                && let Some(effective_claim) = take_effective_owner_claim(
+                    &effective_owner_claims,
+                    &mut effective_owner_claimed,
+                    &block.content,
+                )
+            {
+                owner_claim = effective_claim;
+            }
             AttributedBlockClaim {
                 owner: owner_claim.owner,
-                fallback_owner,
+                fallback_owner: None,
                 owner_key: owner_claim.key,
                 equation_origins: take_equation_origin_claim(
                     &equation_claims,
@@ -3516,10 +3531,10 @@ fn diff_annotated_inner_with_events(
     let root_styles = sanitize_page_styles(root_page_styles_raw(&new.realized));
 
     let mut layout = LayoutCursor::new(&prepared.new_layout_blocks);
-    let old_match_blocks = non_parbreak_blocks(&prepared.old_realized_blocks);
-    let new_match_blocks = non_parbreak_blocks(&prepared.new_realized_blocks);
-    let old_stream = attributed_block_stream(old, &old_match_blocks);
-    let new_stream = attributed_block_stream(new, &new_match_blocks);
+    let old_match_blocks = attributed_diff_blocks(&prepared.old_attributed_blocks);
+    let new_match_blocks = attributed_diff_blocks(&prepared.new_attributed_blocks);
+    let old_stream = attributed_block_stream(&prepared.old_attributed_blocks);
+    let new_stream = attributed_block_stream(&prepared.new_attributed_blocks);
     debug_assert_eq!(old_stream.len(), old_match_blocks.len());
     debug_assert_eq!(new_stream.len(), new_match_blocks.len());
     let mut blocks = Vec::new();
@@ -5299,40 +5314,29 @@ impl<'a> LayoutCursor<'a> {
     }
 }
 
-struct BlockOwnerClaim<'a> {
-    content: Content,
-    owner: Option<&'a AnnotatedContent>,
-    key: Option<SemanticOwnerKey>,
-}
-
 #[derive(Clone)]
 struct BlockOwnerMatch<'a> {
     owner: Option<&'a AnnotatedContent>,
     key: Option<SemanticOwnerKey>,
 }
 
-struct EquationOriginBlockClaim {
-    content: Content,
-    origins: Vec<Content>,
-}
-
 fn take_block_owner_claim<'a>(
-    claims: &[BlockOwnerClaim<'a>],
+    claims: &[AttributedDiffBlock<'a>],
     index: &mut usize,
     target: &Content,
 ) -> BlockOwnerMatch<'a> {
     while let Some(claim) = claims.get(*index) {
-        if owned_block_matches(&claim.content, target) {
+        if attributed_block_content_matches(&claim.block.content, target) {
             *index += 1;
             return BlockOwnerMatch {
-                owner: claim.owner,
-                key: claim.key.clone(),
+                owner: claim.claim.owner,
+                key: claim.claim.owner_key.clone(),
             };
         }
-        if claim.owner.is_some_and(is_display_equation_owner) {
+        if claim.claim.owner.is_some_and(is_display_equation_owner) {
             break;
         }
-        if !claim.content.plain_text().trim().is_empty() {
+        if !claim.block.content.plain_text().trim().is_empty() {
             break;
         }
         *index += 1;
@@ -5344,16 +5348,18 @@ fn take_block_owner_claim<'a>(
 }
 
 fn take_equation_origin_claim(
-    claims: &[EquationOriginBlockClaim],
+    claims: &[AttributedDiffBlock<'_>],
     index: &mut usize,
     target: &Content,
 ) -> Vec<Content> {
     while let Some(claim) = claims.get(*index) {
-        if claim.content == *target {
+        if claim.block.content == *target {
             *index += 1;
-            return claim.origins.clone();
+            return claim.claim.equation_origins.clone();
         }
-        if !claim.content.plain_text().trim().is_empty() || !target.plain_text().trim().is_empty() {
+        if !claim.block.content.plain_text().trim().is_empty()
+            || !target.plain_text().trim().is_empty()
+        {
             break;
         }
         *index += 1;
@@ -5361,18 +5367,19 @@ fn take_equation_origin_claim(
     Vec::new()
 }
 
-fn collect_equation_origin_block_claims(
+fn collect_equation_attributed_blocks(
     node: &AnnotatedContent,
-    out: &mut Vec<EquationOriginBlockClaim>,
+    out: &mut Vec<AttributedDiffBlock<'_>>,
 ) {
     let subtree_origins = annotated_equation_origins(node);
     if !subtree_origins.is_empty() {
         let blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
         if blocks.len() == 1 {
-            out.push(EquationOriginBlockClaim {
-                content: blocks[0].content.clone(),
-                origins: subtree_origins,
-            });
+            out.push(attributed_diff_block(
+                blocks[0].clone(),
+                None,
+                subtree_origins,
+            ));
             return;
         }
 
@@ -5387,10 +5394,7 @@ fn collect_equation_origin_block_claims(
                     .filter_map(|_| origins.pop_front())
                     .collect::<Vec<_>>();
                 if !block_origins.is_empty() {
-                    out.push(EquationOriginBlockClaim {
-                        content: block.content,
-                        origins: block_origins,
-                    });
+                    out.push(attributed_diff_block(block, None, block_origins));
                 }
             }
             return;
@@ -5398,7 +5402,7 @@ fn collect_equation_origin_block_claims(
     }
 
     for child in &node.children {
-        collect_equation_origin_block_claims(child, out);
+        collect_equation_attributed_blocks(child, out);
     }
 }
 
@@ -5443,10 +5447,10 @@ fn realized_equation_carrier_count_for_diff(content: &Content) -> usize {
     0
 }
 
-fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
+fn attach_semantic_owner_keys(claims: &mut [AttributedDiffBlock<'_>]) {
     let mut ordinals: HashMap<SemanticKind, usize> = HashMap::new();
     for claim in claims {
-        let Some(owner) = claim.owner else {
+        let Some(owner) = claim.claim.owner else {
             continue;
         };
         let Some(kind) = owner.annotation.semantic_kind.clone() else {
@@ -5454,7 +5458,7 @@ fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
         };
         let slot_labels = slot_labels_owned(owner);
         let ordinal = ordinals.entry(kind.clone()).or_default();
-        claim.key = Some(SemanticOwnerKey {
+        claim.claim.owner_key = Some(SemanticOwnerKey {
             kind,
             slot_labels,
             ordinal: *ordinal,
@@ -5463,79 +5467,108 @@ fn attach_semantic_owner_keys(claims: &mut [BlockOwnerClaim<'_>]) {
     }
 }
 
-fn collect_block_owner_claims<'a>(node: &'a AnnotatedContent, out: &mut Vec<BlockOwnerClaim<'a>>) {
+fn collect_owner_attributed_blocks<'a>(
+    node: &'a AnnotatedContent,
+    out: &mut Vec<AttributedDiffBlock<'a>>,
+) {
     let blocks = owner_block_units(node);
     if node.annotation.semantic_kind == Some(SemanticKind::Quote)
         && !node.annotation.slots.is_empty()
         && let Some(block) = blocks.first()
     {
-        out.push(BlockOwnerClaim {
-            content: block.content.clone(),
-            owner: Some(node),
-            key: None,
-        });
+        out.push(attributed_diff_block(block.clone(), Some(node), Vec::new()));
         return;
     }
+    if let Some(owner) = direct_block_owner(node)
+        && (blocks.len() == 1 || allows_variable_block_direct_claims(owner))
+    {
+        out.extend(
+            blocks
+                .into_iter()
+                .map(|block| attributed_diff_block(block, Some(owner), Vec::new())),
+        );
+        return;
+    }
+
     if blocks.len() == 1 {
-        let owner = if is_owned_diff_region(node)
-            || has_equation_origins(node)
-            || is_opaque_visual_owner(node)
-        {
-            Some(node)
-        } else {
-            unique_enclosed_diff_region_owner(node)
-        };
+        let owner = unique_enclosed_diff_region_owner(node);
         if owner.is_some() || node.children.is_empty() {
-            out.push(BlockOwnerClaim {
-                content: blocks[0].content.clone(),
-                owner,
-                key: None,
-            });
+            out.push(attributed_diff_block(blocks[0].clone(), owner, Vec::new()));
             return;
         }
     }
 
     if node.children.is_empty() {
-        out.extend(blocks.into_iter().map(|block| BlockOwnerClaim {
-            content: block.content,
-            owner: None,
-            key: None,
-        }));
+        out.extend(
+            blocks
+                .into_iter()
+                .map(|block| attributed_diff_block(block, None, Vec::new())),
+        );
     } else {
         for child in &node.children {
-            collect_block_owner_claims(child, out);
+            collect_owner_attributed_blocks(child, out);
         }
+    }
+}
+
+fn collect_effective_table_owner_blocks<'a>(
+    node: &'a AnnotatedContent,
+    out: &mut Vec<AttributedDiffBlock<'a>>,
+) {
+    if matches!(
+        node.annotation.semantic_kind,
+        Some(SemanticKind::Table | SemanticKind::Grid)
+    ) {
+        let effective = effective_render_content(node);
+        out.extend(
+            non_parbreak_blocks(&extract_block_units(&effective))
+                .into_iter()
+                .map(|block| attributed_diff_block(block, Some(node), Vec::new())),
+        );
+    }
+    for child in &node.children {
+        collect_effective_table_owner_blocks(child, out);
+    }
+}
+
+fn attributed_diff_block<'a>(
+    block: DiffBlock,
+    owner: Option<&'a AnnotatedContent>,
+    equation_origins: Vec<Content>,
+) -> AttributedDiffBlock<'a> {
+    AttributedDiffBlock {
+        block,
+        claim: AttributedBlockClaim {
+            owner,
+            fallback_owner: None,
+            owner_key: None,
+            equation_origins,
+        },
     }
 }
 
 fn owner_block_units(node: &AnnotatedContent) -> Vec<DiffBlock> {
-    let realized_blocks = non_parbreak_blocks(&extract_block_units(&node.realized));
-    if matches!(
-        node.annotation.semantic_kind,
-        Some(SemanticKind::Table | SemanticKind::Grid)
-    ) && realized_blocks
-        .iter()
-        .all(|block| block.content.plain_text().trim().is_empty())
-    {
-        let effective = effective_render_content(node);
-        let blocks = non_parbreak_blocks(&extract_block_units(&effective));
-        let nonempty_blocks = blocks
-            .iter()
-            .filter(|block| !block.content.plain_text().trim().is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        if !nonempty_blocks.is_empty() {
-            return nonempty_blocks;
-        }
-        if !blocks.is_empty() {
-            return blocks;
-        }
-    }
-    realized_blocks
+    non_parbreak_blocks(&extract_block_units(&node.realized))
 }
 
-fn is_owned_diff_region(node: &AnnotatedContent) -> bool {
-    !node.annotation.slots.is_empty()
+fn direct_block_owner(node: &AnnotatedContent) -> Option<&AnnotatedContent> {
+    if has_equation_origins(node)
+        || is_opaque_visual_owner(node)
+        || node.annotation.semantic_kind == Some(SemanticKind::RawBlock)
+    {
+        return Some(node);
+    }
+    if !node.annotation.slots.is_empty() {
+        return Some(node);
+    }
+    None
+}
+
+fn allows_variable_block_direct_claims(node: &AnnotatedContent) -> bool {
+    matches!(
+        node.annotation.semantic_kind,
+        Some(SemanticKind::Table | SemanticKind::Grid)
+    )
 }
 
 fn unique_enclosed_diff_region_owner(node: &AnnotatedContent) -> Option<&AnnotatedContent> {
@@ -5543,8 +5576,33 @@ fn unique_enclosed_diff_region_owner(node: &AnnotatedContent) -> Option<&Annotat
     (owners.len() == 1).then(|| owners.remove(0).1)
 }
 
-fn owned_block_matches(owner_block: &Content, target: &Content) -> bool {
+fn attributed_block_content_matches(owner_block: &Content, target: &Content) -> bool {
     owner_block == target || content_key::normalized_visible_text_matches(owner_block, target)
+}
+
+fn take_effective_owner_claim<'a>(
+    claims: &[AttributedDiffBlock<'a>],
+    claimed: &mut [bool],
+    target: &Content,
+) -> Option<BlockOwnerMatch<'a>> {
+    let index = claims.iter().enumerate().find_map(|(index, claim)| {
+        (!claimed[index] && effective_owner_block_matches(&claim.block.content, target))
+            .then_some(index)
+    })?;
+    claimed[index] = true;
+    let claim = &claims[index];
+    Some(BlockOwnerMatch {
+        owner: claim.claim.owner,
+        key: claim.claim.owner_key.clone(),
+    })
+}
+
+fn effective_owner_block_matches(owner_block: &Content, target: &Content) -> bool {
+    if owner_block == target {
+        return true;
+    }
+    let owner_text = owner_block.plain_text();
+    !owner_text.is_empty() && owner_text == target.plain_text()
 }
 
 fn semantic_owner_claims_match(
@@ -5654,78 +5712,6 @@ fn annotated_block_from(content: &Content, source: Option<&AnnotatedContent>) ->
         annotation: Default::default(),
         children: vec![],
     }
-}
-
-/// Find the annotated descendant whose realized content exactly matches `target`.
-fn find_annotated_child<'a>(
-    root: &'a AnnotatedContent,
-    target: &Content,
-) -> Option<&'a AnnotatedContent> {
-    let mut exact = Vec::new();
-    collect_annotated_matches(root, target, &mut exact);
-    exact
-        .into_iter()
-        .max_by_key(|node| node.annotation.slots.len())
-}
-
-fn collect_annotated_matches<'a>(
-    node: &'a AnnotatedContent,
-    target: &Content,
-    out: &mut Vec<&'a AnnotatedContent>,
-) {
-    if node.realized == *target {
-        out.push(node);
-    }
-    for child in &node.children {
-        collect_annotated_matches(child, target, out);
-    }
-}
-
-fn find_single_block_semantic_owner<'a>(
-    root: &'a AnnotatedContent,
-    target: &Content,
-) -> Option<&'a AnnotatedContent> {
-    let mut owners = Vec::new();
-    collect_single_block_semantic_owners(root, target, &mut owners);
-    owners
-        .into_iter()
-        .max_by_key(|node| node.annotation.slots.len())
-}
-
-fn collect_single_block_semantic_owners<'a>(
-    node: &'a AnnotatedContent,
-    target: &Content,
-    out: &mut Vec<&'a AnnotatedContent>,
-) {
-    if !node.annotation.slots.is_empty() {
-        if matches!(
-            node.annotation.semantic_kind,
-            Some(SemanticKind::Table | SemanticKind::Grid)
-        ) && content_key::normalized_visible_text_matches(
-            &effective_render_content(node),
-            target,
-        ) {
-            out.push(node);
-        }
-        let blocks = owner_block_units(node);
-        if blocks.len() == 1 && owned_block_matches(&blocks[0].content, target) {
-            out.push(node);
-        }
-    }
-    for child in &node.children {
-        collect_single_block_semantic_owners(child, target, out);
-    }
-}
-
-fn find_annotated_block_owner<'a>(
-    root: &'a AnnotatedContent,
-    target: &Content,
-) -> Option<&'a AnnotatedContent> {
-    let exact = find_annotated_child(root, target);
-    if exact.is_some_and(|node| !node.annotation.slots.is_empty()) {
-        return exact;
-    }
-    find_single_block_semantic_owner(root, target).or(exact)
 }
 
 /// True when both nodes have the same slot-bearing semantic kind.
@@ -6839,81 +6825,6 @@ mod tests {
         };
         let result = diff_annotated(&node_a, &node_a);
         assert!(result.blocks.iter().all(|block| block.edits.is_empty()));
-    }
-
-    #[test]
-    fn find_annotated_child_returns_child_with_matching_realized() {
-        use crate::annotated::{AnnotatedContent, Annotation};
-
-        let target = TextElem::packed("hello");
-        let other = TextElem::packed("world");
-        let root = AnnotatedContent {
-            realized: TextElem::packed("root"),
-            annotation: Annotation::default(),
-            children: vec![
-                AnnotatedContent {
-                    realized: other.clone(),
-                    annotation: Annotation::default(),
-                    children: vec![],
-                },
-                AnnotatedContent {
-                    realized: target.clone(),
-                    annotation: Annotation::default(),
-                    children: vec![],
-                },
-            ],
-        };
-        let found = find_annotated_child(&root, &target);
-        assert!(found.is_some());
-        assert!(found.unwrap().realized == target);
-    }
-
-    #[test]
-    fn find_annotated_child_returns_none_when_no_match() {
-        use crate::annotated::{AnnotatedContent, Annotation};
-
-        let root = AnnotatedContent {
-            realized: TextElem::packed("root"),
-            annotation: Annotation::default(),
-            children: vec![AnnotatedContent {
-                realized: TextElem::packed("child"),
-                annotation: Annotation::default(),
-                children: vec![],
-            }],
-        };
-        assert!(find_annotated_child(&root, &TextElem::packed("missing")).is_none());
-    }
-
-    #[test]
-    fn find_annotated_child_does_not_match_empty_text_fallback() {
-        use crate::annotated::{
-            AnnotatedContent, Annotation, SemanticKind, SemanticSlot, SlotStep, WrapperKind,
-        };
-
-        let target = Content::sequence([]);
-        let root = AnnotatedContent {
-            realized: TextElem::packed("root"),
-            annotation: Annotation::default(),
-            children: vec![AnnotatedContent {
-                realized: TextElem::packed(""),
-                annotation: Annotation {
-                    semantic_kind: Some(SemanticKind::Wrapper(WrapperKind::Pad)),
-                    slots: vec![SemanticSlot {
-                        label: SlotStep::WrapperBody,
-                        path: vec![0],
-                        patch_path: None,
-                    }],
-                    ..Annotation::default()
-                },
-                children: vec![AnnotatedContent {
-                    realized: TextElem::packed("body"),
-                    annotation: Annotation::default(),
-                    children: vec![],
-                }],
-            }],
-        };
-
-        assert!(find_annotated_child(&root, &target).is_none());
     }
 
     #[test]
