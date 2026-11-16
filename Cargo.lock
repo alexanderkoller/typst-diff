@@ -2640,7 +2640,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "rustc-hash",
  "serde",
  "serde_json",
  "serde_yaml",

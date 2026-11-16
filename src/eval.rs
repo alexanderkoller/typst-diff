@@ -14,8 +14,7 @@
 //! with identical text but different show rules would look identical in the diff.
 
 use anyhow::Result;
-use std::sync::LazyLock;
-use typst::ROUTINES;
+use std::sync::Arc;
 use typst::World;
 use typst::comemo::Track;
 use typst::diag::{FileError, FileResult};
@@ -24,34 +23,32 @@ use typst::foundations::{
     Bytes, Content, Datetime, Duration, NativeElement, Style, StyleChain, Styles, Target,
     TargetElem,
 };
-use typst::introspection::{Introspector, Locator};
-use typst::layout::{PageElem, PagebreakElem, PagedDocument};
+use typst::introspection::{EmptyIntrospector, Introspector, Locator};
+use typst::layout::{PageElem, PagebreakElem};
 use typst::model::{DocumentInfo, FootnoteElem};
-use typst::routines::{Arenas, RealizationKind, Routines};
+use typst::routines::{Arenas, RealizationKind};
 use typst::syntax::{FileId, Source};
 use typst::text::{Font, FontBook};
-use typst::utils::LazyHash;
+use typst::utils::{LazyHash, Protected};
 use typst::{Library, LibraryExt};
 use typst_kit::fonts::FontStore;
+use typst_layout::{PagedDocument, PagedIntrospector};
 
 use crate::diag::format_diagnostics;
 use crate::normalize::normalize_list_item_runs;
 
-static DIFF_ROUTINES: LazyLock<Routines> = LazyLock::new(|| {
-    let mut rules = typst::foundations::NativeRuleMap::new();
-    typst_layout::register(&mut rules);
-    crate::context_recording::install_recording_context_rule(&mut rules);
-
-    Routines {
-        rules,
-        eval_string: ROUTINES.eval_string,
-        eval_closure: ROUTINES.eval_closure,
-        realize: ROUTINES.realize,
-        layout_frame: ROUTINES.layout_frame,
-        html_module: ROUTINES.html_module,
-        html_span_filled: ROUTINES.html_span_filled,
-    }
-});
+/// The world's standard library with typst-diff's recording context rule
+/// installed in place of Typst's native one.
+///
+/// Since Typst 0.15 the native show rules live in [`Library::rules`] (built once
+/// from the library's routines) and the engine reads them from
+/// [`Engine::library`], so the recording rule is installed into a copy of the
+/// world's library rather than into a separate routines table.
+fn diff_library(world: &dyn World) -> LazyHash<Library> {
+    let mut library = Library::clone(world.library());
+    crate::context_recording::install_recording_context_rule(&mut library.rules);
+    LazyHash::new(library)
+}
 
 /// Evaluate the entry file and return the raw, unrealized [`Content`] tree.
 ///
@@ -65,8 +62,8 @@ pub fn eval_to_content(world: &dyn World) -> Result<Content> {
     let mut sink = Sink::new();
     let traced = Traced::default();
     typst_eval::eval(
-        &ROUTINES,
         world.track(),
+        world.library(),
         traced.track(),
         sink.track_mut(),
         Route::default().track(),
@@ -218,18 +215,22 @@ pub fn layout_document(world: &dyn World, content: &Content) -> Result<PagedDocu
     let target = TargetElem::target.set(Target::Paged).wrap();
     let styles = base.chain(&target);
 
+    let diff_library = diff_library(world);
     let traced = Traced::default();
-    let mut introspector = Introspector::default();
     let mut final_sink = Sink::new();
-    let mut document = None;
+    let mut document: Option<PagedDocument> = None;
 
     for _ in 0..5 {
         let constraint = typst::comemo::Constraint::new();
         let mut sink = Sink::new();
+        let introspector: &dyn Introspector = match &document {
+            Some(document) => document.introspector().as_ref(),
+            None => &EmptyIntrospector,
+        };
         let mut engine = Engine {
-            routines: &DIFF_ROUTINES,
+            library: &diff_library,
             world: world.track(),
-            introspector: introspector.track_with(&constraint),
+            introspector: Protected::new(introspector.track_with(&constraint)),
             traced: traced.track(),
             sink: sink.track_mut(),
             route: Route::default(),
@@ -239,12 +240,10 @@ pub fn layout_document(world: &dyn World, content: &Content) -> Result<PagedDocu
             typst_layout::layout_document(&mut engine, content, styles).map_err(|errs| {
                 anyhow::anyhow!("layout failed:\n{}", format_diagnostics(world, &errs))
             })?;
-        let next_introspector = laid_out.introspector.clone();
-        let converged = constraint.validate(&next_introspector);
+        let converged = constraint.validate(laid_out.introspector().as_ref() as &dyn Introspector);
 
         document = Some(laid_out);
         final_sink = sink;
-        introspector = next_introspector;
 
         if converged {
             break;
@@ -268,23 +267,27 @@ pub fn layout_document(world: &dyn World, content: &Content) -> Result<PagedDocu
 /// on their own position (page references, footnote numbering, counters). Running
 /// layout once produces an initial introspector; repeating with that introspector
 /// lets position-dependent values stabilize. 5 iterations is Typst's standard limit.
-fn layout_introspector(world: &dyn World, content: &Content) -> Result<Introspector> {
+fn layout_introspector(world: &dyn World, content: &Content) -> Result<Arc<PagedIntrospector>> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
     let target = TargetElem::target.set(Target::Paged).wrap();
     let styles = base.chain(&target);
 
     let traced = Traced::default();
-    let mut introspector = Introspector::default();
+    let mut introspector: Option<Arc<PagedIntrospector>> = None;
     let mut final_sink = Sink::new();
 
     for _ in 0..5 {
         let constraint = typst::comemo::Constraint::new();
         let mut sink = Sink::new();
+        let current: &dyn Introspector = match &introspector {
+            Some(introspector) => introspector.as_ref(),
+            None => &EmptyIntrospector,
+        };
         let mut engine = Engine {
-            routines: &ROUTINES,
+            library,
             world: world.track(),
-            introspector: introspector.track_with(&constraint),
+            introspector: Protected::new(current.track_with(&constraint)),
             traced: traced.track(),
             sink: sink.track_mut(),
             route: Route::default(),
@@ -294,11 +297,11 @@ fn layout_introspector(world: &dyn World, content: &Content) -> Result<Introspec
             typst_layout::layout_document(&mut engine, content, styles).map_err(|errs| {
                 anyhow::anyhow!("layout failed:\n{}", format_diagnostics(world, &errs))
             })?;
-        let next_introspector = laid_out.introspector.clone();
-        let converged = constraint.validate(&next_introspector);
+        let next_introspector = laid_out.introspector().clone();
+        let converged = constraint.validate(next_introspector.as_ref() as &dyn Introspector);
 
         final_sink = sink;
-        introspector = next_introspector;
+        introspector = Some(next_introspector);
 
         if converged {
             break;
@@ -313,7 +316,7 @@ fn layout_introspector(world: &dyn World, content: &Content) -> Result<Introspec
         ));
     }
 
-    Ok(introspector)
+    introspector.ok_or_else(|| anyhow::anyhow!("layout loop did not run"))
 }
 
 /// Expand show rules and finalize the content tree using a stable `introspector`.
@@ -326,10 +329,10 @@ fn layout_introspector(world: &dyn World, content: &Content) -> Result<Introspec
 fn realize_to_content(
     world: &dyn World,
     content: &Content,
-    introspector: Introspector,
+    introspector: Arc<PagedIntrospector>,
 ) -> Result<Content> {
     crate::context_recording::clear();
-    let library = world.library();
+    let library = diff_library(world);
     let target = TargetElem::target.set(Target::Paged).wrap();
     let base = StyleChain::new(&library.styles);
     let styles = base.chain(&target);
@@ -339,10 +342,11 @@ fn realize_to_content(
 
     let traced = Traced::default();
     let mut sink = Sink::new();
+    let introspector: &dyn Introspector = introspector.as_ref();
     let mut engine = Engine {
-        routines: &DIFF_ROUTINES,
+        library: &library,
         world: world.track(),
-        introspector: introspector.track(),
+        introspector: Protected::new(introspector.track()),
         traced: traced.track(),
         sink: sink.track_mut(),
         route: Route::default(),
@@ -351,8 +355,8 @@ fn realize_to_content(
     let arenas = Arenas::default();
     let mut info = DocumentInfo::default();
     let mut locator = Locator::root().split();
-    let realized = (DIFF_ROUTINES.realize)(
-        RealizationKind::LayoutDocument { info: &mut info },
+    let realized = (library.routines.realize)(
+        RealizationKind::Document { info: &mut info },
         &mut engine,
         &mut locator,
         &arenas,

@@ -1,12 +1,10 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-use rustc_hash::FxHashMap;
 use typst::diag::SourceResult;
 use typst::engine::Engine;
 use typst::foundations::{
-    Content, ContextElem, Element, NativeElement, NativeRuleMap, NativeShowRule, Packed, ShowFn,
-    StyleChain, Target,
+    Content, ContextElem, NativeRuleMap, Packed, ShowFn, StyleChain, Target,
 };
 use typst::syntax::Span;
 
@@ -16,23 +14,8 @@ thread_local! {
     };
 }
 
-#[repr(C)]
-struct NativeRuleMapRepr {
-    rules: FxHashMap<(Element, Target), NativeShowRule>,
-}
-
 pub(crate) fn install_recording_context_rule(rules: &mut NativeRuleMap) {
-    let replacement = NativeShowRule::new(recording_context_rule as ShowFn<ContextElem>);
-
-    // Typst's NativeRuleMap exposes registration but not replacement. The map is
-    // a single-field wrapper, so keep this narrow and assert the layout we rely on.
-    debug_assert_eq!(
-        std::mem::size_of::<NativeRuleMap>(),
-        std::mem::size_of::<NativeRuleMapRepr>()
-    );
-    let raw = unsafe { &mut *(rules as *mut NativeRuleMap).cast::<NativeRuleMapRepr>() };
-    raw.rules
-        .insert((ContextElem::ELEM, Target::Paged), replacement);
+    rules.replace(Target::Paged, recording_context_rule as ShowFn<ContextElem>);
 }
 
 pub(crate) fn clear() {
