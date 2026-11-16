@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
-use typst::World;
+use typst::{World, WorldExt};
 use typst::foundations::{
     Content, ContextElem, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem,
     Styles,
@@ -32,7 +32,7 @@ use typst::foundations::{
 use typst::introspection::{MetadataElem, StateUpdateElem, Tag, TagElem};
 use typst::layout::{
     AlignElem, BlockBody, BlockElem, BoxElem, ColumnsElem, Frame, FrameItem, GridChild, GridElem,
-    GridItem, PadElem, PageElem, PagebreakElem, PagedDocument, PlaceElem, Point, Rel,
+    GridItem, PadElem, PageElem, PagebreakElem, PlaceElem, Point, Rel,
 };
 use typst::math::EquationElem;
 use typst::model::{
@@ -45,6 +45,7 @@ use typst::text::{
     SuperElem, TextElem, UnderlineElem,
 };
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
+use typst_layout::PagedDocument;
 
 use crate::annotated::{
     AnnotatedContent, SemanticKind, SemanticSlot, SlotStep, WrapperKind, annotate_realized,
@@ -4670,7 +4671,7 @@ fn rendered_region_wrapper(world: &dyn World, content: &Content) -> RenderedRegi
     let Ok(source) = world.source(id) else {
         return RenderedRegionWrapper::None;
     };
-    let Some(range) = source.range(span) else {
+    let Some(range) = world.range(span) else {
         return RenderedRegionWrapper::None;
     };
     let Some(snippet) = source.text().get(range) else {
@@ -4728,7 +4729,7 @@ fn rendered_region_texts(
 ) -> anyhow::Result<Vec<RenderedRegionText>> {
     let semantic_region_exists = page_region_content(styles, kind).is_some();
     let mut out = Vec::new();
-    for (index, page) in document.pages.iter().enumerate() {
+    for (index, page) in document.pages().iter().enumerate() {
         out.push(rendered_region_text(
             side,
             index + 1,
@@ -7943,7 +7944,7 @@ mod tests {
             .expect("expected standalone old deletion");
 
         assert!(!deleted.page_styles.is_empty());
-        assert!(deleted.page_styles.has(PageElem::flipped));
+        assert!(StyleChain::new(&deleted.page_styles).has(PageElem::flipped));
     }
 
     #[test]
