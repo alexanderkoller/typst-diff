@@ -10,27 +10,35 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use typst::diag::{FileError, FileResult};
-use typst::foundations::{Bytes, Datetime};
-use typst::syntax::{FileId, Source, VirtualPath};
+use typst::foundations::{Bytes, Datetime, Duration};
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
-use typst_kit::download::{Downloader, ProgressSink};
-use typst_kit::fonts::{FontSearcher, FontSlot};
-use typst_kit::package::PackageStorage;
+use typst_kit::downloader::SystemDownloader;
+use typst_kit::files::{FsRoot, SystemFiles};
+use typst_kit::fonts::FontStore;
+use typst_kit::packages::SystemPackages;
 
 /// Return Typst's current-date value for this process.
 ///
 /// Typst expects `None` to mean that the date is unavailable and reports that as
 /// an evaluation error. Cache the UTC instant so the old and new documents see
 /// the same "today" value even if a diff run crosses midnight.
-pub(crate) fn current_date(offset: Option<i64>) -> Option<Datetime> {
+///
+/// Since Typst 0.15 the offset is a [`Duration`]; it is truncated to whole
+/// seconds, as in `typst-kit`'s own implementation.
+pub(crate) fn current_date(offset: Option<Duration>) -> Option<Datetime> {
     static NOW_UTC: OnceLock<time::OffsetDateTime> = OnceLock::new();
 
     let now = *NOW_UTC.get_or_init(time::OffsetDateTime::now_utc);
     let date = match offset {
-        Some(hours) => {
-            let offset = time::UtcOffset::from_hms(hours.try_into().ok()?, 0, 0).ok()?;
+        Some(offset) => {
+            let seconds = offset.seconds().trunc();
+            if !seconds.is_finite() || seconds < f64::from(i32::MIN) || seconds > f64::from(i32::MAX) {
+                return None;
+            }
+            let offset = time::UtcOffset::from_whole_seconds(seconds as i32).ok()?;
             now.to_offset(offset).date()
         }
         None => {
@@ -42,19 +50,33 @@ pub(crate) fn current_date(offset: Option<i64>) -> Option<Datetime> {
     Datetime::from_ymd(date.year(), date.month() as u8, date.day())
 }
 
+/// Collect the fonts available to Typst: system fonts first, then the fonts
+/// embedded in the binary (lowest priority), matching the Typst CLI.
+pub(crate) fn search_fonts() -> FontStore {
+    let mut fonts = FontStore::new();
+    fonts.extend(typst_kit::fonts::system());
+    fonts.extend(typst_kit::fonts::embedded());
+    fonts
+}
+
+/// The [`FileId`] of a project file at the virtual path `path`.
+pub(crate) fn project_file_id(path: &str) -> Result<FileId> {
+    let vpath = VirtualPath::new(path).with_context(|| format!("invalid virtual path {path:?}"))?;
+    Ok(RootedPath::new(VirtualRoot::Project, vpath).intern())
+}
+
 /// A Typst [`World`] that reads source and binary files from the local filesystem.
 ///
 /// All virtual paths are rooted at the directory containing the entry file.
 /// Files are cached after the first read so repeated accesses are free.
 pub struct SystemWorld {
-    /// Absolute path to the directory containing the entry file — the "root" for virtual paths.
-    root: PathBuf,
+    /// Resolves project files (rooted at the directory containing the entry
+    /// file) and package files (downloaded on demand) to paths on disk.
+    files: SystemFiles,
     /// The virtual [`FileId`] assigned to the entry file (always `/<filename>`).
     main: FileId,
     library: LazyHash<Library>,
-    book: LazyHash<FontBook>,
-    font_slots: Vec<FontSlot>,
-    package_storage: PackageStorage,
+    fonts: FontStore,
     /// Cache of already-parsed [`Source`] objects, keyed by their virtual [`FileId`].
     source_cache: Arc<Mutex<HashMap<FileId, Source>>>,
     /// Cache of raw binary file bytes (images, fonts, etc.).
@@ -80,17 +102,16 @@ impl SystemWorld {
             .ok_or_else(|| anyhow::anyhow!("entry path has no filename: {:?}", entry))?
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("filename is not valid UTF-8: {:?}", entry))?;
-        let main = FileId::new(None, VirtualPath::new(format!("/{filename}")));
-
-        let fonts = FontSearcher::new().search();
+        let main = project_file_id(&format!("/{filename}"))?;
 
         let world = Self {
-            root,
+            files: SystemFiles::new(
+                FsRoot::new(root),
+                SystemPackages::new(SystemDownloader::new("typst-diff")),
+            ),
             main,
             library: LazyHash::new(Library::default()),
-            book: LazyHash::new(fonts.book),
-            font_slots: fonts.fonts,
-            package_storage: PackageStorage::new(None, None, Downloader::new("typst-diff")),
+            fonts: search_fonts(),
             source_cache: Default::default(),
             file_cache: Default::default(),
         };
@@ -103,22 +124,11 @@ impl SystemWorld {
 
     /// Resolve a virtual [`FileId`] to an absolute path on disk.
     ///
-    /// For package files, the package is downloaded (once) via `package_storage`
-    /// and the returned root is the unpacked package directory. For project files,
-    /// the root is `self.root`.
+    /// For package files, the package is downloaded (once) into the package
+    /// cache and the returned root is the unpacked package directory. For
+    /// project files, the root is the directory containing the entry file.
     fn disk_path(&self, id: FileId) -> FileResult<PathBuf> {
-        let root = if let Some(package) = id.package() {
-            let mut progress = ProgressSink;
-            self.package_storage
-                .prepare_package(package, &mut progress)
-                .map_err(FileError::from)?
-        } else {
-            self.root.clone()
-        };
-
-        id.vpath()
-            .resolve(&root)
-            .ok_or_else(|| FileError::NotFound(root.join(id.vpath().as_rootless_path())))
+        self.files.resolve(id)
     }
 }
 
@@ -128,7 +138,7 @@ impl World for SystemWorld {
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        self.fonts.book()
     }
 
     fn main(&self) -> FileId {
@@ -161,10 +171,10 @@ impl World for SystemWorld {
     }
 
     fn font(&self, index: usize) -> Option<Font> {
-        self.font_slots[index].get()
+        self.fonts.font(index)
     }
 
-    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
         current_date(offset)
     }
 }
@@ -190,8 +200,7 @@ mod tests {
         fs::write(dir.path().join("main.typ"), "#include \"ch.typ\"").unwrap();
         fs::write(dir.path().join("ch.typ"), "Chapter text").unwrap();
         let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
-        use typst::syntax::{FileId, VirtualPath};
-        let ch_id = FileId::new(None, VirtualPath::new("/ch.typ"));
+        let ch_id = project_file_id("/ch.typ").unwrap();
         let src = world.source(ch_id).unwrap();
         assert_eq!(src.text(), "Chapter text");
     }
@@ -226,7 +235,7 @@ mod tests {
         let asset = dir.path().join("asset.bin");
         fs::write(&asset, [1_u8, 2, 3]).unwrap();
         let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
-        let id = FileId::new(None, VirtualPath::new("/asset.bin"));
+        let id = project_file_id("/asset.bin").unwrap();
 
         let first = world.file(id).unwrap();
         fs::write(&asset, [9_u8, 9, 9]).unwrap();
@@ -241,7 +250,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("main.typ"), "").unwrap();
         let world = SystemWorld::new(dir.path().join("main.typ")).unwrap();
-        let id = FileId::new(None, VirtualPath::new("/missing.typ"));
+        let id = project_file_id("/missing.typ").unwrap();
 
         assert!(world.source(id).is_err());
     }

@@ -21,17 +21,18 @@ use typst::comemo::Track;
 use typst::diag::{FileError, FileResult};
 use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{
-    Bytes, Content, Datetime, NativeElement, Style, StyleChain, Styles, Target, TargetElem,
+    Bytes, Content, Datetime, Duration, NativeElement, Style, StyleChain, Styles, Target,
+    TargetElem,
 };
 use typst::introspection::{Introspector, Locator};
 use typst::layout::{PageElem, PagebreakElem, PagedDocument};
 use typst::model::{DocumentInfo, FootnoteElem};
 use typst::routines::{Arenas, RealizationKind, Routines};
-use typst::syntax::{FileId, Source, VirtualPath};
+use typst::syntax::{FileId, Source};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt};
-use typst_kit::fonts::{FontSearcher, FontSlot};
+use typst_kit::fonts::FontStore;
 
 use crate::diag::format_diagnostics;
 use crate::normalize::normalize_list_item_runs;
@@ -85,20 +86,18 @@ struct SnippetWorld {
     main: FileId,
     source: Source,
     library: LazyHash<Library>,
-    book: LazyHash<FontBook>,
-    font_slots: Vec<FontSlot>,
+    fonts: FontStore,
 }
 
 impl SnippetWorld {
     fn new(text: &str) -> Self {
-        let main = FileId::new(None, VirtualPath::new("/snippet.typ"));
-        let fonts = FontSearcher::new().search();
+        let main =
+            crate::world::project_file_id("/snippet.typ").expect("static snippet path is valid");
         Self {
             main,
             source: Source::new(main, text.to_string()),
             library: LazyHash::new(Library::default()),
-            book: LazyHash::new(fonts.book),
-            font_slots: fonts.fonts,
+            fonts: crate::world::search_fonts(),
         }
     }
 }
@@ -109,7 +108,7 @@ impl World for SnippetWorld {
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        self.fonts.book()
     }
 
     fn main(&self) -> FileId {
@@ -120,19 +119,19 @@ impl World for SnippetWorld {
         if id == self.main {
             Ok(self.source.clone())
         } else {
-            Err(FileError::NotFound(id.vpath().as_rooted_path().into()))
+            Err(FileError::NotFound(id.vpath().get_with_slash().into()))
         }
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
-        Err(FileError::NotFound(id.vpath().as_rooted_path().into()))
+        Err(FileError::NotFound(id.vpath().get_with_slash().into()))
     }
 
     fn font(&self, index: usize) -> Option<Font> {
-        self.font_slots[index].get()
+        self.fonts.font(index)
     }
 
-    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
         crate::world::current_date(offset)
     }
 }
