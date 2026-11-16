@@ -24,7 +24,6 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
-use typst::{World, WorldExt};
 use typst::foundations::{
     Content, ContextElem, NativeElement, Repr, SequenceElem, Smart, Style, StyleChain, StyledElem,
     Styles,
@@ -45,6 +44,7 @@ use typst::text::{
     SuperElem, TextElem, UnderlineElem,
 };
 use typst::visualize::{CircleElem, EllipseElem, RectElem};
+use typst::{World, WorldExt};
 use typst_layout::PagedDocument;
 
 use crate::annotated::{

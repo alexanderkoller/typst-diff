@@ -3,9 +3,7 @@ use std::collections::VecDeque;
 
 use typst::diag::SourceResult;
 use typst::engine::Engine;
-use typst::foundations::{
-    Content, ContextElem, NativeRuleMap, Packed, ShowFn, StyleChain, Target,
-};
+use typst::foundations::{Content, ContextElem, NativeRuleMap, Packed, ShowFn, StyleChain, Target};
 use typst::syntax::Span;
 
 thread_local! {

@@ -35,7 +35,10 @@ pub(crate) fn current_date(offset: Option<Duration>) -> Option<Datetime> {
     let date = match offset {
         Some(offset) => {
             let seconds = offset.seconds().trunc();
-            if !seconds.is_finite() || seconds < f64::from(i32::MIN) || seconds > f64::from(i32::MAX) {
+            if !seconds.is_finite()
+                || seconds < f64::from(i32::MIN)
+                || seconds > f64::from(i32::MAX)
+            {
                 return None;
             }
             let offset = time::UtcOffset::from_whole_seconds(seconds as i32).ok()?;

@@ -650,7 +650,8 @@ fn map_transparent_children(
 /// The realized-edit pipeline uses this for inserted edit payloads so structural
 /// whitespace nodes remain bare.
 fn apply_fill_inside(content: &Content, fill: Color) -> Content {
-    if let Some(mapped) = map_transparent_children(content, |child| apply_fill_inside(child, fill.clone()))
+    if let Some(mapped) =
+        map_transparent_children(content, |child| apply_fill_inside(child, fill.clone()))
     {
         return mapped;
     }
