@@ -160,7 +160,7 @@ fn rendered_document_text(content: &Content, world: &typst_diff::world::SystemWo
     let document = typst_diff::eval::layout_document(world, content).unwrap();
     normalize_whitespace(
         &document
-            .pages
+            .pages()
             .iter()
             .flat_map(|page| rendered_text_runs(&page.frame))
             .map(|run| run.text)
@@ -390,7 +390,7 @@ fn rendered_main_body_and_footer_text(
     world: &typst_diff::world::SystemWorld,
 ) -> (String, String, Vec<TextRun>, Vec<TextRun>) {
     let document = typst_diff::eval::layout_document(world, content).unwrap();
-    let first_page = &document.pages[0].frame;
+    let first_page = &document.pages()[0].frame;
     let page_height = first_page.height().to_pt();
     let (body_runs, footer_runs): (Vec<_>, Vec<_>) = rendered_text_runs(first_page)
         .into_iter()
@@ -944,7 +944,7 @@ fn inserted_display_equation_is_tokenized_and_logged() {
     let text = rendered_document_text(&annotated, &new_world);
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
     let green = typst::visualize::Color::from_u8(0, 180, 0, 255).into();
-    let green_text = rendered_text_runs(&document.pages[0].frame)
+    let green_text = rendered_text_runs(&document.pages()[0].frame)
         .into_iter()
         .filter(|run| run.fill == green)
         .map(|run| run.text)
@@ -1247,7 +1247,7 @@ fn figure_caption_label_renders_once_around_body_edit() {
     let world = corpus_world(&format!("{case}/new.typ"));
     let document = typst_diff::eval::layout_document(&world, &annotated).unwrap();
     let rendered = normalize_whitespace(
-        rendered_text_runs(&document.pages[0].frame)
+        rendered_text_runs(&document.pages()[0].frame)
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>()
@@ -1362,7 +1362,7 @@ fn deleted_figure_caption_uses_inert_old_display_payload() {
     let world = corpus_world(&format!("{case}/new.typ"));
     let document = typst_diff::eval::layout_document(&world, &annotated).unwrap();
     let rendered_text = normalize_whitespace(
-        rendered_text_runs(&document.pages[0].frame)
+        rendered_text_runs(&document.pages()[0].frame)
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>()
@@ -1408,7 +1408,7 @@ fn ownership_noise_does_not_steal_figure_or_duplicate_caption_text() {
             let world = corpus_world(&format!("{case}/new.typ"));
             let document = typst_diff::eval::layout_document(&world, &rendered).unwrap();
             let rendered_text = normalize_whitespace(
-                rendered_text_runs(&document.pages[0].frame)
+                rendered_text_runs(&document.pages()[0].frame)
                     .iter()
                     .map(|run| run.text.as_str())
                     .collect::<Vec<_>>()
@@ -1484,7 +1484,7 @@ fn figure_body_word_diff_does_not_renumber_caption() {
     let world = corpus_world("63-figure-body-changed/new.typ");
     let document = typst_diff::eval::layout_document(&world, &annotated).unwrap();
     let rendered = normalize_whitespace(
-        rendered_text_runs(&document.pages[0].frame)
+        rendered_text_runs(&document.pages()[0].frame)
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>()
@@ -1703,8 +1703,8 @@ fn modified_heading_does_not_apply_heading_style_twice() {
 
     let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
     let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
-    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+    let normal_runs = rendered_text_runs(&normal_document.pages()[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages()[0].frame);
 
     let normal_heading_run = normal_runs
         .iter()
@@ -1733,8 +1733,8 @@ fn modified_numbered_headings_do_not_apply_heading_style_twice() {
 
     let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
     let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
-    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+    let normal_runs = rendered_text_runs(&normal_document.pages()[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages()[0].frame);
     let normal_heading_run = normal_runs
         .iter()
         .find(|run| run.text.contains("Methods"))
@@ -1767,9 +1767,9 @@ fn paragraph_to_heading_context_change_keeps_deleted_text_body_sized() {
     let old_document = typst_diff::eval::layout_document(&old_world, &old_normal).unwrap();
     let new_document = typst_diff::eval::layout_document(&new_world, &new_normal).unwrap();
     let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let old_runs = rendered_text_runs(&old_document.pages[0].frame);
-    let new_runs = rendered_text_runs(&new_document.pages[0].frame);
-    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+    let old_runs = rendered_text_runs(&old_document.pages()[0].frame);
+    let new_runs = rendered_text_runs(&new_document.pages()[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages()[0].frame);
 
     let body_size = run_size(&old_runs, "Background");
     let heading_size = run_size(&new_runs, "Background");
@@ -1804,9 +1804,9 @@ fn heading_level_context_change_keeps_deleted_text_at_old_level() {
     let old_document = typst_diff::eval::layout_document(&old_world, &old_normal).unwrap();
     let new_document = typst_diff::eval::layout_document(&new_world, &new_normal).unwrap();
     let annotated_document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let old_runs = rendered_text_runs(&old_document.pages[0].frame);
-    let new_runs = rendered_text_runs(&new_document.pages[0].frame);
-    let annotated_runs = rendered_text_runs(&annotated_document.pages[0].frame);
+    let old_runs = rendered_text_runs(&old_document.pages()[0].frame);
+    let new_runs = rendered_text_runs(&new_document.pages()[0].frame);
+    let annotated_runs = rendered_text_runs(&annotated_document.pages()[0].frame);
 
     let old_heading_size = run_size(&old_runs, "Overview");
     let new_heading_size = run_size(&new_runs, "Overview");
@@ -2711,7 +2711,7 @@ fn nested_list_item_change_preserves_nested_list_layout() {
 
     let new_world = corpus_world("20-nested-list-changed/new.typ");
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let runs = rendered_text_runs(&document.pages[0].frame);
+    let runs = rendered_text_runs(&document.pages()[0].frame);
     let phylum = runs
         .iter()
         .find(|run| run.text.contains("Phylum: Chordata"))
@@ -2738,7 +2738,7 @@ fn nested_list_item_change_preserves_nested_list_layout() {
         .unwrap()
         .realized;
     let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
-    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let normal_runs = rendered_text_runs(&normal_document.pages()[0].frame);
     let normal_class = normal_runs
         .iter()
         .find(|run| run.text.contains("Class: Mammalia"))
@@ -3860,7 +3860,7 @@ fn nested_list_item_inserted_preserves_nested_list_layout() {
     let new_world = corpus_world("69-nested-list-item-inserted/new.typ");
 
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let runs = rendered_text_runs(&document.pages[0].frame);
+    let runs = rendered_text_runs(&document.pages()[0].frame);
     let review = runs
         .iter()
         .find(|run| run.text.contains("Review risks"))
@@ -3874,7 +3874,7 @@ fn nested_list_item_inserted_preserves_nested_list_layout() {
         .unwrap()
         .realized;
     let normal_document = typst_diff::eval::layout_document(&new_world, &normal).unwrap();
-    let normal_runs = rendered_text_runs(&normal_document.pages[0].frame);
+    let normal_runs = rendered_text_runs(&normal_document.pages()[0].frame);
     let normal_review = normal_runs
         .iter()
         .find(|run| run.text.contains("Review risks"))
@@ -4234,7 +4234,7 @@ fn opaque_wrapper_change_renders_only_the_annotated_replacement() {
             );
             let new_world = corpus_world(&format!("{name}/new.typ"));
             let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-            let rendered_text = rendered_text_runs(&document.pages[0].frame)
+            let rendered_text = rendered_text_runs(&document.pages()[0].frame)
                 .into_iter()
                 .map(|run| run.text)
                 .collect::<Vec<_>>()
@@ -5298,9 +5298,9 @@ fn corpus_82_deleted_header_does_not_restyle_body_text() {
         "deleted old pagebreaks must not remain live in the annotated new-world document"
     );
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let runs = rendered_text_runs(&document.pages[0].frame);
+    let runs = rendered_text_runs(&document.pages()[0].frame);
     let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
-    let page_width = document.pages[0].frame.width().to_pt();
+    let page_width = document.pages()[0].frame.width().to_pt();
 
     assert!(
         runs.iter().any(|run| run.text.contains("Report")),
@@ -5350,7 +5350,7 @@ fn corpus_42_contextual_footer_total_pages_is_rendered_region_edit() {
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let first_page = &document.pages[0].frame;
+    let first_page = &document.pages()[0].frame;
     let page_height = first_page.height().to_pt();
     let page_width = first_page.width().to_pt();
     let footer_runs = rendered_text_runs(first_page)
@@ -5445,8 +5445,8 @@ fn corpus_41_contextual_header_style_change_is_rendered_region_edit() {
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    let page_height = document.pages[0].frame.height().to_pt();
-    let header_runs = rendered_text_runs(&document.pages[0].frame)
+    let page_height = document.pages()[0].frame.height().to_pt();
+    let header_runs = rendered_text_runs(&document.pages()[0].frame)
         .into_iter()
         .filter(|run| run.y < page_height * 0.2)
         .collect::<Vec<_>>();
@@ -5534,9 +5534,9 @@ fn corpus_43_contextual_alternating_headers_are_rendered_region_edits() {
 
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
-    assert_alternating_header_page_layout(&document.pages[0].frame, true);
-    assert_alternating_header_page_layout(&document.pages[1].frame, false);
-    assert_alternating_header_page_layout(&document.pages[2].frame, true);
+    assert_alternating_header_page_layout(&document.pages()[0].frame, true);
+    assert_alternating_header_page_layout(&document.pages()[1].frame, false);
+    assert_alternating_header_page_layout(&document.pages()[2].frame, true);
     let pdf = typst_diff::render_to_pdf(&annotated, &new_world).unwrap();
     assert_valid_pdf(&pdf);
 }
@@ -5701,7 +5701,7 @@ Body unchanged.
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
     let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
-    let runs = rendered_text_runs(&document.pages[0].frame);
+    let runs = rendered_text_runs(&document.pages()[0].frame);
 
     assert!(
         runs.iter().any(|run| {
@@ -5729,7 +5729,7 @@ Body unchanged.
     let annotated = typst_diff::annotate::build_annotated_content_from_tree(&result, false);
     let document = typst_diff::eval::layout_document(&new_world, &annotated).unwrap();
     let red = typst::visualize::Color::from_u8(220, 0, 0, 255).into();
-    let runs = rendered_text_runs(&document.pages[0].frame);
+    let runs = rendered_text_runs(&document.pages()[0].frame);
 
     assert!(
         runs.iter()

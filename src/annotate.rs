@@ -650,7 +650,8 @@ fn map_transparent_children(
 /// The realized-edit pipeline uses this for inserted edit payloads so structural
 /// whitespace nodes remain bare.
 fn apply_fill_inside(content: &Content, fill: Color) -> Content {
-    if let Some(mapped) = map_transparent_children(content, |child| apply_fill_inside(child, fill))
+    if let Some(mapped) =
+        map_transparent_children(content, |child| apply_fill_inside(child, fill.clone()))
     {
         return mapped;
     }
@@ -852,6 +853,7 @@ fn apply_page_region_updates(
 }
 
 fn page_styles_has_region(page_styles: &Styles, kind: PageRegionKind) -> bool {
+    let page_styles = StyleChain::new(page_styles);
     match kind {
         PageRegionKind::Header => page_styles.has(PageElem::header),
         PageRegionKind::Footer => page_styles.has(PageElem::footer),

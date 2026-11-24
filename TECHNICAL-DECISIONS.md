@@ -145,7 +145,7 @@ Tradeoff: when Typst or a package has already lowered a context-generated table 
 - Equal-length source/realized sequence zipping is disabled for context-bearing sequences, because equal child counts can be accidental: the visible context output may be a later generated child while the source context placeholder itself remains invisible.
 - A recovered semantic owner may contain exactly one visible non-empty block plus invisible context scaffolding. Block-owner fallback therefore uses the existing normalized owner match for single-block semantic owners so the visible block gets the table owner rather than an anonymous opaque replacement.
 
-Tradeoff: replacing Typst's native context rule requires a narrow unsafe replacement of one private `NativeRuleMap` entry because Typst exposes rule registration but not rule replacement. The wrapper does not change renderer behavior: it calls the built-in rule, records its returned `Content`, and returns that same `Content`.
+Tradeoff: the wrapper does not change renderer behavior: it calls the built-in rule, records its returned `Content`, and returns that same `Content`. Since Typst 0.15 the replacement uses the public `NativeRuleMap::replace` API on a copy of the world's `Library::rules`; the earlier unsafe layout cast into a private `NativeRuleMap` field is gone (see "Typst 0.15 Port").
 
 ## SFB Context Table Diagnosis Is Still Open
 
@@ -183,3 +183,14 @@ Tradeoff: the fix stays in token annotation because diffing already retained equ
 - General semantic-owner classification does not use this layouter-carrier predicate. Textual wrappers such as `pad` may also lower through custom layouter blocks, but their authored wrapper owners already retain textual patch surfaces and should keep word-level edits.
 
 Tradeoff: CeTZ changes are currently represented as whole opaque old/new visual replacements rather than word-level label edits. This uses retained Typst layout-carrier provenance and avoids renderer changes or source-structure guesses.
+
+## Typst 0.15 Port
+
+- typst-diff builds against the Typst 0.15.1 crates. The port changes API usage only; the diff, annotation and rendering logic is unchanged, and the corpus modification logs are byte-identical to the 0.14.2 build.
+- Typst 0.15 attaches the compiler routines and the built-in native show rules to the `Library` (`Library::routines`, `Library::rules`), and `Engine` carries `library` instead of `routines`. typst-diff therefore no longer builds its own `Routines` table: `diff_library` clones the world's library and replaces the paged `ContextElem` rule in `library.rules`. The layout passes that used the recording routines before (final `layout_document`, `realize_to_content`) use this library; `layout_introspector` uses the unmodified world library, as before with Typst's own routines.
+- The engine reads native rules only from `Engine::library`, and Typst's sub-engines inherit the parent's library, so the copied library reaches every realization the recording rule must see. The only Typst code path that reads `world.library()` directly is the convergence-warning analysis after the maximum number of layout iterations, which typst-diff does not call.
+- `Introspector` is a trait in 0.15. The layout loops start from `EmptyIntrospector` and feed back the previous document's `PagedIntrospector`, mirroring Typst's own `compile` loop.
+- Fonts come from a `typst-kit` `FontStore` (system fonts, then embedded fonts), and file/package resolution uses `typst-kit`'s `SystemFiles`, which resolves project paths against the entry directory and package paths against the system package directories, downloading from Typst Universe when needed. The `SystemWorld` source/file caches are unchanged.
+- `World::today` takes a `Duration` offset in 0.15. It is truncated to whole seconds, matching `typst-kit`'s implementation; Typst's `datetime.today(offset:)` still interprets integer offsets as hours.
+
+Tradeoff: cloning the library per layout/realize call is cheap (modules and styles are reference-counted; the rule map has a few hundred entries) and avoids a process-global library that would ignore per-world library configuration.

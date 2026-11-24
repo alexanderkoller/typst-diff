@@ -116,10 +116,9 @@ file.
   behaviour.
 - Source files and binary files are cached in separate `Mutex<HashMap<FileId,
   _>>` maps so repeated lookups within a single compilation are free.
-- Fonts are loaded via `typst-kit`'s `FontSearcher`, which searches system
-  font directories and embeds a set of fallback fonts. The book and font
-  list are stored on `SystemWorld` and served directly via `book()` and
-  `font()`.
+- Fonts are loaded into a `typst-kit` `FontStore`: system fonts first, then
+  the fonts embedded in the binary as lowest-priority fallback. The store is
+  kept on `SystemWorld` and serves `book()` and `font()` directly.
 - `today()` returns `None`; the diff output does not embed a document date.
 
 ### eval
@@ -139,8 +138,8 @@ Used by the CLI. Runs two additional passes over the Content tree:
 1. **`layout_introspector`** — performs a full layout pass (up to 5 iterations
    for convergence) to build a stable `Introspector`. The introspector records
    counters, labels, and references that may affect realized content.
-2. **`realize_to_content`** — calls `ROUTINES.realize` with
-   `RealizationKind::LayoutDocument`, which expands all lazy Typst show rules,
+2. **`realize_to_content`** — calls the library's `realize` routine with
+   `RealizationKind::Document`, which expands all lazy Typst show rules,
    counter steps, and document structure into a flat sequence of `(Content,
    StyleChain)` pairs.
 
@@ -898,7 +897,7 @@ distance. For large documents with few changes, d is small and the algorithm
 runs close to O(n). For documents where every block changes, d ≈ n and the
 algorithm is O(n²).
 
-**Font loading:** `FontSearcher::search()` scans system font directories once
+**Font loading:** `typst_kit::fonts::system()` scans system font directories once
 per `SystemWorld` construction. For the two-document comparison this happens
 twice; the two worlds do not share a font cache.
 
